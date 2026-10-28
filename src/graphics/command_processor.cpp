@@ -155,6 +155,9 @@ void CommandProcessor::Shutdown() {
 
   worker_running_ = false;
   write_ptr_index_event_->Set();
+  // Vblanks have stopped by now (GraphicsSystem::Shutdown stops them first),
+  // so a WAIT_REG_MEM poll would otherwise sleep out its whole interval.
+  register_wait_wake_event_->Set();
   worker_thread_->Wait(0, 0, 0, nullptr);
   worker_thread_.reset();
 }
@@ -1193,6 +1196,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         }
       } else {
         rex::thread::MaybeYield();
+        if (!worker_running_) {
+          // A value the vblank interrupt writes never changes once vblanks
+          // stop at shutdown.
+          return false;
+        }
       }
     }
   } while (!matched);

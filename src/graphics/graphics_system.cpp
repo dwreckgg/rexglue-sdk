@@ -177,6 +177,10 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         HANDLE vblank_timer = CreateWaitableTimerExW(
             nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         constexpr uint64_t kSpinUs = 500;
+        if (!vblank_timer) {
+          REXGPU_WARN("GPU VSync: no high-resolution timer ({}), polling with Sleep(1)",
+                      GetLastError());
+        }
 #endif
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
