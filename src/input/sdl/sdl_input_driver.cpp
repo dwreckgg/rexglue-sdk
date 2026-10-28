@@ -254,7 +254,24 @@ X_RESULT SDLInputDriver::GetRawState(uint32_t user_index, X_INPUT_STATE* out_sta
   // Keep the state fresh while the driver is inactive (GetState only queues
   // an update when active).
   QueueControllerUpdate();
-  auto guard = DrainAndLock();
+  // The caller is the UI thread. It must not wait for controllers_mutex_: a
+  // guest thread can hold it inside SDL_OpenGamepad (a pad plugged in), and
+  // SDL may need the UI thread's message loop to finish that. Report busy
+  // instead; the caller asks again next frame.
+  std::unique_lock<std::mutex> guard(controllers_mutex_, std::try_to_lock);
+  if (!guard.owns_lock()) {
+    return X_ERROR_BUSY;
+  }
+  {
+    std::vector<SDL_Event> events;
+    {
+      std::lock_guard<std::mutex> queue_guard(event_queue_mutex_);
+      events.swap(pending_events_);
+    }
+    for (const auto& event : events) {
+      ProcessEventLocked(event);
+    }
+  }
   auto controller = GetControllerState(user_index);
   if (!controller) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
