@@ -232,16 +232,17 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
 }
 
 void GraphicsSystem::Shutdown() {
-  if (command_processor_) {
-    EndTracing();
-    command_processor_->Shutdown();
-    command_processor_.reset();
-  }
-
+  // Stop the vblank thread first: MarkVblank uses command_processor_.
   if (vsync_worker_thread_) {
     vsync_worker_running_ = false;
     vsync_worker_thread_->Wait(0, 0, 0, nullptr);
     vsync_worker_thread_.reset();
+  }
+
+  if (command_processor_) {
+    EndTracing();
+    command_processor_->Shutdown();
+    command_processor_.reset();
   }
 
   if (presenter_) {
@@ -385,6 +386,10 @@ void GraphicsSystem::MarkVblank() {
   //     something wrong and the CP will block waiting for code that
   //     needs to be run in the interrupt.
   DispatchInterruptCallback(0, 2);
+
+  if (command_processor_) {
+    command_processor_->WakeRegisterWaits();
+  }
 }
 
 void GraphicsSystem::ClearCaches() {

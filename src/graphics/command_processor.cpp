@@ -110,8 +110,10 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
       trace_writer_(graphics_system->memory()->physical_membase()),
       worker_running_(true),
       write_ptr_index_event_(rex::thread::Event::CreateAutoResetEvent(false)),
+      register_wait_wake_event_(rex::thread::Event::CreateAutoResetEvent(false)),
       write_ptr_index_(0) {
   assert_not_null(write_ptr_index_event_);
+  assert_not_null(register_wait_wake_event_);
 }
 
 CommandProcessor::~CommandProcessor() = default;
@@ -1176,7 +1178,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
         } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          // Woken early by the guest vblank (WakeRegisterWaits): in DOA4 the
+          // values these polls wait on are written by the vblank interrupt,
+          // and a plain Sleep(1) wakes 0.5-3 ms after it.
+          rex::thread::Wait(register_wait_wake_event_.get(), false,
+                            std::chrono::milliseconds(wait / 0x100));
         }
         rex::thread::SyncMemory();
         ReturnFromWait();
