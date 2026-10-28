@@ -3,6 +3,7 @@
 
 add_library(rexinput OBJECT
     input_system.cpp
+    pad_remap.cpp
     mnk/mnk_input_driver.cpp
     nop/nop_input_driver.cpp
 )
