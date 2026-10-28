@@ -2,8 +2,9 @@
  * Frame pacing statistics (diagnostic). Enabled by the environment variable
  * REX_PACE_STATS=1; costs one relaxed load per mark when off.
  *
- * Channels: guest vblank (MarkVblank), guest swap (IssueSwap), host present
- * (after IDXGISwapChain::Present). Every 600 marks of a channel, logs the
+ * Channels: guest vblank (MarkVblank), guest swap (IssueSwap, on the GPU
+ * command processor thread), host present (after IDXGISwapChain::Present),
+ * guest VdSwap (the guest thread's call, before the GPU thread reaches it). Every 600 marks of a channel, logs the
  * interval distribution in milliseconds: average, min, max, and how many
  * intervals were short (< 8 ms, a burst) or long (> 17.5 ms, > 25 ms).
  * The present channel also logs how many presents showed a new guest frame
@@ -21,7 +22,7 @@
 
 namespace rex::pace_stats {
 
-enum Channel : int { kVblank = 0, kSwap = 1, kPresent = 2, kChannelCount = 3 };
+enum Channel : int { kVblank = 0, kSwap = 1, kPresent = 2, kGuestSwap = 3, kChannelCount = 4 };
 
 inline bool Enabled() {
   static const bool enabled = [] {
@@ -62,7 +63,7 @@ inline std::atomic<int64_t>& LastSwapUs() {
 inline void Mark(Channel channel) {
   if (!Enabled()) return;
   static ChannelState states[kChannelCount];
-  static const char* const names[kChannelCount] = {"vblank", "swap", "present"};
+  static const char* const names[kChannelCount] = {"vblank", "swap", "present", "guest VdSwap"};
   const int64_t now = NowUs();
   if (channel == kSwap) LastSwapUs().store(now, std::memory_order_relaxed);
   ChannelState& s = states[channel];

@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <string>
 
+#include <rex/pace_stats.h>
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
@@ -433,6 +434,7 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                   mapped_u32 frontbuffer_ptr,  // ptr to frontbuffer address
                   mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
                   mapped_u32 height) {
+  pace_stats::Mark(pace_stats::kGuestSwap);
   // All of these parameters are REQUIRED.
   assert(buffer_ptr);
   assert(fetch_ptr);
