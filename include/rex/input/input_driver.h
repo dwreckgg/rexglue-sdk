@@ -38,6 +38,13 @@ class InputDriver {
   virtual X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
                                 X_INPUT_KEYSTROKE* out_keystroke) = 0;
 
+  // The controller's state as the hardware reports it: no remapping, and not
+  // blanked while the driver is inactive (an overlay is open). For UI that
+  // waits for a button press. Drivers without such a state report no device.
+  virtual X_RESULT GetRawState(uint32_t /*user_index*/, X_INPUT_STATE* /*out_state*/) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
 
   void set_is_active_callback(std::function<bool()> is_active_callback) {

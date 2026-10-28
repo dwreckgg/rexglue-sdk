@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <rex/input/input_driver.h>
+#include <rex/input/pad_remap.h>
 
 #include <SDL3/SDL.h>
 
@@ -42,6 +43,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) override;
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
                         X_INPUT_KEYSTROKE* out_keystroke) override;
+  X_RESULT GetRawState(uint32_t user_index, X_INPUT_STATE* out_state) override;
   void OnWindowAvailable(rex::ui::Window* window) override;
 
  private:
@@ -86,6 +88,10 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   bool TestSDLVersion() const;
   void UpdateXCapabilities(ControllerState& state);
   void QueueControllerUpdate();
+  // Parses pad_remap_p<slot + 1>; called at Setup and from the cvar's change
+  // callback (which runs under the cvar registry lock: no cvar calls here).
+  void LoadPadRemap(size_t slot, std::string_view text);
+  PadRemap PadRemapFor(uint32_t user_index);
 
   rex::ui::Window* attached_window_ = nullptr;
   bool sdl_events_initialized_;
@@ -97,6 +103,10 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   std::mutex event_queue_mutex_;
   std::vector<SDL_Event> pending_events_;
   std::array<KeystrokeState, HID_SDL_USER_COUNT> keystroke_states_;
+  // Per-slot remaps; guarded by remaps_mutex_ (taken after controllers_mutex_,
+  // never before it).
+  std::array<PadRemap, HID_SDL_USER_COUNT> remaps_;
+  std::mutex remaps_mutex_;
 };
 
 }  // namespace rex::input::sdl

@@ -107,6 +107,12 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Called after ImGui drawer is created. Add custom dialogs here.
   virtual void OnCreateDialogs(ui::ImGuiDrawer* drawer) { (void)drawer; }
 
+  /// While this returns true the input drivers report an untouched controller
+  /// to the guest (as they do while the SDK's own overlays have the mouse), for
+  /// a custom dialog that takes input. Called from the guest's input polls, on
+  /// any thread: read only thread-safe state.
+  virtual bool OnBlocksGuestInput() { return false; }
+
   /// Called before cleanup begins. Release custom resources here.
   virtual void OnShutdown() {}
 

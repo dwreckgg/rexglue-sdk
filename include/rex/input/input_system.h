@@ -42,6 +42,9 @@ class InputSystem : public system::IInputSystem {
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
 
+  // InputDriver::GetRawState of the first driver that has the controller.
+  X_RESULT GetRawState(uint32_t user_index, X_INPUT_STATE* out_state);
+
  private:
   rex::ui::Window* window_ = nullptr;
 

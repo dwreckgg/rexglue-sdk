@@ -23,7 +23,21 @@
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
 
+REXCVAR_DEFINE_STRING(pad_remap_p1, "", "Input",
+                      "Player 1 controller remap: target=source pairs, e.g. A=B,B=A");
+REXCVAR_DEFINE_STRING(pad_remap_p2, "", "Input",
+                      "Player 2 controller remap: target=source pairs, e.g. A=B,B=A");
+REXCVAR_DEFINE_STRING(pad_remap_p3, "", "Input",
+                      "Player 3 controller remap: target=source pairs, e.g. A=B,B=A");
+REXCVAR_DEFINE_STRING(pad_remap_p4, "", "Input",
+                      "Player 4 controller remap: target=source pairs, e.g. A=B,B=A");
+
 namespace rex::input::sdl {
+
+static_assert(HID_SDL_TRIGG_THRES == kPadTriggerThreshold);
+
+static constexpr std::array<std::string_view, HID_SDL_USER_COUNT> kPadRemapCvars = {
+    "pad_remap_p1", "pad_remap_p2", "pad_remap_p3", "pad_remap_p4"};
 
 SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
     : InputDriver(window, window_z_order),
@@ -35,14 +49,42 @@ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
       controllers_mutex_(),
       keystroke_states_() {}
 
-SDLInputDriver::~SDLInputDriver() {}
+SDLInputDriver::~SDLInputDriver() {
+  for (std::string_view name : kPadRemapCvars) {
+    rex::cvar::UnregisterChangeCallbacks(name);
+  }
+}
 
 X_STATUS SDLInputDriver::Setup() {
   if (!TestSDLVersion()) {
     return X_STATUS_UNSUCCESSFUL;
   }
 
+  for (size_t slot = 0; slot < HID_SDL_USER_COUNT; ++slot) {
+    LoadPadRemap(slot, rex::cvar::Query<std::string>(kPadRemapCvars[slot]));
+    rex::cvar::RegisterChangeCallback(
+        kPadRemapCvars[slot],
+        [this, slot](std::string_view, std::string_view value) { LoadPadRemap(slot, value); });
+  }
+
   return X_STATUS_SUCCESS;
+}
+
+void SDLInputDriver::LoadPadRemap(size_t slot, std::string_view text) {
+  PadRemap remap;
+  if (!ParsePadRemap(text, &remap)) {
+    REXLOG_WARN("{}: skipped invalid entries in \"{}\"", kPadRemapCvars[slot], text);
+  }
+  if (!remap.IsIdentity()) {
+    REXLOG_INFO("{} = {}", kPadRemapCvars[slot], FormatPadRemap(remap));
+  }
+  std::lock_guard<std::mutex> lock(remaps_mutex_);
+  remaps_[slot] = remap;
+}
+
+PadRemap SDLInputDriver::PadRemapFor(uint32_t user_index) {
+  std::lock_guard<std::mutex> lock(remaps_mutex_);
+  return remaps_[user_index];
 }
 
 void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
@@ -193,11 +235,31 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
     controller->state_changed = false;
   }
   std::memcpy(out_state, &controller->state, sizeof(*out_state));
+  out_state->gamepad = ApplyPadRemap(PadRemapFor(user_index), out_state->gamepad);
   if (!is_active) {
     // Simulate an "untouched" controller. When we become active again the
     // pressed buttons aren't lost and will be visible again.
     std::memset(&out_state->gamepad, 0, sizeof(out_state->gamepad));
   }
+  return X_ERROR_SUCCESS;
+}
+
+X_RESULT SDLInputDriver::GetRawState(uint32_t user_index, X_INPUT_STATE* out_state) {
+  if (user_index >= HID_SDL_USER_COUNT || !out_state) {
+    return X_ERROR_BAD_ARGUMENTS;
+  }
+  if (!sdl_events_initialized_ || !SDL_Gamepad_initialized_) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  // Keep the state fresh while the driver is inactive (GetState only queues
+  // an update when active).
+  QueueControllerUpdate();
+  auto guard = DrainAndLock();
+  auto controller = GetControllerState(user_index);
+  if (!controller) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  std::memcpy(out_state, &controller->state, sizeof(*out_state));
   return X_ERROR_SUCCESS;
 }
 
@@ -307,10 +369,10 @@ X_RESULT SDLInputDriver::GetKeystroke(uint32_t users, uint32_t flags,
     // If input is not active (e.g. due to a dialog overlay), force buttons to
     // "unpressed". The algorithm will automatically send UP events when
     // `is_active()` goes low and DOWN events when it goes high again.
+    const X_INPUT_GAMEPAD gamepad =
+        ApplyPadRemap(PadRemapFor(user_index), controller->state.gamepad);
     const uint64_t curr_butts =
-        is_active
-            ? (controller->state.gamepad.buttons | AnalogToKeyfield(controller->state.gamepad))
-            : uint64_t(0);
+        is_active ? (gamepad.buttons | AnalogToKeyfield(gamepad)) : uint64_t(0);
     KeystrokeState& last = keystroke_states_.at(user_index);
 
     // Handle repeating
