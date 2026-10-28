@@ -762,7 +762,11 @@ void PipelineCache::EndSubmission() {
     shader_storage_file_flush_needed_ = false;
     pipeline_storage_file_flush_needed_ = false;
   }
-  if (!creation_threads_.empty()) {
+  // With asynchronous compilation the draws of a pipeline that is not created
+  // yet are skipped (see IssueDraw), so nothing in the submission depends on
+  // the queue - waiting here would stall the frame for every new pipeline.
+  // (From Tekken 6 Native Online by Ekspym, used with permission.)
+  if (!creation_threads_.empty() && !REXCVAR_GET(async_shader_compilation)) {
     CreateQueuedPipelinesOnProcessorThread();
     // Await creation of all queued pipelines.
     bool await_creation_completion_event;
@@ -3144,7 +3148,10 @@ bool PipelineCache::PrepareRuntimeDescriptionForQueuedCreation(
     if (!translation->is_translated()) {
       std::lock_guard<std::mutex> lock(translation_request_lock_);
       if (!translation->is_translated()) {
-        translation->shader().AnalyzeUcode(ucode_disasm_buffer_);
+        // Not ucode_disasm_buffer_ - the processor thread uses it without this
+        // lock. (From Tekken 6 Native Online by Ekspym, used with permission.)
+        string::StringBuffer ucode_disasm_buffer;
+        translation->shader().AnalyzeUcode(ucode_disasm_buffer);
         if (!TranslateAnalyzedShader(*shader_translator_, *translation, dxbc_converter_, dxc_utils_,
                                      dxc_compiler_)) {
           REXGPU_ERROR("Failed to translate queued {} shader", shader_type);
