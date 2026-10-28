@@ -17,6 +17,7 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/pace_stats.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
@@ -1163,6 +1164,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.
   paint_context_.present_submission_tracker.NextSubmission();
+  pace_stats::Mark(pace_stats::kPresent);
   switch (present_result) {
     case DXGI_ERROR_DEVICE_REMOVED:
       return PaintResult::kGpuLostExternally;
