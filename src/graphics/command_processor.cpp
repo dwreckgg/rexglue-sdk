@@ -1104,6 +1104,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   ++counter_;
+  swap_count_.fetch_add(1, std::memory_order_release);
   return true;
 }
 

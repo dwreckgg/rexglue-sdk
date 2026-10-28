@@ -87,6 +87,11 @@ class CommandProcessor {
 
   uint32_t counter() const { return counter_; }
   void increment_counter() { counter_++; }
+  // Swap packets processed so far: counter() also counts vblanks. Incremented
+  // after IssueSwap has refreshed the guest output, so once swap_count() has
+  // reached n the presenter's guest output holds the frame of swap n until the
+  // next swap is processed. Readable from any thread.
+  uint32_t swap_count() const { return swap_count_.load(std::memory_order_acquire); }
 
   // Wakes a WAIT_REG_MEM poll sleeping on the command processor thread, so it
   // re-checks its condition now instead of at the end of its poll interval.
@@ -275,6 +280,7 @@ class CommandProcessor {
   std::vector<uint32_t> me_bin_;
 
   uint32_t counter_ = 0;
+  std::atomic<uint32_t> swap_count_{0};
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;
