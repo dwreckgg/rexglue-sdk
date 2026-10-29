@@ -57,6 +57,7 @@ std::atomic<uint64_t> g_audio_budget{0}, g_audio_done{0};
 std::atomic<uint64_t> g_audio_lock_base{0};    // g_audio_done when the lockstep was (last) switched on
 std::atomic<void*> g_audio_cb_ctx{nullptr};    // guest context of the worker while a callback runs (sampler)
 std::atomic<uint32_t> g_audio_worker_tid{0};   // host thread id of the worker (runs the guest callbacks)
+std::atomic<uint32_t> g_audio_registrations{0};  // clients the guest registered (netplay: rex_audio_registrations)
 std::mutex g_audio_mutex;
 std::condition_variable g_audio_cv;
 }  // namespace
@@ -275,6 +276,7 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
 
   clients_[index] = {driver, callback, callback_arg, ptr, true};
+  g_audio_registrations.fetch_add(1, std::memory_order_release);
 
   if (out_index) {
     *out_index = index;
@@ -446,4 +448,11 @@ extern "C" __declspec(dllexport) int rex_audio_worker_callback(uint64_t* index) 
   if (!rex::audio::g_audio_lockstep || rex::thread::current_thread_system_id() != rex::audio::g_audio_worker_tid) return 0;
   *index = rex::audio::g_audio_done - rex::audio::g_audio_lock_base;
   return 1;
+}
+
+// Netplay: how many audio clients the guest has registered. The guest registers on its own thread,
+// so the count read at a frame boundary is the same in every run of a lockstep session: the
+// callbacks start at the first boundary after the registration.
+extern "C" __declspec(dllexport) uint32_t rex_audio_registrations() {
+  return rex::audio::g_audio_registrations.load(std::memory_order_acquire);
 }
