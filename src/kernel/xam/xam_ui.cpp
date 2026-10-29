@@ -99,7 +99,9 @@ X_RESULT xeXamDispatchDialog(T* dialog, std::function<X_RESULT(T*)> close_callba
     return result;
   };
   auto post = []() {
-    rex::thread::Sleep(std::chrono::milliseconds(100));
+    if (!rex::system::overlapped_inline()) {  // (netplay lockstep: no host-time delay)
+      rex::thread::Sleep(std::chrono::milliseconds(100));
+    }
     // Broadcast XN_SYS_UI = false
     REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
   };
@@ -141,7 +143,9 @@ X_RESULT xeXamDispatchDialogEx(T* dialog,
     return result;
   };
   auto post = []() {
-    rex::thread::Sleep(std::chrono::milliseconds(100));
+    if (!rex::system::overlapped_inline()) {  // (netplay lockstep: no host-time delay)
+      rex::thread::Sleep(std::chrono::milliseconds(100));
+    }
     // Broadcast XN_SYS_UI = false
     REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
   };
@@ -165,7 +169,9 @@ X_RESULT xeXamDispatchHeadless(std::function<X_RESULT()> run_callback, uint32_t 
     REX_KERNEL_STATE()->BroadcastNotification(0x9, true);
   };
   auto post = []() {
-    rex::thread::Sleep(std::chrono::milliseconds(100));
+    if (!rex::system::overlapped_inline()) {  // (netplay lockstep: no host-time delay)
+      rex::thread::Sleep(std::chrono::milliseconds(100));
+    }
     REXKRNL_DEBUG("xeXamDispatchHeadless: Broadcasting XN_SYS_UI = false");
     // Broadcast XN_SYS_UI = false
     REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
@@ -188,7 +194,9 @@ X_RESULT xeXamDispatchHeadlessEx(std::function<X_RESULT(uint32_t&, uint32_t&)> r
     REX_KERNEL_STATE()->BroadcastNotification(0x9, true);
   };
   auto post = []() {
-    rex::thread::Sleep(std::chrono::milliseconds(100));
+    if (!rex::system::overlapped_inline()) {  // (netplay lockstep: no host-time delay)
+      rex::thread::Sleep(std::chrono::milliseconds(100));
+    }
     // Broadcast XN_SYS_UI = false
     REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
   };

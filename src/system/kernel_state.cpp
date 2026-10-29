@@ -38,6 +38,12 @@ namespace rex::system {
 
 constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
 
+namespace {
+std::atomic<bool> g_overlapped_inline{false};
+}  // namespace
+
+bool overlapped_inline() { return g_overlapped_inline.load(std::memory_order_acquire); }
+
 // This is a global object initialized with the XboxkrnlModule.
 // It references the current kernel state object that all kernel methods should
 // be using to stash their variables.
@@ -1062,6 +1068,17 @@ void KernelState::CompleteOverlappedDeferredEx(
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
   XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
+  if (overlapped_inline()) {
+    // Netplay lockstep: complete on the calling thread, before it returns, with no delay, so
+    // the frame at which the game sees the result does not depend on host timing.
+    if (pre_callback) pre_callback();
+    uint32_t extended_error, length;
+    auto result = completion_callback(extended_error, length);
+    REXSYS_DEBUG("Inline overlapped {:08X}: completing with result {:08X}", overlapped_ptr, result);
+    CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
+    if (post_callback) post_callback();
+    return;
+  }
   auto global_lock = global_critical_region_.Acquire();
   dispatch_queue_.push_back(
       [this, completion_callback, overlapped_ptr, pre_callback, post_callback]() {
@@ -1242,3 +1259,8 @@ const char* KernelState::GetOrCreateFiberName(uint32_t guest_addr, const char* t
 }
 
 }  // namespace rex::system
+
+// Netplay lockstep switch (see rex::system::overlapped_inline): 1 = deferred overlapped completions run inline.
+extern "C" __declspec(dllexport) void rex_overlapped_inline(int on) {
+  rex::system::g_overlapped_inline.store(on != 0, std::memory_order_release);
+}

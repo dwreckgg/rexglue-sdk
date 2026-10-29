@@ -179,6 +179,10 @@ struct FiberInfo {
   bool is_thread_fiber;            ///< true = ConvertThreadToFiber (don't free guest stack)
 };
 
+/// Netplay lockstep: deferred overlapped completions (XAM UI, content, enumerators) run inline on
+/// the calling thread with no delay while this is on (rex_overlapped_inline(1)); off by default.
+bool overlapped_inline();
+
 class KernelState {
  public:
   explicit KernelState(Runtime* emulator);
