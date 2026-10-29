@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <condition_variable>
+#include <mutex>
 #include <rex/assert.h>
 #include <rex/audio/audio_driver.h>
 #include <rex/audio/audio_system.h>
@@ -41,6 +43,23 @@ REXCVAR_DEFINE_INT32(
 // implementations. They can be found in xboxkrnl_audio_xma.cc
 
 namespace rex::audio {
+
+extern std::atomic<bool> g_xma_lockstep;  // xma_decoder.cpp
+
+namespace {
+// Netplay audio lockstep (Tekken 6 rollback): the game asks the sound library whether a sound has finished and its
+// round intro waits for that, so the guest audio callbacks (each renders one 256-sample frame and retires finished
+// voices) must advance with the game frames, not with the host audio clock. While enabled, the worker runs a callback
+// only within the budget that rex_audio_advance gives at every game frame boundary.
+// (Ported from the Tekken 6 SDK patch to v0.8: the hunk's anchor kWorkerShutdownTimeout does not exist here.)
+std::atomic<bool> g_audio_lockstep{false};
+std::atomic<uint64_t> g_audio_budget{0}, g_audio_done{0};
+std::atomic<uint64_t> g_audio_lock_base{0};    // g_audio_done when the lockstep was (last) switched on
+std::atomic<void*> g_audio_cb_ctx{nullptr};    // guest context of the worker while a callback runs (sampler)
+std::atomic<uint32_t> g_audio_worker_tid{0};   // host thread id of the worker (runs the guest callbacks)
+std::mutex g_audio_mutex;
+std::condition_variable g_audio_cv;
+}  // namespace
 
 AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
     : memory_(function_dispatcher->memory()),
@@ -95,10 +114,19 @@ X_STATUS AudioSystem::Setup(system::KernelState* kernel_state) {
 void AudioSystem::WorkerThreadMain() {
   // Initialize driver and ringbuffer.
   Initialize();
+  g_audio_worker_tid = rex::thread::current_thread_system_id();
+  REXAPU_INFO("AudioWorker: host thread {}", g_audio_worker_tid.load());
 
   // Main run loop.
   uint32_t diag_pump_count = 0;
   while (worker_running_) {
+    if (g_audio_lockstep) {
+      std::unique_lock lock(g_audio_mutex);
+      g_audio_cv.wait_for(lock, std::chrono::milliseconds(100), [this] {
+        return !g_audio_lockstep || g_audio_done < g_audio_budget || !worker_running_;
+      });
+      if (g_audio_lockstep && g_audio_done >= g_audio_budget) continue;
+    }
     // These handles signify the number of submitted samples. Once we reach
     // 64 samples, we wait until our audio backend releases a semaphore
     // (signaling a sample has finished playing)
@@ -142,12 +170,19 @@ void AudioSystem::WorkerThreadMain() {
         }
         SCOPE_profile_cpu_i("apu", "rex::audio::AudioSystem->client_callback");
         uint64_t args[] = {client_callback_arg};
+        g_audio_cb_ctx.store(worker_thread_->thread_state()->context(), std::memory_order_relaxed);
         function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
                                       rex::countof(args));
+        g_audio_cb_ctx.store(nullptr, std::memory_order_relaxed);
         if (diag_pump_count < 10) {
           REXAPU_DEBUG("AudioWorker: callback returned for client {}", index);
         }
         diag_pump_count++;
+        {
+          std::lock_guard lock(g_audio_mutex);
+          g_audio_done++;
+        }
+        g_audio_cv.notify_all();
       } else {
         REXAPU_DEBUG("AudioWorker: semaphore signaled for client {} but callback is 0", index);
       }
@@ -380,3 +415,35 @@ void AudioSystem::Resume() {
 }
 
 }  // namespace rex::audio
+
+// Netplay audio lockstep (see g_audio_lockstep): on = 1 starts it (budget = callbacks done so far), 0 stops it
+extern "C" __declspec(dllexport) void rex_audio_lockstep(int on) {
+  {
+    std::lock_guard lock(rex::audio::g_audio_mutex);
+    rex::audio::g_audio_budget = rex::audio::g_audio_done.load();
+    rex::audio::g_audio_lock_base = rex::audio::g_audio_done.load();
+    rex::audio::g_audio_lockstep = on != 0;
+    rex::audio::g_xma_lockstep = on != 0;
+  }
+  rex::audio::g_audio_cv.notify_all();
+}
+// Sampler: the worker's guest context while it runs a guest callback, else nullptr
+extern "C" __declspec(dllexport) void* rex_audio_callback_context() { return rex::audio::g_audio_cb_ctx.load(std::memory_order_relaxed); }
+// Allows n more audio callbacks and waits until they ran (1) or timeout_ms passed (0)
+extern "C" __declspec(dllexport) int rex_audio_advance(uint32_t n, int timeout_ms) {
+  std::unique_lock lock(rex::audio::g_audio_mutex);
+  rex::audio::g_audio_budget += n;
+  rex::audio::g_audio_cv.notify_all();
+  return rex::audio::g_audio_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [] {
+    return rex::audio::g_audio_done >= rex::audio::g_audio_budget;
+  }) ? 1 : 0;
+}
+
+// Netplay: the guest audio callback reads the time base once per call; in the lockstep the game gives that thread a
+// time derived from the callback number instead of the host clock. Returns 1 and the callback number since the
+// lockstep start when the calling thread is the audio worker in the lockstep, else 0.
+extern "C" __declspec(dllexport) int rex_audio_worker_callback(uint64_t* index) {
+  if (!rex::audio::g_audio_lockstep || rex::thread::current_thread_system_id() != rex::audio::g_audio_worker_tid) return 0;
+  *index = rex::audio::g_audio_done - rex::audio::g_audio_lock_base;
+  return 1;
+}

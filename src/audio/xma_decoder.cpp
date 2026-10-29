@@ -19,6 +19,9 @@
 #include <rex/memory/ring_buffer.h>
 #include <rex/string/buffer.h>
 #include <rex/system/function_dispatcher.h>
+#include <atomic>
+#include <chrono>
+
 #include <rex/system/thread_state.h>
 #include <rex/system/xthread.h>
 
@@ -137,8 +140,24 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
   return X_STATUS_SUCCESS;
 }
 
+// Netplay audio lockstep (rex_audio_lockstep): the worker must not decode. A kick decodes inline on the guest thread
+// (WriteRegister); the worker sweep raced with it: when it took the freshly enabled context first, the inline Work()
+// returned at once and the guest read the context while the decode was still running -> the sound library saw the
+// decoded amount at a timing dependent moment (two Tekken 6 netplay instances went apart now and then).
+std::atomic<bool> g_xma_lockstep{false};
+// Netplay statistics: time of the inline decodes at a context kick (rex_xma_stats)
+std::atomic<uint64_t> g_t6_xma_ns{0}, g_t6_xma_n{0};
+
 void XmaDecoder::WorkerThreadMain() {
   while (worker_running_) {
+    if (g_xma_lockstep) {
+      if (paused_) {
+        pause_fence_.Signal();
+        resume_fence_.Wait();
+      }
+      rex::thread::Wait(work_event_.get(), false, std::chrono::milliseconds(100));
+      continue;
+    }
     // Okay, let's loop through XMA contexts to find ones we need to decode!
     bool did_work = false;
     for (uint32_t n = 0; n < kContextCount && worker_running_; n++) {
@@ -299,9 +318,12 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       if (kicked_value & 1) {
         uint32_t context_id = base_context_id + i;
         auto& context = contexts_[context_id];
+        const auto w0 = std::chrono::steady_clock::now();
         if (context.Work()) {
           context.SignalWorkDone();
         }
+        g_t6_xma_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w0).count();
+        g_t6_xma_n++;
       }
     }
     work_event_->Set();
@@ -376,3 +398,8 @@ void XmaDecoder::Resume() {
 }
 
 }  // namespace rex::audio
+
+extern "C" __declspec(dllexport) void rex_xma_stats(uint64_t* ns, uint64_t* n) {
+  *ns = rex::audio::g_t6_xma_ns.load();
+  *n = rex::audio::g_t6_xma_n.load();
+}

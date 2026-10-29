@@ -36,6 +36,15 @@ extern "C" {
 // Credits for most of this code goes to:
 // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
 
+// Tekken 6 netplay: decoder errors that leave the game without sound (two players, 2026-10-12: "There are no bits to
+// copy" - from then on first the character sounds, then the music were gone and the next match hung in its loading).
+// The game asks with rex_audio_xma_errors() and restarts instead of parking after such a match.
+#include <atomic>
+static std::atomic<unsigned> t6_xma_errors{0};
+#if defined(_WIN32)
+extern "C" __declspec(dllexport) unsigned rex_audio_xma_errors() { return t6_xma_errors.load(std::memory_order_relaxed); }
+#endif
+
 namespace rex::audio {
 
 using stream::BitStream;
@@ -611,6 +620,7 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
   if (bits_to_copy == 0) {
     REXAPU_ERROR("XmaContext {}: There are no bits to copy!", id());
+    t6_xma_errors.fetch_add(1, std::memory_order_relaxed);  // (netplay: the game restarts after the match, see the top)
     SwapInputBuffer(data);
     return;
   }
