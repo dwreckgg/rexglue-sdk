@@ -210,12 +210,15 @@ void AudioSystem::WorkerThreadMain() {
     }
 
     if (!pumped) {
-      // Netplay: in the lockstep no 500 ms sleep. A WaitAny that timed out because it was entered before the
-      // lockstep was switched on (no client yet) would otherwise leave the worker asleep while the game's frame
-      // boundary waits for its callbacks; the gate at the top of the loop does the waiting.
-      if (g_audio_lockstep) continue;
       SCOPE_profile_cpu_i("apu", "Sleep");
-      rex::thread::Sleep(std::chrono::milliseconds(500));
+      // Netplay: the 500 ms pause after a WaitAny timeout is a wait on the lockstep condition variable, ended at
+      // once when the lockstep is armed (rex_audio_lockstep(1) notifies it) or the worker is stopping. A plain
+      // Sleep would hold the worker for the rest of the 500 ms when the lockstep is armed during it, while the
+      // game's frame boundary waits for callbacks; the gate at the top of the loop then does the waiting.
+      // Offline nothing makes the predicate true, so it stays a 500 ms pause (callback notifications do not end it).
+      std::unique_lock lock(g_audio_mutex);
+      g_audio_cv.wait_for(lock, std::chrono::milliseconds(500),
+                          [this] { return g_audio_lockstep || !worker_running_; });
     }
   }
   worker_running_ = false;
