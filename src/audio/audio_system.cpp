@@ -154,6 +154,20 @@ void AudioSystem::WorkerThreadMain() {
       continue;
     }
 
+    // Netplay: the budget gate at the top of the loop is checked before WaitAny. The lockstep can be switched on
+    // while this worker is already inside WaitAny, and a client registered meanwhile releases its semaphore and
+    // wakes it with no budget: callback 0 would then run at a host-timed point, in the middle of the guest's init.
+    // So a callback also waits for its budget here (the semaphore count WaitAny took is held until then).
+    // Not in the lockstep: unchanged.
+    if (result.first == thread::WaitResult::kSuccess && g_audio_lockstep) {
+      std::unique_lock lock(g_audio_mutex);
+      while (!g_audio_cv.wait_for(lock, std::chrono::milliseconds(100), [this] {
+        return !g_audio_lockstep || g_audio_done < g_audio_budget || !worker_running_;
+      })) {
+      }
+      if (!worker_running_) break;
+    }
+
     // Number of clients pumped
     bool pumped = false;
     if (result.first == rex::thread::WaitResult::kSuccess) {
