@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <mutex>
 
@@ -41,6 +42,8 @@ uint64_t last_guest_tick_count_ = 0;
 uint64_t last_host_tick_count_ = Clock::QueryHostTickCount();
 // Mutex to ensure last_host_tick_count_ and last_guest_tick_count_ are in sync
 std::mutex tick_mutex_;
+// Netplay: deterministic guest clocks in a lockstep session (set_guest_time_override).
+std::atomic<Clock::GuestTimeOverride> guest_time_override_{nullptr};
 
 void RecomputeGuestTickScalar() {
   // Create a rational number with numerator (first) and denominator (second)
@@ -155,12 +158,24 @@ void Clock::set_guest_system_time_base(uint64_t time_base) {
   guest_system_time_base_ = time_base;
 }
 
+void Clock::set_guest_time_override(GuestTimeOverride fn) {
+  guest_time_override_.store(fn, std::memory_order_release);
+}
+
 uint64_t Clock::QueryGuestTickCount() {
+  if (auto fn = guest_time_override_.load(std::memory_order_acquire)) {
+    uint64_t value;
+    if (fn(0, &value)) return value;
+  }
   auto guest_tick_count = UpdateGuestClock();
   return guest_tick_count;
 }
 
 uint64_t Clock::QueryGuestSystemTime() {
+  if (auto fn = guest_time_override_.load(std::memory_order_acquire)) {
+    uint64_t value;
+    if (fn(1, &value)) return value;
+  }
   if (REXCVAR_GET(clock_no_scaling)) {
     return Clock::QueryHostSystemTime();
   }

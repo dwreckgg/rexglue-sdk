@@ -79,6 +79,13 @@ class Clock {
   // Sets the system time of the guest.
   static void SetGuestSystemTime(uint64_t system_time);
 
+  // Netplay (lockstep sessions): an override of the guest clocks, unset by default. When set,
+  // QueryGuestTickCount (kind 0: the time base that mftb reads, guest ticks) and
+  // QueryGuestSystemTime (kind 1: FILETIME) call it first; it returns true with the value to use,
+  // or false to fall back to the host clock (host threads, outside a session).
+  using GuestTimeOverride = bool (*)(int kind, uint64_t* value);
+  static void set_guest_time_override(GuestTimeOverride fn);
+
   // Scales a time duration in milliseconds, from guest time.
   static uint32_t ScaleGuestDurationMillis(uint32_t guest_ms);
   // Scales a time duration in 100ns ticks like FILETIME, from guest time.
