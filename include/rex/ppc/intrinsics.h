@@ -28,6 +28,10 @@
 
 #include <rex/types.h>
 
+// After simde's headers: redirects simde_mm_dp_ps (vmsum3fp128 / vmsum4fp128) to a result that
+// carries one canonical NaN. Generated code reaches this through <rex/ppc.h>.
+#include <rex/ppc/dot_product.h>
+
 namespace rex::ppc {
 
 //=============================================================================
