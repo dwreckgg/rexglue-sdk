@@ -21,9 +21,12 @@ namespace rex::system {
 
 namespace {
 // Netplay lockstep (rex_notify_lockstep): a notification is numbered when it is queued and becomes
-// visible to the guest at the first frame boundary after that (rex_notify_frame), so every run of a
-// session dequeues it in the same frame; input-device notifications (the host's own controllers; a
-// session's input is staged) are dropped.
+// visible to the guest at the first frame boundary after that (rex_notify_frame). Today every enqueue is
+// made inside a guest call (the startup burst of KernelState::RegisterNotifyListener, xam_ui, xam_user,
+// xmp_app) at a fixed point of the game's frame, so it is dequeued in the same frame in every run. An
+// enqueue from a host thread would reach the guest from the boundary after it, which is the same frame in
+// every run only if that thread's timing puts it on the same side of the boundary. Nothing is dropped
+// (DroppedInLockstep below). Outside the lockstep the queue behaves exactly as before.
 std::atomic<bool> g_notify_lockstep{false};
 std::atomic<uint64_t> g_notify_seq{0};      // the next notification's number
 std::atomic<uint64_t> g_notify_visible{0};  // notifications numbered below this are visible
@@ -92,7 +95,9 @@ bool XNotifyListener::DequeueNotification(XNotificationID* out_id, uint32_t* out
     if (notifications_.empty()) wait_handle_->Reset();
     return true;
   }
-  if (notifications_.empty()) wait_handle_->Reset();
+  // Reached with nothing taken. Offline that means the queue was empty at entry, where the old code returned
+  // without touching the event; only the lockstep resets here (its drops can empty the queue in the loop).
+  if (lockstep && notifications_.empty()) wait_handle_->Reset();
   return false;
 }
 
