@@ -18,6 +18,33 @@
 
 namespace rex::audio::conversion {
 
+// Portable versions; also the reference the SSE versions must agree with.
+inline void sequential_6_BE_to_interleaved_6_LE_scalar(float* output, const float* input,
+                                                size_t ch_sample_count) {
+  for (size_t sample = 0; sample < ch_sample_count; sample++) {
+    for (size_t channel = 0; channel < 6; channel++) {
+      output[sample * 6 + channel] = rex::byte_swap(input[channel * ch_sample_count + sample]);
+    }
+  }
+}
+inline void sequential_6_BE_to_interleaved_2_LE_scalar(float* output, const float* input,
+                                                size_t ch_sample_count) {
+  // Default 5.1 channel mapping is fl, fr, fc, lf, bl, br
+  // (index 4 is back-left, 5 is back-right; the SSE version below agrees)
+  // https://docs.microsoft.com/en-us/windows/win32/xaudio2/xaudio2-default-channel-mapping
+  for (size_t sample = 0; sample < ch_sample_count; sample++) {
+    // put center on left and right, discard low frequency
+    float fl = rex::byte_swap(input[0 * ch_sample_count + sample]);
+    float fr = rex::byte_swap(input[1 * ch_sample_count + sample]);
+    float fc = rex::byte_swap(input[2 * ch_sample_count + sample]);
+    float bl = rex::byte_swap(input[4 * ch_sample_count + sample]);
+    float br = rex::byte_swap(input[5 * ch_sample_count + sample]);
+    float center_halved = fc * 0.5f;
+    output[sample * 2] = (fl + bl + center_halved) * (1.0f / 2.5f);
+    output[sample * 2 + 1] = (fr + br + center_halved) * (1.0f / 2.5f);
+  }
+}
+
 #if REX_ARCH_AMD64
 inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* input,
                                                 size_t ch_sample_count) {
@@ -76,27 +103,11 @@ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* inpu
 #else
 inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* input,
                                                 size_t ch_sample_count) {
-  for (size_t sample = 0; sample < ch_sample_count; sample++) {
-    for (size_t channel = 0; channel < 6; channel++) {
-      output[sample * 6 + channel] = rex::byte_swap(input[channel * ch_sample_count + sample]);
-    }
-  }
+  sequential_6_BE_to_interleaved_6_LE_scalar(output, input, ch_sample_count);
 }
 inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* input,
                                                 size_t ch_sample_count) {
-  // Default 5.1 channel mapping is fl, fr, fc, lf, bl, br
-  // https://docs.microsoft.com/en-us/windows/win32/xaudio2/xaudio2-default-channel-mapping
-  for (size_t sample = 0; sample < ch_sample_count; sample++) {
-    // put center on left and right, discard low frequency
-    float fl = rex::byte_swap(input[0 * ch_sample_count + sample]);
-    float fr = rex::byte_swap(input[1 * ch_sample_count + sample]);
-    float fc = rex::byte_swap(input[2 * ch_sample_count + sample]);
-    float br = rex::byte_swap(input[4 * ch_sample_count + sample]);
-    float bl = rex::byte_swap(input[5 * ch_sample_count + sample]);
-    float center_halved = fc * 0.5f;
-    output[sample * 2] = (fl + bl + center_halved) * (1.0f / 2.5f);
-    output[sample * 2 + 1] = (fr + br + center_halved) * (1.0f / 2.5f);
-  }
+  sequential_6_BE_to_interleaved_2_LE_scalar(output, input, ch_sample_count);
 }
 #endif
 
