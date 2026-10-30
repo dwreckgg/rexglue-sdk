@@ -115,6 +115,10 @@ class Entry {
 
   Entry* GetChild(const std::string_view name);
   Entry* ResolvePath(const std::string_view path);
+  // Puts `entry` in place of the child with the same name (compared as GetChild does), at the
+  // same position, or adds it when no child has that name; returns the child it replaced.
+  // For a file served from somewhere other than its device's own storage.
+  std::unique_ptr<Entry> ReplaceChild(std::unique_ptr<Entry> entry);
 
   const std::vector<std::unique_ptr<Entry>>& children() const { return children_; }
   size_t child_count() const { return children_.size(); }

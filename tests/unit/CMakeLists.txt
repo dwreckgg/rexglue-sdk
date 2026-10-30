@@ -15,6 +15,7 @@ add_executable(unit_tests
     ppc/stack_test.cpp
     system/guest_path_test.cpp
     system/fixed_timestamp_test.cpp
+    filesystem/entry_replace_child_test.cpp
     system/function_dispatcher_test.cpp
     codegen/manifest_test.cpp
     rexglue/migration_scan_test.cpp

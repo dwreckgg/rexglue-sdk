@@ -94,6 +94,18 @@ Entry* Entry::ResolvePath(const std::string_view path) {
   return entry;
 }
 
+std::unique_ptr<Entry> Entry::ReplaceChild(std::unique_ptr<Entry> entry) {
+  auto global_lock = global_critical_region_.Acquire();
+  for (auto& child : children_) {
+    if (rex::string::utf8_equal_case(child->name(), entry->name())) {
+      std::swap(child, entry);
+      return entry;
+    }
+  }
+  children_.push_back(std::move(entry));
+  return nullptr;
+}
+
 Entry* Entry::IterateChildren(const rex::filesystem::WildcardEngine& engine,
                               size_t* current_index) {
   auto global_lock = global_critical_region_.Acquire();
