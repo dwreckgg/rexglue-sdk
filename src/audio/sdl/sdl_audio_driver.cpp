@@ -11,11 +11,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 
 #include <rex/assert.h>
 #include <rex/audio/conversion.h>
 #include <rex/audio/flags.h>
+#include <rex/audio/speaker_mode.h>
 #include <rex/audio/sdl/sdl_audio_driver.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -24,6 +26,25 @@
 #include <SDL3/SDL.h>
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+REXCVAR_DEFINE_STRING(audio_speakers, "auto", "Audio",
+                      "Speaker layout: auto (follow the device), stereo, or surround (5.1)")
+    .allowed({"auto", "stereo", "surround"});
+
+namespace rex::audio {
+namespace {
+std::atomic<uint32_t> g_output_info{0};  // device_channels | stream_channels << 8
+}  // namespace
+
+void SetOutputInfo(const OutputInfo& info) {
+  g_output_info.store(uint32_t(info.device_channels) | (uint32_t(info.stream_channels) << 8),
+                      std::memory_order_release);
+}
+
+OutputInfo GetOutputInfo() {
+  const uint32_t packed = g_output_info.load(std::memory_order_acquire);
+  return {uint8_t(packed & 0xFF), uint8_t((packed >> 8) & 0xFF)};
+}
+}  // namespace rex::audio
 
 namespace rex::audio::sdl {
 
@@ -72,7 +93,9 @@ bool SDLAudioDriver::Initialize() {
     obtained_spec = desired_spec;
   }
 
-  if (obtained_spec.channels == 2) {
+  const SpeakerMode speaker_mode = ParseSpeakerMode(REXCVAR_GET(audio_speakers));
+  const uint8_t stream_channels = ChooseStreamChannels(speaker_mode, obtained_spec.channels);
+  if (stream_channels == 2) {
     SDL_DestroyAudioStream(sdl_stream_);
     sdl_stream_ = nullptr;
     desired_spec.channels = 2;
@@ -89,6 +112,11 @@ bool SDLAudioDriver::Initialize() {
       return false;
     }
   }
+
+  SetOutputInfo({uint8_t(obtained_spec.channels), sdl_device_channels_});
+  REXAPU_INFO("Audio output: speakers={} device_channels={} stream_channels={}",
+              REXCVAR_GET(audio_speakers), int(obtained_spec.channels),
+              int(sdl_device_channels_));
 
   if (!SDL_ResumeAudioDevice(sdl_device)) {
     REXAPU_ERROR("SDL_ResumeAudioDevice() failed: {}", SDL_GetError());
