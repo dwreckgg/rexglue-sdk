@@ -435,6 +435,10 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
         return NULL;
     }
 
+    // A first use can be host-timed (a waiter on a contended critical section): its handle comes from the top of
+    // the table, so the handles later given to the guest do not depend on when it happened (object_table.h).
+    kernel_state->object_table()->MoveToHighSlot(object);
+
     // Stash pointer in struct.
     // FIXME: This assumes the object contains a dispatch header (some don't!)
     StashHandle(header, object->handle());

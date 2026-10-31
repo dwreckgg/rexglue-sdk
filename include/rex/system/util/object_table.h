@@ -37,6 +37,12 @@ class ObjectTable {
   X_STATUS RetainHandle(X_HANDLE handle);
   X_STATUS ReleaseHandle(X_HANDLE handle);
   X_STATUS RemoveHandle(X_HANDLE handle);
+  // Moves the object's only handle (the one its constructor just added) to the highest free slot above it. For the
+  // host objects GetNativeObject creates on a guest dispatcher header's first use: that use can come at a host-timed
+  // moment (a wait on a contended critical section), and a slot taken from the low end there would shift every handle
+  // the guest is given afterwards. Moved out, the freed low slot goes to the next object created, so the handles the
+  // guest sees follow only the guest's own creations. No higher free slot: the handle stays where it is.
+  X_STATUS MoveToHighSlot(XObject* object);
 
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);

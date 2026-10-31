@@ -95,6 +95,28 @@ bool ObjectTable::Resize(uint32_t new_capacity) {
   return true;
 }
 
+X_STATUS ObjectTable::MoveToHighSlot(XObject* object) {
+  auto global_lock = global_critical_region_.Acquire();
+  auto& handles = object->handles();
+  if (handles.size() != 1) {
+    return X_STATUS_INVALID_HANDLE;
+  }
+  const uint32_t old_slot = GetHandleSlot(handles[0]);
+  if (old_slot >= table_capacity_ || table_[old_slot].object != object) {
+    return X_STATUS_INVALID_HANDLE;
+  }
+  for (uint32_t slot = table_capacity_ - 1; slot > old_slot; --slot) {
+    if (!table_[slot].object) {
+      table_[slot] = table_[old_slot];
+      table_[old_slot] = ObjectTableEntry{};
+      handles[0] = XObject::kHandleBase + (slot << 2);
+      REXSYS_NOISY_DEBUG("Moved handle to:{:08X} for {}", handles[0], typeid(*object).name());
+      return X_STATUS_SUCCESS;
+    }
+  }
+  return X_STATUS_SUCCESS;
+}
+
 X_STATUS ObjectTable::AddHandle(XObject* object, X_HANDLE* out_handle) {
   X_STATUS result = X_STATUS_SUCCESS;
 
