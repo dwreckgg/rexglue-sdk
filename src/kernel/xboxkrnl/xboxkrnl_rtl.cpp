@@ -13,7 +13,9 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <algorithm>
+#include <cstdlib>
 #include <string>
+#include <vector>
 
 #include <rex/chrono/chrono_steady_cast.h>
 #include <rex/kernel/xboxkrnl/private.h>
@@ -338,7 +340,60 @@ struct X_RTL_CRITICAL_SECTION {
 #pragma pack(pop)
 static_assert_size(X_RTL_CRITICAL_SECTION, 28);
 
+// REX_LOG_CS (a diagnostic): "*" logs every critical-section initialisation with the state it overwrites; a list of
+// hex guest addresses ("830ADBCC,82B747D0") also logs, for those sections, every initialisation, every enter that
+// goes to the wait (before and after it) and every leave that signals a waiter. Each line names the guest thread
+// and its lr. Nothing is logged without the variable.
+namespace {
+struct CsLogSetting {
+  bool all = false;
+  std::vector<uint32_t> addresses;
+};
+
+const CsLogSetting& CsLog() {
+  static const CsLogSetting setting = [] {
+    CsLogSetting s;
+    const char* v = std::getenv("REX_LOG_CS");
+    if (!v) return s;
+    std::string text(v);
+    size_t pos = 0;
+    while (pos <= text.size()) {
+      size_t end = text.find(',', pos);
+      if (end == std::string::npos) end = text.size();
+      const std::string item = text.substr(pos, end - pos);
+      if (item == "*") {
+        s.all = true;
+      } else if (!item.empty()) {
+        s.addresses.push_back(uint32_t(std::strtoul(item.c_str(), nullptr, 16)));
+      }
+      pos = end + 1;
+    }
+    return s;
+  }();
+  return setting;
+}
+
+bool CsNamed(uint32_t cs_ptr) {
+  const auto& a = CsLog().addresses;
+  return std::find(a.begin(), a.end(), cs_ptr) != a.end();
+}
+
+void CsLine(const char* what, uint32_t cs_ptr, const X_RTL_CRITICAL_SECTION* cs) {
+  uint32_t guest_tid = 0, lr = 0;
+  if (XThread* thread = XThread::GetCurrentThread()) {
+    guest_tid = thread->thread_id();
+    if (auto* ctx = thread->thread_state() ? thread->thread_state()->context() : nullptr) lr = uint32_t(ctx->lr);
+  }
+  const bool stash = cs->header.wait_list_flink == kXObjSignature;
+  REXKRNL_INFO("[cs] {} {:08X}: guest thread {} lr {:08X}; type {} lock count {} recursion {} owner {:08X} stash {}",
+               what, cs_ptr, guest_tid, lr, uint32_t(cs->header.type), int32_t(cs->lock_count),
+               int32_t(cs->recursion_count), uint32_t(cs->owning_thread),
+               stash ? fmt::format("{:08X}", uint32_t(cs->header.wait_list_blink)) : std::string("none"));
+}
+}  // namespace
+
 void xeRtlInitializeCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t cs_ptr) {
+  if (CsLog().all || CsNamed(cs_ptr)) CsLine("init (state before)", cs_ptr, cs);
   cs->header.type = 1;      // EventSynchronizationObject (auto reset)
   cs->header.absolute = 0;  // spin count div 256
   cs->header.signal_state = 0;
@@ -356,6 +411,7 @@ X_STATUS xeRtlInitializeCriticalSectionAndSpinCount(X_RTL_CRITICAL_SECTION* cs, 
                                                     uint32_t spin_count) {
   // Spin count is rounded up to 256 intervals then packed in.
   // uint32_t spin_count_div_256 = (uint32_t)floor(spin_count / 256.0f + 0.5f);
+  if (CsLog().all || CsNamed(cs_ptr)) CsLine("init (state before)", cs_ptr, cs);
   uint32_t spin_count_div_256 = (spin_count + 255) >> 8;
   if (spin_count_div_256 > 255) {
     spin_count_div_256 = 255;
@@ -398,8 +454,11 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
   }
 
   if (rex::thread::atomic_inc(&cs->lock_count) != 0) {
+    const bool log = CsNamed(cs.guest_address());
+    if (log) CsLine("enter waits", cs.guest_address(), cs.host_address());
     // Create a full waiter.
     xeKeWaitForSingleObject(reinterpret_cast<void*>(cs.host_address()), 8, 0, 0, nullptr);
+    if (log) CsLine("enter woken", cs.guest_address(), cs.host_address());
   }
 
   assert_true(cs->owning_thread == 0);
@@ -442,6 +501,7 @@ void RtlLeaveCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
   cs->owning_thread = 0;
   if (rex::thread::atomic_dec(&cs->lock_count) != -1) {
     // There were waiters - wake one of them.
+    if (CsNamed(cs.guest_address())) CsLine("leave signals", cs.guest_address(), cs.host_address());
     xeKeSetEvent(reinterpret_cast<X_KEVENT*>(cs.host_address()), 1, 0);
   }
 }
