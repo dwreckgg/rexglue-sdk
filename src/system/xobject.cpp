@@ -81,10 +81,20 @@ XObject::Type XObject::type() const {
 }
 
 void XObject::RetainHandle() {
+  // An object can be left with no handle (a lazy object evicted when the guest re-initialised its header:
+  // ObjectTable::MoveToHighSlot): a no-op then, asserted in debug builds.
+  assert_false(handles_.empty());
+  if (handles_.empty()) {
+    return;
+  }
   kernel_state_->object_table()->RetainHandle(handles_[0]);
 }
 
 bool XObject::ReleaseHandle() {
+  assert_false(handles_.empty());  // see RetainHandle
+  if (handles_.empty()) {
+    return false;
+  }
   // FIXME: Return true when handle is actually released.
   return kernel_state_->object_table()->ReleaseHandle(handles_[0]) == X_STATUS_SUCCESS;
 }
@@ -442,7 +452,9 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
     const uint32_t guest_header = kernel_state->memory()->HostToGuestVirtual(native_ptr);
     const X_STATUS moved = kernel_state->object_table()->MoveToHighSlot(object, guest_header);
     if (XFAILED(moved)) {
-      REXSYS_WARN("GetNativeObject: the lazy object for header {:08X} (type {}) keeps the low handle {:08X} "
+      // The netplay harness matches on the tag "[netplay-lazy-pool]": keep it in this text.
+      REXSYS_WARN("[netplay-lazy-pool] GetNativeObject: the lazy object for header {:08X} (type {}) keeps the low "
+                  "handle {:08X} "
                   "(MoveToHighSlot status {:08X}): later guest handles are shifted in this run",
                   guest_header, as_type, object->handle(), moved);
     } else {

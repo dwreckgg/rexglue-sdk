@@ -425,6 +425,11 @@ TEST_CASE("ObjectTable MoveToHighSlot gives a re-initialised header's slot to it
   CHECK(again->handles()[0] == home);
   CHECK(table.LookupObject<XObject>(home).get() == again);
   CHECK(first->handles().empty());
+  // An evicted object has no handle: handle() is 0 and ReleaseHandle is a no-op (no handles_[0] read; this
+  // TestObject has no kernel state, so a read through it would crash).
+  CHECK(first->handle() == 0);
+  CHECK_FALSE(first->ReleaseHandle());
+  CHECK(table.LookupObject<XObject>(home).get() == again);
 
   // Once its slot was released and taken by another key, the old key's record no longer frees anything.
   table.ReleaseHandle(home);  // the slot is free again
@@ -441,6 +446,44 @@ TEST_CASE("ObjectTable MoveToHighSlot gives a re-initialised header's slot to it
   CHECK(third->handles()[0] != home);
 
   first->Release();
+  table.Reset();
+}
+
+TEST_CASE("ObjectTable MoveToHighSlot never evicts an ordinary object from a released lazy slot",
+          "[kernel][object_table]") {
+  InitTestLogging();
+
+  ObjectTable table;
+  const uint32_t k = 0x401F5240;
+  auto* lazy = Added(table);
+  REQUIRE(table.MoveToHighSlot(lazy, k) == X_STATUS_SUCCESS);
+  const X_HANDLE home = SlotHandle(Home(k));
+  REQUIRE(lazy->handles()[0] == home);
+
+  // The lazy object's handle is released (ObDereferenceObject -> ReleaseHandle): its slot is free.
+  REQUIRE(table.ReleaseHandle(home) == X_STATUS_SUCCESS);
+  REQUIRE(table.LookupObject<XObject>(home).get() == nullptr);
+
+  // Ordinary objects fill the table from the low end until one takes that slot.
+  TestObject* ordinary = nullptr;
+  for (uint32_t i = 0; i < 16384 && !ordinary; ++i) {
+    auto* o = new TestObject();
+    X_HANDLE h = 0;
+    REQUIRE(table.AddHandle(o, &h) == X_STATUS_SUCCESS);
+    if (h == home) {
+      ordinary = o;
+    }
+  }
+  REQUIRE(ordinary != nullptr);
+
+  // The guest re-initialises the same header: the ordinary object keeps its handle and its table entry.
+  auto* again = Added(table);
+  REQUIRE(table.MoveToHighSlot(again, k) == X_STATUS_SUCCESS);
+  CHECK(table.LookupObject<XObject>(home).get() == ordinary);
+  REQUIRE(ordinary->handles().size() == 1);
+  CHECK(ordinary->handles()[0] == home);
+  CHECK(again->handles()[0] != home);
+
   table.Reset();
 }
 

@@ -115,6 +115,8 @@ class ObjectTable {
   }
   X_STATUS FindFreeSlot(uint32_t* out_slot);
   bool Resize(uint32_t new_capacity);
+  // Drops MoveToHighSlot's records for `slot` (its entry is being cleared), so the maps hold live lazy objects only.
+  void ForgetLazySlot(uint32_t slot);
 
   rex::thread::global_critical_region global_critical_region_;
   std::mutex name_mutex_;
@@ -122,9 +124,16 @@ class ObjectTable {
   ObjectTableEntry* table_ = nullptr;
   uint32_t last_free_entry_ = 0;
   std::unordered_map<string::string_key_case, X_HANDLE> name_table_;
-  // MoveToHighSlot's bookkeeping: the pool slot each key's latest object took, and the key that placed each slot.
+  // MoveToHighSlot's bookkeeping: the pool slot each key's live lazy object holds, and per such slot its key and
+  // object. Every path that clears a table entry (RemoveHandle, PurgeAllObjects, Reset, MoveToHighSlot's own
+  // eviction) drops the slot's records, so both maps hold live lazy objects only (at most kLazyPoolSize each).
+  struct LazyOwner {
+    uint32_t key;
+    XObject* object;
+  };
   std::unordered_map<uint32_t, uint32_t> lazy_slot_by_key_;
-  std::unordered_map<uint32_t, uint32_t> lazy_key_by_slot_;
+  std::unordered_map<uint32_t, LazyOwner> lazy_owner_by_slot_;
+  bool pool_slot_warned_ = false;  // FindFreeSlot's one-time WARN
 };
 
 // Generic lookup
