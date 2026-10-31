@@ -37,12 +37,27 @@ class ObjectTable {
   X_STATUS RetainHandle(X_HANDLE handle);
   X_STATUS ReleaseHandle(X_HANDLE handle);
   X_STATUS RemoveHandle(X_HANDLE handle);
-  // Moves the object's only handle (the one its constructor just added) to the highest free slot above it. For the
-  // host objects GetNativeObject creates on a guest dispatcher header's first use: that use can come at a host-timed
-  // moment (a wait on a contended critical section), and a slot taken from the low end there would shift every handle
-  // the guest is given afterwards. Moved out, the freed low slot goes to the next object created, so the handles the
-  // guest sees follow only the guest's own creations. No higher free slot: the handle stays where it is.
-  X_STATUS MoveToHighSlot(XObject* object);
+  // Moves the object's only handle (the one its constructor just added) into the lazy pool, slots kLazyPoolBase ..
+  // kLazyPoolTop, at the first free slot probing downward (wrapping) from LazyHomeSlot(key). For the host objects
+  // GetNativeObject creates on a guest dispatcher header's first use; key = the header's guest address. That use can
+  // come at a host-timed moment (a wait on a contended critical section), and a slot taken from the low end there
+  // would shift every handle the guest is given afterwards: moved out, the freed low slot goes to the next object
+  // created, so the handles the guest sees follow only the guest's own creations. The slot depends on the key, not on
+  // how many lazy objects came before, so a host-timed one on one peer does not move the others (residual: two keys
+  // whose probe paths meet take each other's slot when their creation order differs). A key seen before (the guest
+  // re-initialised that header, overwriting the stash) gives up its previous object's slot first: that object can no
+  // longer be reached from guest memory and leaves the table, so re-initialised headers do not fill the pool.
+  // DOA4 netplay debug 82B70000: no handle in this pool is ever handed to the guest (the game imports no
+  // ObOpenObjectByPointer, the only export that returns a lazily created object's handle), so a slot difference
+  // between peers shows only in stash words, which the .data sweep zeroes.
+  // Returns X_STATUS_INVALID_HANDLE when the object does not hold exactly one handle in this table,
+  // X_STATUS_UNSUCCESSFUL when the pool has no free slot; in both cases the handle stays where it is (the caller logs a
+  // WARN).
+  X_STATUS MoveToHighSlot(XObject* object, uint32_t key);
+  static constexpr uint32_t kLazyPoolSize = 8192;
+  static constexpr uint32_t kLazyPoolTop = 16383;  // the table's first size is 16 * 1024 slots
+  static constexpr uint32_t kLazyPoolBase = kLazyPoolTop + 1 - kLazyPoolSize;
+  static uint32_t LazyHomeSlot(uint32_t key);
 
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);
@@ -107,6 +122,9 @@ class ObjectTable {
   ObjectTableEntry* table_ = nullptr;
   uint32_t last_free_entry_ = 0;
   std::unordered_map<string::string_key_case, X_HANDLE> name_table_;
+  // MoveToHighSlot's bookkeeping: the pool slot each key's latest object took, and the key that placed each slot.
+  std::unordered_map<uint32_t, uint32_t> lazy_slot_by_key_;
+  std::unordered_map<uint32_t, uint32_t> lazy_key_by_slot_;
 };
 
 // Generic lookup

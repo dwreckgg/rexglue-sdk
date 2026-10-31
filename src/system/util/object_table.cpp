@@ -39,6 +39,8 @@ void ObjectTable::Reset() {
 
   table_capacity_ = 0;
   last_free_entry_ = 0;
+  lazy_slot_by_key_.clear();
+  lazy_key_by_slot_.clear();
   free(table_);
   table_ = nullptr;
 }
@@ -95,26 +97,61 @@ bool ObjectTable::Resize(uint32_t new_capacity) {
   return true;
 }
 
-X_STATUS ObjectTable::MoveToHighSlot(XObject* object) {
+uint32_t ObjectTable::LazyHomeSlot(uint32_t key) {
+  // Fibonacci hashing of the word index: the top 13 bits of (key / 4) * 2654435761, counted down from the pool's top.
+  const uint32_t h = ((key >> 2) * 2654435761u) >> (32 - 13);
+  return kLazyPoolTop - h;
+}
+
+X_STATUS ObjectTable::MoveToHighSlot(XObject* object, uint32_t key) {
   auto global_lock = global_critical_region_.Acquire();
   auto& handles = object->handles();
   if (handles.size() != 1) {
     return X_STATUS_INVALID_HANDLE;
   }
   const uint32_t old_slot = GetHandleSlot(handles[0]);
-  if (old_slot >= table_capacity_ || table_[old_slot].object != object) {
+  if (old_slot >= table_capacity_ || table_[old_slot].object != object || table_capacity_ <= kLazyPoolTop) {
     return X_STATUS_INVALID_HANDLE;
   }
-  for (uint32_t slot = table_capacity_ - 1; slot > old_slot; --slot) {
+
+  // The guest re-initialised a header it had used before (its stash was overwritten, so GetNativeObject creates a
+  // new object): the old object can no longer be reached from guest memory, so it leaves the table and its slot is
+  // free for the new one. A slot whose owner changed meanwhile (the old object's handle was released and the slot
+  // reused) is left alone.
+  if (auto it = lazy_slot_by_key_.find(key); it != lazy_slot_by_key_.end()) {
+    const uint32_t prev = it->second;
+    auto owner = lazy_key_by_slot_.find(prev);
+    if (owner != lazy_key_by_slot_.end() && owner->second == key) {
+      if (prev < table_capacity_ && prev != old_slot && table_[prev].object) {
+        XObject* dead = table_[prev].object;
+        const X_HANDLE dead_handle = XObject::kHandleBase + (prev << 2);
+        table_[prev] = ObjectTableEntry{};
+        auto h = std::find(dead->handles().begin(), dead->handles().end(), dead_handle);
+        if (h != dead->handles().end()) {
+          dead->handles().erase(h);
+        }
+        dead->Release();
+      }
+      lazy_key_by_slot_.erase(owner);
+    }
+    lazy_slot_by_key_.erase(it);
+  }
+
+  // Probe downward from the key's home slot through the pool, wrapping once.
+  const uint32_t home = LazyHomeSlot(key);
+  for (uint32_t n = 0; n < kLazyPoolSize; ++n) {
+    const uint32_t slot = kLazyPoolTop - ((kLazyPoolTop - home + n) % kLazyPoolSize);
     if (!table_[slot].object) {
       table_[slot] = table_[old_slot];
       table_[old_slot] = ObjectTableEntry{};
       handles[0] = XObject::kHandleBase + (slot << 2);
+      lazy_slot_by_key_[key] = slot;
+      lazy_key_by_slot_[slot] = key;
       REXSYS_NOISY_DEBUG("Moved handle to:{:08X} for {}", handles[0], typeid(*object).name());
       return X_STATUS_SUCCESS;
     }
   }
-  return X_STATUS_SUCCESS;
+  return X_STATUS_UNSUCCESSFUL;
 }
 
 X_STATUS ObjectTable::AddHandle(XObject* object, X_HANDLE* out_handle) {
