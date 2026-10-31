@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdlib>
 #include <vector>
 
 #include <rex/chrono/clock.h>
@@ -80,10 +81,20 @@ XObject::Type XObject::type() const {
 }
 
 void XObject::RetainHandle() {
+  // An object can be left with no handle (a lazy object evicted when the guest re-initialised its header:
+  // ObjectTable::MoveToHighSlot): a no-op then, asserted in debug builds.
+  assert_false(handles_.empty());
+  if (handles_.empty()) {
+    return;
+  }
   kernel_state_->object_table()->RetainHandle(handles_[0]);
 }
 
 bool XObject::ReleaseHandle() {
+  assert_false(handles_.empty());  // see RetainHandle
+  if (handles_.empty()) {
+    return false;
+  }
   // FIXME: Return true when handle is actually released.
   return kernel_state_->object_table()->ReleaseHandle(handles_[0]) == X_STATUS_SUCCESS;
 }
@@ -433,6 +444,29 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
       default:
         assert_always();
         return NULL;
+    }
+
+    // A first use can be host-timed (a waiter on a contended critical section): its handle moves to the lazy pool,
+    // at a slot keyed by the header's guest address, so the handles later given to the guest do not depend on when
+    // it happened (object_table.h MoveToHighSlot).
+    const uint32_t guest_header = kernel_state->memory()->HostToGuestVirtual(native_ptr);
+    const X_STATUS moved = kernel_state->object_table()->MoveToHighSlot(object, guest_header);
+    if (XFAILED(moved)) {
+      // The netplay harness matches on the tag "[netplay-lazy-pool]": keep it in this text.
+      REXSYS_WARN("[netplay-lazy-pool] GetNativeObject: the lazy object for header {:08X} (type {}) keeps the low "
+                  "handle {:08X} "
+                  "(MoveToHighSlot status {:08X}): later guest handles are shifted in this run",
+                  guest_header, as_type, object->handle(), moved);
+    } else {
+      // REX_LOG_LAZY_OBJECTS=1: one line per lazy object (a diagnostic; about 1600 in a 7000-frame DOA4 session).
+      static const bool log_lazy = [] {
+        const char* v = std::getenv("REX_LOG_LAZY_OBJECTS");
+        return v && v[0] == '1';
+      }();
+      if (log_lazy) {
+        REXSYS_INFO("GetNativeObject: lazy object for header {:08X} (type {}) handle {:08X}", guest_header, as_type,
+                    object->handle());
+      }
     }
 
     // Stash pointer in struct.

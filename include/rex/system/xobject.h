@@ -151,8 +151,9 @@ class XObject {
 
   Type type() const;
 
-  // Returns the primary handle of this object.
-  X_HANDLE handle() const { return handles_[0]; }
+  // Returns the primary handle of this object; 0 for an object left with no handle (a lazy object evicted by
+  // ObjectTable::MoveToHighSlot). RetainHandle and ReleaseHandle are no-ops then (asserted in debug builds).
+  X_HANDLE handle() const { return handles_.empty() ? X_HANDLE(0) : handles_[0]; }
 
   // Returns all associated handles with this object.
   std::vector<X_HANDLE> handles() const { return handles_; }
