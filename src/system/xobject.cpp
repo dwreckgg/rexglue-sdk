@@ -13,6 +13,7 @@
 #include <vector>
 
 #include <rex/chrono/clock.h>
+#include <rex/memory/utils.h>  // load_and_swap (the lazy-object log's guest back chain)
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/util/string_utils.h>  // For TranslateAnsiStringAddress
@@ -464,8 +465,32 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
         return v && v[0] == '1';
       }();
       if (log_lazy) {
-        REXSYS_INFO("GetNativeObject: lazy object for header {:08X} (type {}) handle {:08X}", guest_header, as_type,
-                    object->handle());
+        // The guest caller: lr = the return address into the code that called the kernel export; lr2 = the
+        // return address that code's own prologue saved (back chain [r1], saved LR at [chain - 8]), read only
+        // from readable guest stack pages, 0 where it cannot be read (a leaf caller gives a stale lr2).
+        uint32_t lr = 0, lr2 = 0, guest_tid = 0;
+        if (XThread* thread = XThread::GetCurrentThread()) {
+          guest_tid = thread->thread_id();
+          if (auto* ctx = thread->thread_state() ? thread->thread_state()->context() : nullptr) {
+            lr = uint32_t(ctx->lr);
+            auto* mem = kernel_state->memory();
+            auto readable = [mem](uint32_t a) {
+              uint32_t protect = 0;
+              auto* heap = (a >= 0x70000000u && a < 0x7F000000u) ? mem->LookupHeap(a) : nullptr;
+              return heap && heap->QueryProtect(a, &protect) && (protect & rex::memory::kMemoryProtectRead);
+            };
+            const uint32_t r1 = ctx->r1.u32;
+            if (readable(r1)) {
+              const uint32_t chain = rex::memory::load_and_swap<uint32_t>(mem->TranslateVirtual(r1));
+              if (readable(chain - 8)) {
+                lr2 = rex::memory::load_and_swap<uint32_t>(mem->TranslateVirtual(chain - 8));
+              }
+            }
+          }
+        }
+        REXSYS_INFO("GetNativeObject: lazy object for header {:08X} (type {}) handle {:08X} lr {:08X} lr2 {:08X} "
+                    "guest thread {}",
+                    guest_header, as_type, object->handle(), lr, lr2, guest_tid);
       }
     }
 
