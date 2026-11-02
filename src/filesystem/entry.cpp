@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 
 #include <rex/filesystem.h>
 #include <rex/filesystem/device.h>
@@ -17,6 +18,25 @@
 #include <rex/string.h>
 
 namespace rex::filesystem {
+
+namespace {
+// Entry::set_fixed_timestamp: 0 = off (each entry's own times).
+std::atomic<uint64_t> g_fixed_timestamp{0};
+
+uint64_t Reported(uint64_t own) {
+  const uint64_t fixed = g_fixed_timestamp.load(std::memory_order_relaxed);
+  return fixed ? fixed : own;
+}
+}  // namespace
+
+void Entry::set_fixed_timestamp(uint64_t filetime) {
+  g_fixed_timestamp.store(filetime, std::memory_order_release);
+}
+uint64_t Entry::fixed_timestamp() { return g_fixed_timestamp.load(std::memory_order_acquire); }
+
+uint64_t Entry::create_timestamp() const { return Reported(create_timestamp_); }
+uint64_t Entry::access_timestamp() const { return Reported(access_timestamp_); }
+uint64_t Entry::write_timestamp() const { return Reported(write_timestamp_); }
 
 Entry::Entry(Device* device, Entry* parent, const std::string_view path)
     : device_(device),

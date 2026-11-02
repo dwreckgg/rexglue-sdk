@@ -89,9 +89,11 @@ class Entry {
   uint32_t attributes() const { return attributes_; }
   size_t size() const { return size_; }
   size_t allocation_size() const { return allocation_size_; }
-  uint64_t create_timestamp() const { return create_timestamp_; }
-  uint64_t access_timestamp() const { return access_timestamp_; }
-  uint64_t write_timestamp() const { return write_timestamp_; }
+  // The times the guest is shown (NtQueryInformationFile, NtQueryDirectoryFile, the CRT's find and
+  // attribute calls): the entry's own, or the fixed timestamp while one is set (below).
+  uint64_t create_timestamp() const;
+  uint64_t access_timestamp() const;
+  uint64_t write_timestamp() const;
   bool delete_on_close() const { return delete_on_close_; }
 
   virtual bool SetAttributes([[maybe_unused]] uint64_t attributes) { return false; }
@@ -101,6 +103,15 @@ class Entry {
   void SetForDeletion(bool delete_on_close) { delete_on_close_ = delete_on_close; }
 
   bool is_read_only() const;
+
+  // Netplay (lockstep sessions): a FILETIME that every entry reports as its create, access and write
+  // time (the change time is the write time) instead of its own, unset (0) by default. A host-path
+  // entry's own times are the host file's, which differ between two installs of the same game folder
+  // (extracted or copied at different moments), so a guest that keeps them would differ between the
+  // two PCs of a session. Process-wide and read at every query, so it also covers entries made before
+  // it was set; the entries' own times are kept, and setting 0 shows them again.
+  static void set_fixed_timestamp(uint64_t filetime);
+  static uint64_t fixed_timestamp();
 
   Entry* GetChild(const std::string_view name);
   Entry* ResolvePath(const std::string_view path);
