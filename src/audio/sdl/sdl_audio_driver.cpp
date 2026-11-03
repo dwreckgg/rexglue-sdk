@@ -34,6 +34,10 @@ namespace rex::audio {
 namespace {
 std::atomic<uint32_t> g_output_info{0};  // device_channels | stream_channels << 8
 }  // namespace
+// Netplay diagnostics (rex_audio_out_stats): output chunks the device asked for while no guest frame was
+// queued (each became silence), and the queue depth after the last push or pop. Read-only telemetry.
+std::atomic<uint64_t> g_out_silence_fills{0};
+std::atomic<uint32_t> g_out_queue_depth{0};
 
 void SetOutputInfo(const OutputInfo& info) {
   g_output_info.store(uint32_t(info.device_channels) | (uint32_t(info.stream_channels) << 8),
@@ -151,6 +155,7 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
   {
     std::unique_lock<std::mutex> guard(frames_mutex_);
     frames_queued_.push(output_frame);
+    g_out_queue_depth.store(uint32_t(frames_queued_.size()), std::memory_order_relaxed);
     PROFILE_BUFFER_QUEUE_DEPTH(static_cast<int64_t>(frames_queued_.size()));
   }
 }
@@ -199,6 +204,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
         REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
         sdl_callback_count++;
       }
+      g_out_silence_fills.fetch_add(1, std::memory_order_relaxed);
       std::memset(data, 0, len);
       if (!SDL_PutAudioStreamData(stream, data, len)) {
         REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
@@ -208,6 +214,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     } else {
       auto buffer = driver->frames_queued_.front();
       driver->frames_queued_.pop();
+      g_out_queue_depth.store(uint32_t(driver->frames_queued_.size()), std::memory_order_relaxed);
       if (REXCVAR_GET(audio_mute)) {
         std::memset(data, 0, len);
       } else {
@@ -239,3 +246,10 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
 }
 
 }  // namespace rex::audio::sdl
+
+// Netplay diagnostics: silence chunks filled because no guest frame was queued (a dropout), and the current
+// output queue depth in guest frames of 256 samples.
+extern "C" __declspec(dllexport) void rex_audio_out_stats(uint64_t* silence_fills, uint32_t* queue_depth) {
+  *silence_fills = rex::audio::g_out_silence_fills.load(std::memory_order_relaxed);
+  *queue_depth = rex::audio::g_out_queue_depth.load(std::memory_order_relaxed);
+}
