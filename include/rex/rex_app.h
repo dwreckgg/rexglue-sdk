@@ -186,6 +186,8 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   ui::Window* window() const { return window_.get(); }
   ui::ImGuiDrawer* imgui_drawer() const { return imgui_drawer_.get(); }
   ui::ImmediateDrawer* immediate_drawer() const { return immediate_drawer_.get(); }
+  /// True while the SDK's own debug, console or settings overlay is open.
+  bool HasSdkOverlayOpen() const { return debug_overlay_ || console_overlay_ || settings_overlay_; }
 
   const std::filesystem::path& game_data_root() const { return game_data_root_; }
   const std::filesystem::path& user_data_root() const { return user_data_root_; }
