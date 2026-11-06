@@ -30,7 +30,8 @@ REXCVAR_DEFINE_BOOL(d3d12_break_on_warning, false, "UI/D3D12",
                     "Break on Direct3D 12 validation warnings");
 
 REXCVAR_DEFINE_INT32(d3d12_adapter, -1, "UI/D3D12",
-                     "Index of the DXGI adapter to use (-1 for any physical, -2 for WARP)")
+                     "Index of the DXGI adapter to use (-1 for a discrete GPU, else the first physical, "
+                     "-2 for WARP)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_INT32(d3d12_queue_priority, 1, "UI/D3D12",
@@ -250,10 +251,61 @@ bool D3D12Provider::Initialize() {
     return false;
   }
 
-  // Choose the adapter.
+  // Choose the adapter. Automatic (-1): a discrete GPU over an integrated one, then the most dedicated
+  // memory. Windows' own order is no guide: it lists the GPU driving the display first (the integrated
+  // one on many hybrid laptops), and EnumAdapterByGpuPreference follows a per-application setting. The
+  // indices logged here are the ones d3d12_adapter counts; the loop below handles an explicit index
+  // and WARP.
   uint32_t adapter_index = 0;
   IDXGIAdapter1* adapter = nullptr;
-  while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
+  {
+    const bool automatic = REXCVAR_GET(d3d12_adapter) == -1;
+    bool best_discrete = false;
+    uint64_t best_memory = 0;
+    IDXGIAdapter1* listed = nullptr;
+    for (uint32_t i = 0; dxgi_factory->EnumAdapters1(i, &listed) == S_OK; ++i) {
+      DXGI_ADAPTER_DESC1 desc;
+      bool usable = false;
+      bool uma = false;
+      if (SUCCEEDED(listed->GetDesc1(&desc))) {
+        const bool software = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+        if (!software) {
+          ID3D12Device* device = nullptr;
+          if (SUCCEEDED(pfn_d3d12_create_device_(listed, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) {
+            usable = true;
+            D3D12_FEATURE_DATA_ARCHITECTURE architecture = {};
+            if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &architecture,
+                                                      sizeof(architecture)))) {
+              uma = architecture.UMA != 0;
+            }
+            device->Release();
+          }
+        }
+        char name[256] = {};
+        WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+        const uint64_t memory = desc.DedicatedVideoMemory;
+        REXGPU_INFO("DXGI adapter {}: {} ({} MB dedicated, {})", i, name, memory / (1024 * 1024),
+                    software ? "software" : !usable ? "no Direct3D 12" : uma ? "integrated" : "discrete");
+        const bool discrete = usable && !uma;
+        if (automatic && usable &&
+            (adapter == nullptr || (discrete && !best_discrete) ||
+             (discrete == best_discrete && memory > best_memory))) {
+          if (adapter != nullptr) {
+            adapter->Release();
+          }
+          adapter = listed;
+          listed = nullptr;
+          best_discrete = discrete;
+          best_memory = memory;
+        }
+      }
+      if (listed != nullptr) {
+        listed->Release();
+        listed = nullptr;
+      }
+    }
+  }
+  while (adapter == nullptr && dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
     DXGI_ADAPTER_DESC1 adapter_desc;
     if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
       if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device),
