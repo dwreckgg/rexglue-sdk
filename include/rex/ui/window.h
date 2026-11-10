@@ -318,9 +318,13 @@ class Window {
   }
   // For the presenter, after a kRetryLater (rex/ui/exclusive_fullscreen.h): schedules the next try (Win32: a
   // kRetryIntervalMs timer on the UI thread) if fewer than kRetryTries were made since the last reset; returns whether
-  // it did. The count resets on a focus gain, an activation, a new request and a successful entry.
+  // it did. The count resets on a focus gain, an activation, a new request and a successful entry. When it returns
+  // false (the budget is spent, exclusive_fullscreen::AfterRetryLater) the presenter blocks new attempts
+  // (OnFullscreenExclusiveBlocked; Task 9c review I1).
   bool OnFullscreenExclusiveRetryLater() {
-    if (fullscreen_exclusive_retries_ >= exclusive_fullscreen::kRetryTries || !CanApplyState()) {
+    using exclusive_fullscreen::RetryStep;
+    if (exclusive_fullscreen::AfterRetryLater(fullscreen_exclusive_retries_) != RetryStep::kSchedule ||
+        !CanApplyState()) {
       return false;
     }
     ++fullscreen_exclusive_retries_;
@@ -338,6 +342,23 @@ class Window {
       fullscreen_exclusive_retries_ = 0;
       RequestFullscreenExclusiveUpdate("the window was activated");
     }
+  }
+  // Applies a changed exclusive fullscreen mode (the fullscreen_exclusive_mode cvar, set by the caller first) while
+  // exclusive fullscreen is active: the posted update switches the display mode in place (ResizeTarget, then the
+  // buffers; no pass through windowed or the desktop mode; Task 9c review I2). When exclusive fullscreen is not active
+  // nothing needs doing (the mode is read at each entry) and this only asks for the update, which then changes nothing
+  // or enters. UI thread; `reason` must be a string literal (logged when the posted update runs).
+  void ReapplyFullscreenExclusiveMode(const char* reason = "ReapplyFullscreenExclusiveMode") {
+    if (fullscreen_ && fullscreen_exclusive_) {
+      fullscreen_exclusive_mode_reapply_ = true;
+      RequestFullscreenExclusiveUpdate(reason);
+    }
+  }
+  // For the presenter's update: whether a mode reapply is pending; clears it.
+  bool TakeFullscreenExclusiveModeReapply() {
+    const bool pending = fullscreen_exclusive_mode_reapply_;
+    fullscreen_exclusive_mode_reapply_ = false;
+    return pending;
   }
   // For the presenter, after leaving exclusive fullscreen (Task 9 review M7): DXGI puts back the window rect it saved
   // when entering, which a ResizeTarget at a mode other than the desktop's had changed. While the window is still
@@ -780,6 +801,8 @@ class Window {
   bool fullscreen_exclusive_blocked_ = false;
   // Tries scheduled since the last reset (OnFullscreenExclusiveRetryLater).
   uint32_t fullscreen_exclusive_retries_ = 0;
+  // Set by ReapplyFullscreenExclusiveMode, taken by the presenter's next exclusive update.
+  bool fullscreen_exclusive_mode_reapply_ = false;
 
   std::string title_;
 

@@ -146,7 +146,7 @@ class VulkanPresenter final : public Presenter {
                               std::function<bool(GuestOutputRefreshContext& context)> refresher,
                               bool& is_8bpc_out_ref) override;
 
-  PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
+  PaintResult PaintAndPresentImpl(bool execute_ui_drawers, bool ui_thread_presentation_wanted) override;
 
  private:
   // Usable for both the guest output image itself and for intermediate images.

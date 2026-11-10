@@ -688,8 +688,8 @@ void Win32Window::ResizeWindowedClientNow(uint32_t width, uint32_t height, const
   w = std::min(w, LONG(work.right - work.left));
   h = std::min(h, LONG(work.bottom - work.top));
   // Inside the work area: keep the top-left where it fits, else move it in.
-  const LONG x = std::max(LONG(work.left), std::min(window_rect.left, LONG(work.right - w)));
-  const LONG y = std::max(LONG(work.top), std::min(window_rect.top, LONG(work.bottom - h)));
+  const LONG x = display_mode::PlaceInside(window_rect.left, w, work.left, work.right);
+  const LONG y = display_mode::PlaceInside(window_rect.top, h, work.top, work.bottom);
   if (IsZoomed(hwnd_)) {
     ShowWindow(hwnd_, SW_RESTORE);
   }
@@ -707,21 +707,25 @@ void Win32Window::ApplyWindowedClientSizeImpl(uint32_t width, uint32_t height) {
     return;
   }
   // Fullscreen: the size the window returns to when it leaves fullscreen (ApplyNewFullscreen puts
-  // pre_fullscreen_placement_ back). rcNormalPosition is in workspace coordinates (the work area's origin is 0,0).
+  // pre_fullscreen_placement_ back). rcNormalPosition is in workspace coordinates: screen coordinates minus the primary
+  // monitor's work-area origin. The window's monitor's work area is converted into them, so a window on a secondary
+  // monitor stays on it (Task 9c review M4; the old clamp to [0, work size) assumed the primary monitor).
   HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
-  MONITORINFO monitor_info;
+  HMONITOR primary = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+  MONITORINFO monitor_info, primary_info;
   monitor_info.cbSize = sizeof(monitor_info);
-  if (!monitor || !GetMonitorInfo(monitor, &monitor_info)) {
+  primary_info.cbSize = sizeof(primary_info);
+  if (!monitor || !GetMonitorInfo(monitor, &monitor_info) || !primary || !GetMonitorInfo(primary, &primary_info)) {
     return;
   }
-  const LONG work_w = monitor_info.rcWork.right - monitor_info.rcWork.left;
-  const LONG work_h = monitor_info.rcWork.bottom - monitor_info.rcWork.top;
+  const RECT& work = monitor_info.rcWork;
+  const LONG origin_x = primary_info.rcWork.left, origin_y = primary_info.rcWork.top;
   const RECT frame = WindowedRectForClient(width, height);
-  const LONG w = std::min(LONG(frame.right - frame.left), work_w);
-  const LONG h = std::min(LONG(frame.bottom - frame.top), work_h);
+  const LONG w = std::min(LONG(frame.right - frame.left), LONG(work.right - work.left));
+  const LONG h = std::min(LONG(frame.bottom - frame.top), LONG(work.bottom - work.top));
   RECT& normal = pre_fullscreen_placement_.rcNormalPosition;
-  normal.left = std::max(LONG(0), std::min(normal.left, work_w - w));
-  normal.top = std::max(LONG(0), std::min(normal.top, work_h - h));
+  normal.left = display_mode::PlaceInside(normal.left, w, work.left - origin_x, work.right - origin_x);
+  normal.top = display_mode::PlaceInside(normal.top, h, work.top - origin_y, work.bottom - origin_y);
   normal.right = normal.left + w;
   normal.bottom = normal.top + h;
   pre_fullscreen_normal_client_width_ = width;

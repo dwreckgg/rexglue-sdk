@@ -1494,7 +1494,9 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   return true;
 }
 
-Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers,
+                                                             bool ui_thread_presentation_wanted) {
+  (void)ui_thread_presentation_wanted;  // no implementation wish for UI-thread presents here
   // Begin the submission in place of the one not currently potentially used on
   // the GPU.
   uint64_t current_paint_submission_index =

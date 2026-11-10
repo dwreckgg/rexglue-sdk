@@ -662,6 +662,14 @@ class Presenter {
     (void)reason;
     return ExclusiveFullscreenChange::kUnchanged;
   }
+  // Called by UpdateExclusiveFullscreenFromUIThread instead of SetExclusiveFullscreenFromUIThreadImpl when exclusive
+  // fullscreen is active, still wanted, and Window::ReapplyFullscreenExclusiveMode asked for it: switches the display
+  // mode in place to the current target (kModeChanged), or returns kUnchanged (already at it, or the switch failed and
+  // the old mode stays). Same conditions as SetExclusiveFullscreenFromUIThreadImpl.
+  virtual ExclusiveFullscreenChange ReapplyExclusiveFullscreenModeFromUIThreadImpl(const char* reason) {
+    (void)reason;
+    return ExclusiveFullscreenChange::kUnchanged;
+  }
   // For PaintAndPresentImpl while exclusive (which then runs on the UI thread): asks the window to run the update
   // (posted), for example when DXGI has left exclusive fullscreen by itself.
   void RequestExclusiveFullscreenUpdateViaWindow(const char* reason);
@@ -737,8 +745,10 @@ class Presenter {
   // May be called from the non-UI thread, but only to paint the guest output
   // (no UI drawing, with execute_ui_drawers disabled).
   //
-  // Call via PaintAndPresent.
-  virtual PaintResult PaintAndPresentImpl(bool execute_ui_drawers) = 0;
+  // Call via PaintAndPresent. ui_thread_presentation_wanted: WantsUIThreadPresentation as the presenting thread read
+  // it once for this present (D3D12: present_vsync), so the paint mode decision and the present call agree within a
+  // frame (Task 9c review M2).
+  virtual PaintResult PaintAndPresentImpl(bool execute_ui_drawers, bool ui_thread_presentation_wanted) = 0;
 
   // For calling from the painting implementations if requested.
   void ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context);
@@ -867,7 +877,11 @@ class Presenter {
   // may not be made outdated if that happens - though if it's
   // kPresentedSuboptimal rather than kNotPresentedConnectionOutdated, the image
   // has been successfully sent to the OS presentation at least.
-  PaintResult PaintAndPresent(bool execute_ui_drawers);
+  PaintResult PaintAndPresent(bool execute_ui_drawers, bool ui_thread_presentation_wanted);
+  // One line when WantsUIThreadPresentation flips (present_vsync turned on or off), wherever it is first seen: the guest
+  // output thread's refresh or a UI thread paint (Task 9c review M3: a flip while the UI thread already presents, the
+  // Esc menu open, is logged too). Any thread; `where` is a string literal.
+  void NoteUIThreadPresentationWanted(bool wanted, const char* where);
 
   void HandleUIDrawersChangeFromUIThread(bool drawers_were_empty);
 
@@ -902,8 +916,12 @@ class Presenter {
   // UI thread only: the reason of an exclusive fullscreen update that arrived during a UI thread paint, posted again
   // when the paint ends (null: none).
   const char* exclusive_fullscreen_update_after_paint_ = nullptr;
-  // UI thread only: the WantsUIThreadPresentation value last logged (SetPaintModeFromUIThread).
-  bool ui_thread_presentation_logged_ = false;
+  // The WantsUIThreadPresentation value last logged (NoteUIThreadPresentationWanted; any thread).
+  std::atomic<bool> ui_thread_presentation_logged_{false};
+  // UI thread only: an exclusive fullscreen update is running (UpdateExclusiveFullscreenFromUIThread). The swap chain
+  // reconnects its own window resizes cause post no further update meanwhile (exclusive_fullscreen::
+  // PostUpdateOnConnect; Task 9c review I1).
+  bool exclusive_fullscreen_update_in_progress_ = false;
 
   // The surface of the `window_` the presenter is currently attached to.
   Surface* surface_ = nullptr;

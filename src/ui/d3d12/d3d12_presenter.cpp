@@ -598,7 +598,8 @@ bool DesktopModeDesc(IDXGIOutput* output, DXGI_FORMAT format, DXGI_MODE_DESC& mo
   return true;
 }
 
-// The output's modes of `format` (GetDisplayModeList, interlaced and scaled variants included as DXGI lists them).
+// The output's modes of `format` (GetDisplayModeList with flags 0: progressive, unscaled modes only; interlaced and
+// scaled variants, DXGI_ENUM_MODES_INTERLACED and DXGI_ENUM_MODES_SCALING, are not listed).
 std::vector<DXGI_MODE_DESC> OutputModeDescs(IDXGIOutput* output, DXGI_FORMAT format) {
   UINT count = 0;
   if (FAILED(output->GetDisplayModeList(format, 0, &count, nullptr)) || !count) {
@@ -725,8 +726,18 @@ Presenter::ExclusiveFullscreenChange D3D12Presenter::SetExclusiveFullscreenFromU
     if (paint_context_.swap_chain.Get() == swap_chain) {
       return false;
     }
-    REXLOG_WARN("D3D12Presenter: exclusive fullscreen ({}): the swap chain was recreated during {}; stopped", reason,
-                after);
+    // swap_chain_ref is the last reference to the old swap chain, released when this returns; DXGI raises a
+    // non-continuable exception when a swap chain still in fullscreen is released (Task 9c review M1, graded Important
+    // by R85), so leave fullscreen on it first.
+    BOOL old_in_fullscreen = FALSE;
+    HRESULT leave_hr = S_OK;
+    if (SUCCEEDED(swap_chain->GetFullscreenState(&old_in_fullscreen, nullptr)) && old_in_fullscreen) {
+      leave_hr = swap_chain->SetFullscreenState(FALSE, nullptr);
+    }
+    REXLOG_WARN(
+        "D3D12Presenter: exclusive fullscreen ({}): the swap chain was recreated during {}; stopped{}", reason, after,
+        old_in_fullscreen ? fmt::format(" (the old swap chain left fullscreen first: hr {:08X})", uint32_t(leave_hr))
+                          : std::string());
     return true;
   };
   BOOL in_fullscreen = FALSE;
@@ -853,6 +864,7 @@ Presenter::ExclusiveFullscreenChange D3D12Presenter::SetExclusiveFullscreenFromU
   paint_context_.exclusive_present_count = 0;
   paint_context_.exclusive_occlusion_logged = false;
   paint_context_.exclusive_loss_requested = false;
+  paint_context_.exclusive_mode = mode;
   in_fullscreen_after = FALSE;
   swap_chain->GetFullscreenState(&in_fullscreen_after, nullptr);
   const double hz = mode.RefreshRate.Denominator
@@ -872,6 +884,74 @@ Presenter::ExclusiveFullscreenChange D3D12Presenter::SetExclusiveFullscreenFromU
       mode_set_again ? " (mode set again with ResizeTarget)" : "",
       SUCCEEDED(resize_target_hr) ? "" : " (the ResizeTarget before entering failed)", ForegroundState(hwnd));
   return ExclusiveFullscreenChange::kEntered;
+}
+
+Presenter::ExclusiveFullscreenChange D3D12Presenter::ReapplyExclusiveFullscreenModeFromUIThreadImpl(
+    const char* reason) {
+  // UI thread, painting owned by it, exclusive fullscreen active and wanted (Presenter::UpdateExclusiveFullscreen-
+  // FromUIThread). The display mode is switched in place: ResizeTarget in fullscreen sets the output's mode and resizes
+  // the window to it; the caller then resizes the buffers (kModeChanged: ActionsFor's resize, forced here). No pass
+  // through windowed or the desktop mode (Task 9c review I2).
+  const Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain_ref = paint_context_.swap_chain;
+  IDXGISwapChain3* swap_chain = swap_chain_ref.Get();
+  if (!swap_chain || !paint_context_.swap_chain_exclusive) {
+    return ExclusiveFullscreenChange::kUnchanged;
+  }
+  BOOL in_fullscreen = FALSE;
+  if (FAILED(swap_chain->GetFullscreenState(&in_fullscreen, nullptr)) || !in_fullscreen) {
+    // DXGI left it by itself: the ordinary update finds and handles that (kLost).
+    return SetExclusiveFullscreenFromUIThreadImpl(true, reason);
+  }
+  Microsoft::WRL::ComPtr<IDXGIOutput> output;
+  HRESULT hr = swap_chain->GetContainingOutput(&output);
+  DXGI_MODE_DESC mode;
+  if (FAILED(hr) || !GetExclusiveFullscreenTargetMode(output.Get(), mode)) {
+    REXLOG_WARN("D3D12Presenter: exclusive fullscreen mode not changed ({}): no target mode (GetContainingOutput hr "
+                "{:08X}); the current mode stays",
+                reason, uint32_t(hr));
+    return ExclusiveFullscreenChange::kUnchanged;
+  }
+  const DXGI_MODE_DESC& was = paint_context_.exclusive_mode;
+  if (mode.Width == was.Width && mode.Height == was.Height &&
+      uint64_t(mode.RefreshRate.Numerator) * was.RefreshRate.Denominator ==
+          uint64_t(was.RefreshRate.Numerator) * mode.RefreshRate.Denominator) {
+    REXLOG_INFO("D3D12Presenter: exclusive fullscreen mode unchanged ({}): already {}x{} @ {}/{} Hz", reason,
+                mode.Width, mode.Height, mode.RefreshRate.Numerator, mode.RefreshRate.Denominator);
+    return ExclusiveFullscreenChange::kUnchanged;
+  }
+  paint_context_.AwaitSwapChainUsageCompletion();
+  hr = swap_chain->ResizeTarget(&mode);
+  if (paint_context_.swap_chain.Get() != swap_chain) {
+    // Recreated during the call (a failed resize in the re-entered WM_SIZE): leave fullscreen on the old one before it
+    // is released (as `replaced` does in SetExclusiveFullscreenFromUIThreadImpl), and block like a loss.
+    BOOL old_in_fullscreen = FALSE;
+    if (SUCCEEDED(swap_chain->GetFullscreenState(&old_in_fullscreen, nullptr)) && old_in_fullscreen) {
+      swap_chain->SetFullscreenState(FALSE, nullptr);
+    }
+    REXLOG_WARN("D3D12Presenter: exclusive fullscreen ({}): the swap chain was recreated during the mode change "
+                "ResizeTarget; stopped",
+                reason);
+    return ExclusiveFullscreenChange::kFailed;
+  }
+  if (FAILED(hr)) {
+    REXLOG_WARN("D3D12Presenter: exclusive fullscreen mode not changed ({}): ResizeTarget {}x{} @ {}/{} Hz hr {:08X}; "
+                "the current mode stays",
+                reason, mode.Width, mode.Height, mode.RefreshRate.Numerator, mode.RefreshRate.Denominator,
+                uint32_t(hr));
+    return ExclusiveFullscreenChange::kUnchanged;
+  }
+  paint_context_.exclusive_mode = mode;
+  paint_context_.swap_chain_resize_forced = true;
+  paint_context_.exclusive_present_count = 0;
+  DEVMODEW now;
+  const bool now_known = GetOutputDesktopMode(output.Get(), now, nullptr);
+  REXLOG_INFO(
+      "D3D12Presenter: exclusive fullscreen mode changed ({}): {}x{} @ {}/{} Hz -> {}x{} @ {}/{} Hz; output now at "
+      "{}x{} @ {} Hz",
+      reason, was.Width, was.Height, was.RefreshRate.Numerator, was.RefreshRate.Denominator, mode.Width, mode.Height,
+      mode.RefreshRate.Numerator, mode.RefreshRate.Denominator, now_known ? now.dmPelsWidth : 0,
+      now_known ? now.dmPelsHeight : 0, now_known ? now.dmDisplayFrequency : 0);
+  return ExclusiveFullscreenChange::kModeChanged;
 }
 
 bool D3D12Presenter::RefreshGuestOutputImpl(
@@ -964,7 +1044,8 @@ bool D3D12Presenter::PaintContext::LeaveFullscreenStateForRelease(const char* re
   return true;
 }
 
-Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers,
+                                                            bool ui_thread_presentation_wanted) {
   // Begin the command list with the command allocator not currently potentially
   // used on the GPU.
   UINT64 current_paint_submission = paint_context_.paint_submission_tracker.GetCurrentSubmission();
@@ -1570,7 +1651,9 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // every present, so a change applies from the next frame) waits for the monitor's refresh, without the tearing flag.
   // present_vsync off and not exclusive: the call is as before (interval 0, the tearing flag if the swap chain has it).
   const bool exclusive = paint_context_.swap_chain_exclusive;
-  const bool vsync = REXCVAR_GET(present_vsync);
+  // present_vsync as the presenting thread read it once for this present (WantsUIThreadPresentation; Task 9c review
+  // M2), so a guest output thread present never waits for the refresh.
+  const bool vsync = ui_thread_presentation_wanted;
   const present_choice::PresentChoice choice =
       present_choice::Choose(exclusive, vsync, paint_context_.swap_chain_allows_tearing);
   const UINT present_flags =

@@ -120,13 +120,14 @@ class D3D12Presenter final : public Presenter {
   void DisconnectPaintingFromSurfaceFromUIThreadImpl() override;
   ExclusiveFullscreenChange SetExclusiveFullscreenFromUIThreadImpl(bool want,
                                                                    const char* reason) override;
+  ExclusiveFullscreenChange ReapplyExclusiveFullscreenModeFromUIThreadImpl(const char* reason) override;
 
   bool RefreshGuestOutputImpl(uint32_t mailbox_index, uint32_t frontbuffer_width,
                               uint32_t frontbuffer_height,
                               std::function<bool(GuestOutputRefreshContext& context)> refresher,
                               bool& is_8bpc_out) override;
 
-  PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
+  PaintResult PaintAndPresentImpl(bool execute_ui_drawers, bool ui_thread_presentation_wanted) override;
 
  private:
   struct GuestOutputPaintRectangleConstants {
@@ -288,6 +289,9 @@ class D3D12Presenter final : public Presenter {
     uint32_t exclusive_present_count = 0;
     bool exclusive_occlusion_logged = false;
     bool exclusive_loss_requested = false;
+    // The mode exclusive fullscreen was entered at, or last switched to (ReapplyExclusiveFullscreenModeFromUIThreadImpl);
+    // UI thread only, meaningful while swap_chain_exclusive.
+    DXGI_MODE_DESC exclusive_mode = {};
     // The Present call last logged (rex/ui/present_choice.h): -1 none yet, else sync interval * 2 + tearing flag. Only
     // the presenting thread (painting is owned by one thread at a time) reads and writes it.
     int32_t present_choice_logged = -1;

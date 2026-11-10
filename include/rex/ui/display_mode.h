@@ -40,7 +40,9 @@ inline std::string ModeText(const DisplayMode& m) {
 }
 
 // A refresh in the text matches a mode's rational within this (the text keeps 3 decimals, so 0.0005 of rounding, and
-// a hand-written 59.94 against 60000/1001 = 59.94006 is 0.00006 off; two real modes are never this close).
+// a hand-written 59.94 against 60000/1001 = 59.94006 is 0.00006 off). Two offered modes can be this close (60000/1001
+// and 59940/1000 differ by 0.00006 Hz): ChooseMode then takes the first in the monitor's list; to the monitor both are
+// the same rate.
 constexpr double kRefreshMatchHz = 0.001;
 
 namespace detail {
@@ -155,6 +157,15 @@ inline Choice ChooseMode(std::string_view text, const std::vector<DisplayMode>& 
     }
   }
   return {Pick::kFallback, desktop, "the monitor does not offer this mode"};
+}
+
+// One axis of a window's placement inside a monitor's work area [area_begin, area_end): the start of a span of `size`
+// at `pos` where it fits, else moved in (the area's begin when the span is larger than the area). The area must be in
+// the coordinates `pos` is in: screen coordinates for a live window, workspace coordinates (screen minus the primary
+// monitor's work-area origin) for a WINDOWPLACEMENT's rcNormalPosition, so a window on a secondary monitor stays there
+// (Task 9c review M4).
+constexpr int32_t PlaceInside(int32_t pos, int32_t size, int32_t area_begin, int32_t area_end) {
+  return std::max(area_begin, std::min(pos, area_end - size));
 }
 
 // The windowed client sizes the menu offers: the 16:9 sizes below whose window (the client size plus the frame,

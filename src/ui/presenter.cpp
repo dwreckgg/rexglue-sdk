@@ -488,7 +488,10 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       // doesn't limit the frame rate.
       WaitForUITickFromUIThread();
 
-      paint_result = PaintAndPresent(draw_ui);
+      // present_vsync read once for this present (Task 9c review M2), and its flip logged here too (M3).
+      const bool ui_thread_presentation_wanted = WantsUIThreadPresentation();
+      NoteUIThreadPresentationWanted(ui_thread_presentation_wanted, "a UI thread paint");
+      paint_result = PaintAndPresent(draw_ui, ui_thread_presentation_wanted);
       if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
         // Request another PaintFromUIThread which will try to recover from the
         // outdated connection in the next frame (not immediately, so the
@@ -641,9 +644,13 @@ bool Presenter::RefreshGuestOutput(
         // Only window paint requesting is accessible.
         RequestPaintOrConnectionRecoveryViaWindow(true);
         break;
-      case PaintMode::kGuestOutputThreadImmediately:
-        // Both painting and window paint requesting are accessible.
-        if (WantsUIThreadPresentation()) {
+      case PaintMode::kGuestOutputThreadImmediately: {
+        // Both painting and window paint requesting are accessible. present_vsync is read once per frame here and
+        // carried to the present (Task 9c review M2): a flip between two reads can no longer give one interval-1
+        // present on this thread.
+        const bool ui_thread_presentation_wanted = WantsUIThreadPresentation();
+        NoteUIThreadPresentationWanted(ui_thread_presentation_wanted, "the guest output refresh");
+        if (ui_thread_presentation_wanted) {
           // The implementation now wants UI-thread presents (present_vsync turned on mid-run): do not present here;
           // the UI thread paints this frame, and its paint sets the paint mode to the desired kUIThreadOnRequest at
           // its end (PaintFromUIThread). The guest output thread only requests the paint (no wait on the UI thread).
@@ -651,12 +658,13 @@ bool Presenter::RefreshGuestOutput(
           break;
         }
         if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
-          paint_result = PaintAndPresent(false);
+          paint_result = PaintAndPresent(false, ui_thread_presentation_wanted);
           if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
             RequestPaintOrConnectionRecoveryViaWindow(true);
           }
         }
         break;
+      }
     }
   }
   // Handle GPU loss when not in the middle of the function anymore, and
@@ -843,8 +851,21 @@ void Presenter::UpdateExclusiveFullscreenFromUIThread(const char* reason, bool l
   if (paint_mode_ == PaintMode::kGuestOutputThreadImmediately) {
     SetPaintModeFromUIThread(PaintMode::kUIThreadOnRequest);
   }
+  // From here to the end of this update, the window resizes DXGI's calls and the placement restore cause reconnect the
+  // swap chain without posting another update (Task 9c review I1 (a); set before the calls, #0570). The update itself
+  // decides on the state it leaves: a retry runs at the timer, nothing else.
+  struct UpdateInProgress {
+    bool& flag;
+    const bool before;
+    explicit UpdateInProgress(bool& f) : flag(f), before(f) { flag = true; }
+    ~UpdateInProgress() { flag = before; }
+  } update_in_progress(exclusive_fullscreen_update_in_progress_);
   const uint32_t retries_before = window_->FullscreenExclusiveRetries();
-  const ExclusiveFullscreenChange change = SetExclusiveFullscreenFromUIThreadImpl(want, why);
+  // A changed mode while exclusive (Window::ReapplyFullscreenExclusiveMode, Task 9c review I2): switched in place.
+  const bool reapply_mode = window_->TakeFullscreenExclusiveModeReapply();
+  const ExclusiveFullscreenChange change = (reapply_mode && want && IsExclusiveFullscreenActiveFromUIThread())
+                                               ? ReapplyExclusiveFullscreenModeFromUIThreadImpl(why)
+                                               : SetExclusiveFullscreenFromUIThreadImpl(want, why);
   const exclusive_fullscreen::Actions actions = exclusive_fullscreen::ActionsFor(change);
   if (actions.block) {
     window_->OnFullscreenExclusiveBlocked();
@@ -856,9 +877,12 @@ void Presenter::UpdateExclusiveFullscreenFromUIThread(const char* reason, bool l
     window_->ResetFullscreenExclusiveRetries();
   }
   if (actions.retry && !window_->OnFullscreenExclusiveRetryLater()) {
+    // The budget is spent (exclusive_fullscreen::AfterRetryLater): blocked, so only the window's activation, its next
+    // focus gain or a new request try again (Task 9c review I1 (b)).
+    window_->OnFullscreenExclusiveBlocked();
     REXLOG_INFO(
-        "Presenter: exclusive fullscreen still refused after {} retries {} ms apart; tried again when the window is "
-        "activated or gets the focus",
+        "Presenter: exclusive fullscreen still refused after {} retries {} ms apart; blocked until the window is "
+        "activated, gets the focus or exclusive fullscreen is requested again",
         exclusive_fullscreen::kRetryTries, exclusive_fullscreen::kRetryIntervalMs);
   }
   if (actions.restore_placement) {
@@ -881,7 +905,8 @@ void Presenter::UpdateExclusiveFullscreenFromUIThread(const char* reason, bool l
       bool request_repaint = false;
       UpdateSurfacePaintConnectionFromUIThread(&request_repaint, true);
     }
-    if (change == ExclusiveFullscreenChange::kEntered && !IsExclusiveFullscreenActiveFromUIThread()) {
+    if ((change == ExclusiveFullscreenChange::kEntered || change == ExclusiveFullscreenChange::kModeChanged) &&
+        !IsExclusiveFullscreenActiveFromUIThread()) {
       // The resize failed and the swap chain was recreated (windowed): no new attempt until the next focus gain.
       window_->OnFullscreenExclusiveBlocked();
     }
@@ -1418,18 +1443,22 @@ void Presenter::SetPaintModeFromUIThread(PaintMode new_mode) {
     std::lock_guard<std::mutex> lock(paint_mode_mutex_);
     paint_mode_ = new_mode;
   }
-  // One line when the implementation's own wish for UI-thread presents (present_vsync) flips, at the paint mode change
-  // it causes (UI thread; never per frame).
-  const bool wants_ui_thread = WantsUIThreadPresentation();
-  if (wants_ui_thread != ui_thread_presentation_logged_) {
-    ui_thread_presentation_logged_ = wants_ui_thread;
-    REXLOG_INFO("Presenter: {} (present_vsync {}); paint mode now {}",
-                wants_ui_thread ? "presenting on the UI thread" : "UI-thread presenting no longer required",
-                wants_ui_thread, new_mode == PaintMode::kUIThreadOnRequest
-                                     ? "the UI thread on request"
-                                     : (new_mode == PaintMode::kNone ? "none" : "the guest output thread"));
-  }
+  // The implementation's own wish for UI-thread presents (present_vsync) is logged where it flips
+  // (NoteUIThreadPresentationWanted); this paint mode change may be the one it causes.
+  NoteUIThreadPresentationWanted(WantsUIThreadPresentation(), "a paint mode change");
   UpdateUITicksNeededFromUIThread();
+}
+
+void Presenter::NoteUIThreadPresentationWanted(bool wanted, const char* where) {
+  // Any thread (the guest output thread's refresh, a UI thread paint, a paint mode change): the first to see a flip
+  // logs it, once.
+  bool logged = ui_thread_presentation_logged_.load(std::memory_order_relaxed);
+  if (logged == wanted ||
+      !ui_thread_presentation_logged_.compare_exchange_strong(logged, wanted, std::memory_order_relaxed)) {
+    return;
+  }
+  REXLOG_INFO("Presenter: present_vsync {} (seen at {}): {}", wanted ? "on" : "off", where,
+              wanted ? "every present on the UI thread" : "UI-thread presenting no longer required by present_vsync");
 }
 
 Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintable) const {
@@ -1519,8 +1548,9 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
           }
           // A new or resized swap chain: enter exclusive fullscreen if the window wants it (posted, so never inside
           // this connection update; a no-op when nothing changed).
-          if (SupportsExclusiveFullscreen() && window_ && window_->IsFullscreen() &&
-              window_->IsFullscreenExclusive()) {
+          if (SupportsExclusiveFullscreen() && window_ &&
+              exclusive_fullscreen::PostUpdateOnConnect(window_->IsFullscreen(), window_->IsFullscreenExclusive(),
+                                                        exclusive_fullscreen_update_in_progress_)) {
             window_->RequestFullscreenExclusiveUpdate("the swap chain was connected");
           }
           // Fallthrough to common success handling.
@@ -1640,10 +1670,10 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
 #endif  // XE_PLATFORM
 }
 
-Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
+Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers, bool ui_thread_presentation_wanted) {
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
-  PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
+  PaintResult result = PaintAndPresentImpl(execute_ui_drawers, ui_thread_presentation_wanted);
   switch (result) {
     case PaintResult::kPresented:
       surface_paint_connection_was_optimal_at_successful_paint_ = true;
