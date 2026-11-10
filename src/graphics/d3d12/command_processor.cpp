@@ -1944,12 +1944,11 @@ bool D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   xenos::TextureFormat frontbuffer_format;
   uint32_t frontbuffer_width_unscaled = 0, frontbuffer_height_unscaled = 0;
   ID3D12Resource* swap_texture_resource =
-      texture_cache_->RequestSwapTexture(swap_texture_srv_desc, frontbuffer_format,
+      texture_cache_->RequestSwapTexture(SwapTextureFetch(), swap_texture_srv_desc, frontbuffer_format,
                                          &frontbuffer_width_unscaled, &frontbuffer_height_unscaled);
   if (!swap_texture_resource) {
     // Dump texture fetch constant 0 for debugging
-    const auto& regs = *register_file_;
-    auto fetch = regs.GetTextureFetch(0);
+    auto fetch = SwapTextureFetch();
     REXGPU_ERROR(
         "IssueSwap: RequestSwapTexture failed - fetch0: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
         fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);

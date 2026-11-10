@@ -157,7 +157,9 @@ class D3D12TextureCache final : public TextureCache {
   // NON_PIXEL_SHADER_RESOURCE state), or nullptr in case of failure, and writes
   // the description of its SRV. May call LoadTextureData, so the same
   // restrictions (such as about descriptor heap change possibility) apply.
-  ID3D12Resource* RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW_DESC& srv_desc_out,
+  // fetch: the swap's texture fetch constant (CommandProcessor::SwapTextureFetch).
+  ID3D12Resource* RequestSwapTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                     D3D12_SHADER_RESOURCE_VIEW_DESC& srv_desc_out,
                                      xenos::TextureFormat& format_out,
                                      uint32_t* width_unscaled_out = nullptr,
                                      uint32_t* height_unscaled_out = nullptr);

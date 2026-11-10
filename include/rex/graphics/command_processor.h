@@ -295,6 +295,16 @@ class CommandProcessor {
   };
   EarlySwap early_swap_;
   bool PresentBeforeVblankWait(memory::RingBuffer peek, int64_t lag_wait_enter);
+  // The fetch constant IssueSwap presents (texture fetch 0): the register file's, or, during the early present, the
+  // swap's own six dwords read from the packet after the wait (the register file keeps the guest's values).
+  const uint32_t* swap_fetch_override_ = nullptr;
+  xenos::xe_gpu_texture_fetch_t SwapTextureFetch() const {
+    if (!swap_fetch_override_) return register_file_->GetTextureFetch(0);
+    xenos::xe_gpu_texture_fetch_t fetch;
+    static_assert(sizeof(fetch) == 6 * sizeof(uint32_t));
+    std::memcpy(&fetch, swap_fetch_override_, sizeof(fetch));
+    return fetch;
+  }
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;

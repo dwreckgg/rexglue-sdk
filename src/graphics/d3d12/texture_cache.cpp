@@ -1365,12 +1365,11 @@ void D3D12TextureCache::CreateCurrentScaledResolveRangeUintPow2UAV(
           element_size_bytes_pow2);
 }
 
-ID3D12Resource* D3D12TextureCache::RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW_DESC& srv_desc_out,
+ID3D12Resource* D3D12TextureCache::RequestSwapTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                                      D3D12_SHADER_RESOURCE_VIEW_DESC& srv_desc_out,
                                                       xenos::TextureFormat& format_out,
                                                       uint32_t* width_unscaled_out,
                                                       uint32_t* height_unscaled_out) {
-  const auto& regs = register_file();
-  xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(0);
   TextureKey key;
   BindingInfoFromFetchConstant(fetch, key, nullptr);
   if (!key.is_valid || key.base_page == 0 || key.dimension != xenos::DataDimension::k2DOrStacked) {

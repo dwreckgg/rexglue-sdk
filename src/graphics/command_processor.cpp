@@ -1215,16 +1215,12 @@ bool CommandProcessor::PresentBeforeVblankWait(memory::RingBuffer peek, int64_t 
     pace_stats::LagGpuLastSwap() = record;
   }
 
-  // Present it with the swap's fetch constant in place, then put the register file back: the type-0 packet after
-  // the wait writes it again through WriteRegister (its side effects untouched).
-  uint32_t* fetch_regs = &register_file_->values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
-  uint32_t saved[6];
-  for (uint32_t i = 0; i < 6; ++i) {
-    saved[i] = fetch_regs[i];
-    fetch_regs[i] = fetch[i];
-  }
+  // Present it with the swap's own fetch constant (SwapTextureFetch), never written into the register file: the
+  // register file stays the guest's (guest-thread MMIO reads it), and the type-0 packet after the wait writes it as
+  // before.
+  swap_fetch_override_ = fetch;
   const bool refreshed = IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
-  for (uint32_t i = 0; i < 6; ++i) fetch_regs[i] = saved[i];
+  swap_fetch_override_ = nullptr;
   if (!refreshed) {
     // Not shown (no presenter, a failed submission or swap texture, a transient refresh failure): the swap packet
     // presents it as before, and counts it.
