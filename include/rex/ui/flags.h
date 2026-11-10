@@ -30,6 +30,8 @@ REXCVAR_DECLARE(int32_t, window_width);
 REXCVAR_DECLARE(int32_t, window_height);
 REXCVAR_DECLARE(bool, fullscreen);
 REXCVAR_DECLARE(bool, fullscreen_exclusive);
+REXCVAR_DECLARE(std::string, fullscreen_exclusive_mode);
+REXCVAR_DECLARE(std::string, window_client_size);
 REXCVAR_DECLARE(int32_t, monitor);
 
 // D3D12

@@ -573,9 +573,10 @@ bool GetOutputDesktopMode(IDXGIOutput* output, DEVMODEW& mode_out, DXGI_OUTPUT_D
 }
 }  // namespace
 
-bool D3D12Presenter::GetExclusiveFullscreenTargetMode(IDXGIOutput* output, DXGI_MODE_DESC& mode_out) {
-  // Today the monitor's current mode (G4c): its size and refresh rate, matched to the closest mode DXGI lists for the
-  // swap chain's format, so the refresh rate is the exact rational the driver uses.
+namespace {
+// The output's current desktop mode as a mode of `format`: its size and refresh rate, matched to the closest mode DXGI
+// lists, so the refresh rate is the exact rational the driver uses.
+bool DesktopModeDesc(IDXGIOutput* output, DXGI_FORMAT format, DXGI_MODE_DESC& mode_out) {
   DEVMODEW desktop;
   if (!GetOutputDesktopMode(output, desktop, nullptr)) {
     return false;
@@ -586,13 +587,103 @@ bool D3D12Presenter::GetExclusiveFullscreenTargetMode(IDXGIOutput* output, DXGI_
   // 0 and 1 mean the hardware default rate: leave the rate unspecified then.
   wanted.RefreshRate.Numerator = desktop.dmDisplayFrequency > 1 ? desktop.dmDisplayFrequency : 0;
   wanted.RefreshRate.Denominator = desktop.dmDisplayFrequency > 1 ? 1 : 0;
-  wanted.Format = kSwapChainFormat;
+  wanted.Format = format;
   if (FAILED(output->FindClosestMatchingMode(&wanted, &mode_out, nullptr)) ||
       mode_out.Width != wanted.Width || mode_out.Height != wanted.Height) {
     // No listed mode of the desktop's size: ask for the desktop mode as it is.
     mode_out = wanted;
   }
   return true;
+}
+
+// The output's modes of `format` (GetDisplayModeList, interlaced and scaled variants included as DXGI lists them).
+std::vector<DXGI_MODE_DESC> OutputModeDescs(IDXGIOutput* output, DXGI_FORMAT format) {
+  UINT count = 0;
+  if (FAILED(output->GetDisplayModeList(format, 0, &count, nullptr)) || !count) {
+    return {};
+  }
+  std::vector<DXGI_MODE_DESC> descs(count);
+  if (FAILED(output->GetDisplayModeList(format, 0, &count, descs.data()))) {
+    return {};
+  }
+  descs.resize(count);
+  return descs;
+}
+
+display_mode::DisplayMode FromDesc(const DXGI_MODE_DESC& m) {
+  return {m.Width, m.Height, m.RefreshRate.Numerator, m.RefreshRate.Denominator};
+}
+}  // namespace
+
+bool D3D12Presenter::GetExclusiveFullscreenTargetMode(IDXGIOutput* output, DXGI_MODE_DESC& mode_out) {
+  DXGI_MODE_DESC desktop;
+  if (!DesktopModeDesc(output, kSwapChainFormat, desktop)) {
+    return false;
+  }
+  const std::string& text = REXCVAR_GET(fullscreen_exclusive_mode);
+  if (text.empty()) {
+    mode_out = desktop;
+    return true;
+  }
+  const std::vector<DXGI_MODE_DESC> descs = OutputModeDescs(output, kSwapChainFormat);
+  std::vector<display_mode::DisplayMode> offered;
+  offered.reserve(descs.size());
+  for (const DXGI_MODE_DESC& m : descs) {
+    offered.push_back(FromDesc(m));
+  }
+  const display_mode::Choice choice = display_mode::ChooseMode(text, offered, FromDesc(desktop));
+  if (choice.pick == display_mode::Pick::kOffered) {
+    // ChooseMode returns the first matching mode in `offered`, which is descs' order: take that desc (its scanline
+    // ordering and scaling as DXGI lists them).
+    for (const DXGI_MODE_DESC& m : descs) {
+      const display_mode::DisplayMode dm = FromDesc(m);
+      if (dm.width == choice.mode.width && dm.height == choice.mode.height &&
+          dm.refresh_num == choice.mode.refresh_num && dm.refresh_den == choice.mode.refresh_den) {
+        mode_out = m;
+        return true;
+      }
+    }
+  }
+  REXLOG_WARN("D3D12Presenter: fullscreen_exclusive_mode '{}': {}; the desktop mode {} instead", text,
+              choice.reason ? choice.reason : "not found", display_mode::ModeText(FromDesc(desktop)));
+  mode_out = desktop;
+  return true;
+}
+
+bool D3D12Presenter::ListExclusiveFullscreenModes(void* hwnd, std::vector<display_mode::DisplayMode>& modes_out,
+                                                  display_mode::DisplayMode& desktop_out) {
+  modes_out.clear();
+  desktop_out = {};
+  HMONITOR monitor = hwnd ? MonitorFromWindow(HWND(hwnd), MONITOR_DEFAULTTONEAREST) : nullptr;
+  if (!monitor) {
+    return false;
+  }
+  Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+  if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+    return false;
+  }
+  Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+  for (UINT a = 0; factory->EnumAdapters1(a, adapter.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; ++a) {
+    Microsoft::WRL::ComPtr<IDXGIOutput> output;
+    for (UINT o = 0; adapter->EnumOutputs(o, output.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; ++o) {
+      DXGI_OUTPUT_DESC desc;
+      if (FAILED(output->GetDesc(&desc)) || desc.Monitor != monitor) {
+        continue;
+      }
+      DXGI_MODE_DESC desktop;
+      if (!DesktopModeDesc(output.Get(), kSwapChainFormat, desktop)) {
+        return false;
+      }
+      std::vector<display_mode::DisplayMode> offered;
+      for (const DXGI_MODE_DESC& m : OutputModeDescs(output.Get(), kSwapChainFormat)) {
+        offered.push_back(FromDesc(m));
+      }
+      desktop_out = FromDesc(desktop);
+      modes_out = display_mode::SortedUniqueModes(std::move(offered), desktop_out);
+      return true;
+    }
+  }
+  return false;
 }
 
 namespace {

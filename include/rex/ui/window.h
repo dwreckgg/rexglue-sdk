@@ -16,6 +16,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <rex/platform.h>
 #include <rex/ui/menu_item.h>
@@ -348,6 +349,18 @@ class Window {
     }
   }
 
+  // The windowed client size (Task 9c, the window_client_size cvar): resizes the client area to width x height
+  // physical pixels, kept inside the monitor's work area. Applied at once while windowed; while fullscreen it becomes
+  // the size the window returns to when it leaves fullscreen. UI thread.
+  void SetWindowedClientSize(uint32_t width, uint32_t height) {
+    if (CanApplyState() && width && height) {
+      ApplyWindowedClientSizeImpl(width, height);
+    }
+  }
+  // The 16:9 client sizes (physical pixels, largest first) whose window fits the work area of the monitor the window is
+  // on: 1280x720, 1600x900, 1920x1080, 2560x1440, 3200x1800 and 3840x2160 where they fit. UI thread.
+  virtual std::vector<std::pair<uint32_t, uint32_t>> ListWindowedClientSizes() const { return {}; }
+
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.
   const std::string& GetTitle() const { return title_; }
@@ -602,6 +615,10 @@ class Window {
   // Called only if state can be applied (see the public callers).
   virtual void ScheduleFullscreenExclusiveRetryImpl() {}
   virtual void RestoreFullscreenPlacementImpl() {}
+  virtual void ApplyWindowedClientSizeImpl(uint32_t width, uint32_t height) {
+    (void)width;
+    (void)height;
+  }
 
   Presenter* presenter() const { return presenter_; }
   bool HasSurface() const { return presenter_surface_ != nullptr; }

@@ -14,10 +14,12 @@
 #include <array>
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_submission_tracker.h>
+#include <rex/ui/display_mode.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/surface.h>
 
@@ -96,9 +98,18 @@ class D3D12Presenter final : public Presenter {
   }
   bool SupportsExclusiveFullscreen() const override { return true; }
 
-  // The display mode exclusive fullscreen enters on `output`: the output's current desktop mode (its size and refresh
-  // rate, matched to a mode of the swap chain's format). The one place the target mode is chosen.
+  // The display mode exclusive fullscreen enters on `output`: fullscreen_exclusive_mode's mode when the output offers
+  // it for the swap chain's format, else (the cvar empty, not a mode text, or a mode not offered: logged) the output's
+  // current desktop mode. The one place the target mode is chosen.
   static bool GetExclusiveFullscreenTargetMode(IDXGIOutput* output, DXGI_MODE_DESC& mode_out);
+
+  // The menu's list of exclusive fullscreen modes (Task 9c): the modes of the monitor the window `hwnd` is on, for the
+  // swap chain's format, one per display_mode::ModeText, largest first, the desktop mode included; desktop_out is the
+  // desktop's current mode (what "" means). False (lists empty) without a DXGI output for that monitor. It uses its
+  // own DXGI factory and no swap chain, so it never waits on the presenter: call it from the UI thread (where the menu
+  // draws); it is not meant for the GPU thread.
+  static bool ListExclusiveFullscreenModes(void* hwnd, std::vector<display_mode::DisplayMode>& modes_out,
+                                           display_mode::DisplayMode& desktop_out);
 
  protected:
   SurfacePaintConnectResult ConnectOrReconnectPaintingToSurfaceFromUIThread(

@@ -46,6 +46,8 @@ class Win32Window : public Window {
 
   uint32_t GetMediumDpi() const override;
 
+  std::vector<std::pair<uint32_t, uint32_t>> ListWindowedClientSizes() const override;
+
  protected:
   bool OpenImpl() override;
   void RequestCloseImpl() override;
@@ -68,11 +70,16 @@ class Win32Window : public Window {
   void RequestFullscreenExclusiveUpdateImpl(const char* reason) override;
   void ScheduleFullscreenExclusiveRetryImpl() override;
   void RestoreFullscreenPlacementImpl() override;
+  void ApplyWindowedClientSizeImpl(uint32_t width, uint32_t height) override;
 
  private:
   // The exclusive fullscreen retry timer (SetTimer on hwnd_, WM_TIMER on the UI thread).
   static constexpr UINT_PTR kTimerFullscreenExclusiveRetry = 0x4F55;
-
+  // The window rect (frame included) of a windowed client area of width x height at the current DPI and menu.
+  RECT WindowedRectForClient(uint32_t width, uint32_t height) const;
+  // Resizes the window now so its client area is width x height, kept inside the monitor's work area; logs the
+  // client area it got. `why` names the caller in the log.
+  void ResizeWindowedClientNow(uint32_t width, uint32_t height, const char* why);
   enum : UINT {
     kUserMessageAutoHideCursor = WM_USER,
     // Runs the presenter's exclusive fullscreen update (Presenter::UpdateExclusiveFullscreenFromUIThread) from the

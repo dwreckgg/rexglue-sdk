@@ -20,6 +20,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/video_mode_util.h>
 #include <rex/logging.h>
+#include <rex/ui/display_mode.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/surface_win.h>
 #include <rex/ui/window_win.h>
@@ -298,6 +299,19 @@ bool Win32Window::OpenImpl() {
         int y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - h) / 2;
         SetWindowPos(hwnd_, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
       }
+    }
+  }
+
+  // window_client_size (Task 9c): the windowed client size, only when set ("" keeps the size from window_width /
+  // window_height or the app's default, as before). Before entering fullscreen, so the placement the window returns
+  // to has it. Only the window: window_width / window_height and the guest's video mode are not touched.
+  {
+    const std::string& client_size = REXCVAR_GET(window_client_size);
+    uint32_t client_width, client_height;
+    if (display_mode::ParseSizeText(client_size, client_width, client_height)) {
+      ResizeWindowedClientNow(client_width, client_height, "window_client_size at start-up");
+    } else if (!client_size.empty()) {
+      REXLOG_WARN("Win32Window: window_client_size '{}' is not WxH (e.g. 1600x900): ignored", client_size);
     }
   }
 
@@ -647,6 +661,91 @@ void Win32Window::RestoreFullscreenPlacementImpl() {
   // No Z order change and no activation: after a focus loss the window must not come back in front.
   SetWindowPos(hwnd_, nullptr, m.left, m.top, m.right - m.left, m.bottom - m.top,
                SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
+RECT Win32Window::WindowedRectForClient(uint32_t width, uint32_t height) const {
+  RECT rect = {0, 0, LONG(width), LONG(height)};
+  DWORD style = GetWindowLong(hwnd_, GWL_STYLE);
+  if (IsFullscreen()) {
+    style |= WS_OVERLAPPEDWINDOW;  // the windowed style it returns to (ApplyNewFullscreen)
+  }
+  AdjustWindowRectangle(rect, style, BOOL(GetMainMenu() != nullptr), GetWindowLong(hwnd_, GWL_EXSTYLE), dpi_);
+  return rect;
+}
+
+void Win32Window::ResizeWindowedClientNow(uint32_t width, uint32_t height, const char* why) {
+  HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO monitor_info;
+  monitor_info.cbSize = sizeof(monitor_info);
+  RECT window_rect;
+  if (!monitor || !GetMonitorInfo(monitor, &monitor_info) || !GetWindowRect(hwnd_, &window_rect)) {
+    return;
+  }
+  const RECT& work = monitor_info.rcWork;
+  const RECT frame = WindowedRectForClient(width, height);
+  LONG w = frame.right - frame.left, h = frame.bottom - frame.top;
+  const bool shrunk = w > work.right - work.left || h > work.bottom - work.top;
+  w = std::min(w, LONG(work.right - work.left));
+  h = std::min(h, LONG(work.bottom - work.top));
+  // Inside the work area: keep the top-left where it fits, else move it in.
+  const LONG x = std::max(LONG(work.left), std::min(window_rect.left, LONG(work.right - w)));
+  const LONG y = std::max(LONG(work.top), std::min(window_rect.top, LONG(work.bottom - h)));
+  if (IsZoomed(hwnd_)) {
+    ShowWindow(hwnd_, SW_RESTORE);
+  }
+  SetWindowPos(hwnd_, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+  RECT client = {};
+  GetClientRect(hwnd_, &client);
+  REXLOG_INFO("Win32Window: windowed client size {}x{} ({}): client area {}x{}, window {}x{} at ({},{}){}", width,
+              height, why, client.right, client.bottom, w, h, x, y,
+              shrunk ? ", shrunk to the monitor's work area" : "");
+}
+
+void Win32Window::ApplyWindowedClientSizeImpl(uint32_t width, uint32_t height) {
+  if (!IsFullscreen()) {
+    ResizeWindowedClientNow(width, height, "SetWindowedClientSize");
+    return;
+  }
+  // Fullscreen: the size the window returns to when it leaves fullscreen (ApplyNewFullscreen puts
+  // pre_fullscreen_placement_ back). rcNormalPosition is in workspace coordinates (the work area's origin is 0,0).
+  HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO monitor_info;
+  monitor_info.cbSize = sizeof(monitor_info);
+  if (!monitor || !GetMonitorInfo(monitor, &monitor_info)) {
+    return;
+  }
+  const LONG work_w = monitor_info.rcWork.right - monitor_info.rcWork.left;
+  const LONG work_h = monitor_info.rcWork.bottom - monitor_info.rcWork.top;
+  const RECT frame = WindowedRectForClient(width, height);
+  const LONG w = std::min(LONG(frame.right - frame.left), work_w);
+  const LONG h = std::min(LONG(frame.bottom - frame.top), work_h);
+  RECT& normal = pre_fullscreen_placement_.rcNormalPosition;
+  normal.left = std::max(LONG(0), std::min(normal.left, work_w - w));
+  normal.top = std::max(LONG(0), std::min(normal.top, work_h - h));
+  normal.right = normal.left + w;
+  normal.bottom = normal.top + h;
+  pre_fullscreen_normal_client_width_ = width;
+  pre_fullscreen_normal_client_height_ = height;
+  pre_fullscreen_dpi_ = dpi_;
+  REXLOG_INFO("Win32Window: windowed client size {}x{} kept for when the window leaves fullscreen", width, height);
+}
+
+std::vector<std::pair<uint32_t, uint32_t>> Win32Window::ListWindowedClientSizes() const {
+  if (!hwnd_) {
+    return {};
+  }
+  HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO monitor_info;
+  monitor_info.cbSize = sizeof(monitor_info);
+  if (!monitor || !GetMonitorInfo(monitor, &monitor_info)) {
+    return {};
+  }
+  const RECT frame = WindowedRectForClient(1280, 720);
+  return display_mode::FittingClientSizes(
+      uint32_t(monitor_info.rcWork.right - monitor_info.rcWork.left),
+      uint32_t(monitor_info.rcWork.bottom - monitor_info.rcWork.top),
+      uint32_t(std::max(LONG(0), LONG((frame.right - frame.left) - 1280))),
+      uint32_t(std::max(LONG(0), LONG((frame.bottom - frame.top) - 720))));
 }
 
 void Win32Window::RequestFullscreenExclusiveUpdateImpl(const char* reason) {

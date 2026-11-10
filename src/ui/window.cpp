@@ -39,6 +39,21 @@ REXCVAR_DEFINE_BOOL(fullscreen_exclusive, false, "UI/Window",
                     "In fullscreen, use DXGI exclusive fullscreen at the monitor's current mode (D3D12; experimental)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// Output size (Task 9c), presentation only: never the guest's video mode (video_mode_*, resolution, and window_width /
+// window_height, which feed it, are not touched). The display mode exclusive fullscreen enters, "WxH@Hz" as
+// rex/ui/display_mode.h's ModeText writes it ("" = the desktop's current mode; a mode the monitor does not offer falls
+// back to it, logged). Read at each entry into exclusive fullscreen.
+REXCVAR_DEFINE_STRING(fullscreen_exclusive_mode, "", "UI/Window",
+                      "Exclusive fullscreen display mode, WxH@Hz (empty: the desktop's current mode)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// The windowed client size, "WxH" in physical pixels ("" = the size from window_width / window_height or the app's
+// default, as before). Only the window: unlike window_width / window_height it never feeds the guest's video mode.
+// Read at start-up; at run time the app resizes with Window::SetWindowedClientSize.
+REXCVAR_DEFINE_STRING(window_client_size, "", "UI/Window",
+                      "Windowed client size, WxH in physical pixels (empty: from window_width/window_height)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
                      "Monitor index to display on (0 = default, 1 = primary, 2 = "
                      "second monitor, etc.)")
