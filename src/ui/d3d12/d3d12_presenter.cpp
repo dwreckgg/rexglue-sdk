@@ -13,8 +13,12 @@
 #include <atomic>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <tuple>
 #include <utility>
 
 #include <string>
@@ -561,6 +565,60 @@ void D3D12Presenter::DisconnectPaintingFromSurfaceFromUIThreadImpl() {
 }
 
 namespace {
+// The argument values of every IDXGISwapChain::Present call, as passed (the present_vsync check after Task 11: an
+// external capture reported SyncInterval 0 where the game logged interval 1). On only with the environment variable
+// REX_PRESENT_CALL_LOG=N (N > 0): the first N calls one line each, then every 600 calls one census line, the count of
+// calls since the last census by (thread, SyncInterval, Flags, whether the swap chain's window is the foreground window,
+// exclusive). Every call is counted (no filter on the values: D1.2). Painting is owned by one thread at a time; the
+// mutex only keeps the census whole if that ever changes.
+class PresentCallLog {
+ public:
+  static PresentCallLog& Get() {
+    static PresentCallLog log;
+    return log;
+  }
+  bool on() const { return first_lines_ > 0; }
+  void Note(IDXGISwapChain1* swap_chain, UINT sync_interval, UINT flags, bool exclusive, bool vsync_carried,
+            HRESULT hr) {
+    HWND hwnd = nullptr;
+    swap_chain->GetHwnd(&hwnd);
+    const bool foreground = hwnd && GetForegroundWindow() == hwnd;
+    const uint32_t thread = uint32_t(GetCurrentThreadId());
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++calls_;
+    if (calls_ <= first_lines_) {
+      REXLOG_INFO(
+          "D3D12Presenter: Present call {}: SyncInterval {}, Flags 0x{:X} (thread {}, window foreground {}, exclusive "
+          "{}, present_vsync as carried {}) hr {:08X}",
+          calls_, sync_interval, flags, thread, foreground, exclusive, vsync_carried, uint32_t(hr));
+    }
+    ++census_[std::make_tuple(thread, uint32_t(sync_interval), uint32_t(flags), foreground, exclusive)];
+    if (calls_ % 600 == 0) {
+      std::string text;
+      for (const auto& [key, count] : census_) {
+        text += fmt::format("{}[thread {} SyncInterval {} Flags 0x{:X} foreground {} exclusive {}: {}]",
+                            text.empty() ? "" : " ", std::get<0>(key), std::get<1>(key), std::get<2>(key),
+                            std::get<3>(key), std::get<4>(key), count);
+      }
+      REXLOG_INFO("D3D12Presenter: Present calls {}-{}: {}", census_from_, calls_, text);
+      census_.clear();
+      census_from_ = calls_ + 1;
+    }
+  }
+
+ private:
+  PresentCallLog() {
+    if (const char* v = std::getenv("REX_PRESENT_CALL_LOG")) {
+      first_lines_ = uint64_t(std::strtoull(v, nullptr, 10));
+    }
+  }
+  uint64_t first_lines_ = 0;
+  std::mutex mutex_;
+  uint64_t calls_ = 0;
+  uint64_t census_from_ = 1;
+  std::map<std::tuple<uint32_t, uint32_t, uint32_t, bool, bool>, uint64_t> census_;
+};
+
 // The output's current desktop mode (EnumDisplaySettings, ENUM_CURRENT_SETTINGS), for the target and the log.
 bool GetOutputDesktopMode(IDXGIOutput* output, DEVMODEW& mode_out, DXGI_OUTPUT_DESC* desc_out) {
   DXGI_OUTPUT_DESC desc;
@@ -1722,7 +1780,13 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
                 choice.sync_interval, choice.allow_tearing ? "on" : "off", vsync, exclusive);
   }
   auto present = [&] {
-    return paint_context_.swap_chain->Present(choice.sync_interval, present_flags);
+    const UINT sync_interval_arg = choice.sync_interval;
+    const HRESULT hr = paint_context_.swap_chain->Present(sync_interval_arg, present_flags);
+    if (PresentCallLog& call_log = PresentCallLog::Get(); call_log.on()) {
+      // The values exactly as passed to this call (REX_PRESENT_CALL_LOG).
+      call_log.Note(paint_context_.swap_chain.Get(), sync_interval_arg, present_flags, exclusive, vsync, hr);
+    }
+    return hr;
   };
   HRESULT present_result;
   if (!pace_stats::LagOn()) {
