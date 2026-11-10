@@ -10,12 +10,14 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <memory>
 #include <utility>
 
 #include <rex/assert.h>
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/pace_stats.h>
 #include <rex/logging.h>
@@ -33,6 +35,51 @@
 
 REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
                     "Allow variable refresh rate and tearing");
+
+namespace {
+// The lag marks' ring (rex/pace_stats.h): one writer (the presenting thread), one reader (the title's trace writer).
+constexpr uint32_t kLagMarkCount = 4096;
+rex::pace_stats::LagPresentMark g_lag_marks[kLagMarkCount];
+std::atomic<uint32_t> g_lag_mark_head{0}, g_lag_mark_tail{0};
+std::atomic<uint64_t> g_lag_marks_dropped{0};
+void PushLagMark(const rex::pace_stats::LagPresentMark& mark) {
+  const uint32_t head = g_lag_mark_head.load(std::memory_order_relaxed);
+  if (head - g_lag_mark_tail.load(std::memory_order_acquire) >= kLagMarkCount) {
+    g_lag_marks_dropped.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  g_lag_marks[head % kLagMarkCount] = mark;
+  g_lag_mark_head.store(head + 1, std::memory_order_release);
+}
+}  // namespace
+
+// Turns the lag marks on or off (off by default). On before the guest's first VdSwap, so every swap gets an ordinal.
+extern "C" __declspec(dllexport) void rex_lag_marks_enable(int on) {
+  rex::pace_stats::LagMarksOn().store(on != 0, std::memory_order_relaxed);
+}
+// Moves up to `max` host present marks, oldest first, into `out`; returns how many.
+extern "C" __declspec(dllexport) uint32_t rex_lag_marks_drain(rex::pace_stats::LagPresentMark* out,
+                                                              uint32_t max) {
+  uint32_t tail = g_lag_mark_tail.load(std::memory_order_relaxed);
+  const uint32_t head = g_lag_mark_head.load(std::memory_order_acquire);
+  uint32_t n = 0;
+  while (n < max && tail != head) {
+    out[n++] = g_lag_marks[tail % kLagMarkCount];
+    ++tail;
+  }
+  g_lag_mark_tail.store(tail, std::memory_order_release);
+  return n;
+}
+// Present marks lost to a full ring since the start.
+extern "C" __declspec(dllexport) uint64_t rex_lag_marks_dropped() {
+  return g_lag_marks_dropped.load(std::memory_order_relaxed);
+}
+// The calling thread's last VdSwap while the marks were on: returns its ordinal (0: none) and stores its QPC time.
+extern "C" __declspec(dllexport) uint32_t rex_lag_last_guest_swap(int64_t* qpc_out) {
+  const rex::pace_stats::LagThreadSwap& last = rex::pace_stats::LagLastSwapThisThread();
+  if (qpc_out) *qpc_out = last.qpc;
+  return last.index;
+}
 
 namespace rex::ui::d3d12 {
 
@@ -452,6 +499,12 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
     paint_context_.swap_chain_height = new_swap_chain_height;
     paint_context_.swap_chain_allows_tearing =
         (swap_chain_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+    REXLOG_INFO(
+        "D3D12Presenter: created a {}x{} flip-discard swap chain of {} buffers, allows tearing {} "
+        "(d3d12_allow_variable_refresh_rate_and_tearing {}, DXGI tearing support {})",
+        new_swap_chain_width, new_swap_chain_height, PaintContext::kSwapChainBufferCount,
+        paint_context_.swap_chain_allows_tearing,
+        REXCVAR_GET(d3d12_allow_variable_refresh_rate_and_tearing), dxgi_supports_tearing_);
     for (uint32_t i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
       if (FAILED(paint_context_.swap_chain->GetBuffer(
               i, IID_PPV_ARGS(&paint_context_.swap_chain_buffers[i])))) {
@@ -1157,9 +1210,25 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // fullscreen is ever used in, the allow tearing flag must not be passed in
   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
   // presentation model used in Direct3D 12).
-  HRESULT present_result = paint_context_.swap_chain->Present(
-      0, DXGI_PRESENT_RESTART |
-             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
+  auto present = [&] {
+    return paint_context_.swap_chain->Present(
+        0, DXGI_PRESENT_RESTART |
+               (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
+  };
+  HRESULT present_result;
+  if (!pace_stats::LagOn()) {
+    present_result = present();
+  } else {
+    // Lag marks (rex/pace_stats.h): the present's call and return times and the guest swap it paints.
+    pace_stats::LagPresentMark mark;
+    mark.swap_index = guest_output_resource ? guest_output_properties.lag_swap_index : 0;
+    mark.flags = paint_context_.swap_chain_allows_tearing ? 1u : 0u;
+    mark.qpc_before = int64_t(rex::chrono::Clock::host_tick_count_platform());
+    present_result = present();
+    mark.qpc_after = int64_t(rex::chrono::Clock::host_tick_count_platform());
+    mark.present_hr = present_result;
+    PushLagMark(mark);
+  }
   // Even if presentation has failed, work might have been enqueued anyway
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.

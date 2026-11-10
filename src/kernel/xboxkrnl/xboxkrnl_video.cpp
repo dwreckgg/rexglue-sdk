@@ -16,6 +16,7 @@
 #include <string>
 
 #include <rex/pace_stats.h>
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
@@ -435,6 +436,14 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                   mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
                   mapped_u32 height) {
   pace_stats::Mark(pace_stats::kGuestSwap);
+  // Lag marks (pace_stats.h): this swap's ordinal, carried in its swap packet; 0 while the marks are off.
+  uint32_t lag_swap_index = 0;
+  if (pace_stats::LagOn()) {
+    lag_swap_index = pace_stats::LagGuestSwapCount().fetch_add(1, std::memory_order_relaxed) + 1;
+    pace_stats::LagThreadSwap& last = pace_stats::LagLastSwapThisThread();
+    last.index = lag_swap_index;
+    last.qpc = int64_t(rex::chrono::Clock::host_tick_count_platform());
+  }
   // All of these parameters are REQUIRED.
   assert(buffer_ptr);
   assert(fetch_ptr);
@@ -497,12 +506,15 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   dwords[offset++] = gpu_fetch.dword_4;
   dwords[offset++] = gpu_fetch.dword_5;
 
-  dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, 4);
+  dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, lag_swap_index ? 5 : 4);
   dwords[offset++] = rex::graphics::xenos::kSwapSignature;
   dwords[offset++] = frontbuffer_physical_address;
 
   dwords[offset++] = *width;
   dwords[offset++] = *height;
+  if (lag_swap_index) {
+    dwords[offset++] = lag_swap_index;  // read by CommandProcessor::ExecutePacketType3_XE_SWAP
+  }
 
   // Fill the rest of the buffer with NOP packets.
   for (uint32_t i = offset; i < 64; i++) {

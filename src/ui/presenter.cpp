@@ -17,6 +17,7 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/pace_stats.h>
 #include <rex/platform.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
@@ -561,6 +562,8 @@ bool Presenter::RefreshGuestOutput(
   writable_properties.display_aspect_ratio_x = display_aspect_ratio_x;
   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
   writable_properties.is_8bpc = false;
+  // Lag marks (rex/pace_stats.h): the swap packet's ordinal, set by the GPU thread that calls this from IssueSwap.
+  writable_properties.lag_swap_index = pace_stats::LagOn() ? pace_stats::LagGpuSwapIndex() : 0;
   bool is_active = writable_properties.IsActive();
   if (is_active) {
     if (!RefreshGuestOutputImpl(guest_output_mailbox_writable_, frontbuffer_width,

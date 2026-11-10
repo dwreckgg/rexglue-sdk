@@ -31,6 +31,7 @@
 #include <rex/math.h>
 #include <rex/memory.h>
 #include <rex/memory/ring_buffer.h>
+#include <rex/pace_stats.h>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
@@ -1099,7 +1100,13 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_ptr = reader->ReadAndSwap<uint32_t>();
   uint32_t frontbuffer_width = reader->ReadAndSwap<uint32_t>();
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
-  reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+  uint32_t data_read = 4;
+  if (count >= 5) {
+    // Lag marks (pace_stats.h): VdSwap's ordinal of this swap, for the present that paints its output.
+    pace_stats::LagGpuSwapIndex() = reader->ReadAndSwap<uint32_t>();
+    data_read = 5;
+  }
+  reader->AdvanceRead((count - data_read) * sizeof(uint32_t));
 
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 

@@ -24,6 +24,47 @@ namespace rex::pace_stats {
 
 enum Channel : int { kVblank = 0, kSwap = 1, kPresent = 2, kGuestSwap = 3, kChannelCount = 4 };
 
+// ---- Lag marks (the title's latency trace; exported as rex_lag_*, d3d12_presenter.cpp) ----
+// Off unless the title calls rex_lag_marks_enable(1); off, each site below costs one relaxed load and one branch.
+// On, every guest VdSwap gets an ordinal (from 1) that travels in its PM4_XE_SWAP packet (a fifth data dword) to
+// the GPU thread, then in the guest output's properties (Presenter::GuestOutputProperties::lag_swap_index) to the
+// host present that paints it. Times are QueryPerformanceCounter ticks.
+struct LagPresentMark {
+  int64_t qpc_before = 0;   // just before IDXGISwapChain::Present
+  int64_t qpc_after = 0;    // just after it returned
+  uint32_t swap_index = 0;  // the VdSwap ordinal of the guest output this present painted; 0: none painted
+  uint32_t flags = 0;       // bit 0: the swap chain allows tearing (swap_chain_allows_tearing)
+  int32_t present_hr = 0;   // what Present returned
+  uint32_t reserved = 0;
+};
+static_assert(sizeof(LagPresentMark) == 32);
+
+inline std::atomic<bool>& LagMarksOn() {
+  static std::atomic<bool> on{false};
+  return on;
+}
+inline bool LagOn() { return LagMarksOn().load(std::memory_order_relaxed); }
+// The last VdSwap ordinal handed out (the guest threads that swap: the title's main thread, the D3D kick thread).
+inline std::atomic<uint32_t>& LagGuestSwapCount() {
+  static std::atomic<uint32_t> count{0};
+  return count;
+}
+// The calling thread's last VdSwap while the marks were on: its ordinal and the QPC time it was handed out.
+struct LagThreadSwap {
+  uint32_t index = 0;
+  int64_t qpc = 0;
+};
+inline LagThreadSwap& LagLastSwapThisThread() {
+  thread_local LagThreadSwap last;
+  return last;
+}
+// The ordinal of the swap packet the GPU thread is executing (written and read on the GPU thread, before and inside
+// IssueSwap's RefreshGuestOutput).
+inline uint32_t& LagGpuSwapIndex() {
+  static uint32_t index = 0;
+  return index;
+}
+
 inline bool Enabled() {
   static const bool enabled = [] {
     const char* v = std::getenv("REX_PACE_STATS");

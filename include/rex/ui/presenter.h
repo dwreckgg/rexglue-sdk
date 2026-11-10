@@ -388,6 +388,8 @@ class Presenter {
     uint32_t display_aspect_ratio_x;
     uint32_t display_aspect_ratio_y;
     bool is_8bpc;
+    // Lag marks (rex/pace_stats.h): the VdSwap ordinal of the guest swap this output came from, 0 if unknown.
+    uint32_t lag_swap_index;
 
     GuestOutputProperties() { SetToInactive(); }
 
@@ -402,6 +404,7 @@ class Presenter {
       display_aspect_ratio_x = 0;
       display_aspect_ratio_y = 0;
       is_8bpc = false;
+      lag_swap_index = 0;
     }
   };
 
