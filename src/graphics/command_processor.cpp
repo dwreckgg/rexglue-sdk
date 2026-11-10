@@ -1169,7 +1169,8 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   return true;
 }
 
-bool CommandProcessor::PresentBeforeVblankWait(memory::RingBuffer peek, int64_t lag_wait_enter) {
+bool CommandProcessor::PresentBeforeVblankWait(memory::RingBuffer peek, int64_t lag_wait_enter, uint32_t wait_poll,
+                                               uint32_t wait_ref, uint32_t wait_info) {
   // The packets after this wait, read from a copy of the reader (nothing is consumed): type-2 NOPs, then VdSwap's
   // block (xboxkrnl_video.cpp VdSwap_entry): a type-0 write of the 6 dwords of texture fetch constant 0, then
   // PM4_XE_SWAP. Anything else (a draw, a resolve, an event, a predicated swap) and the frame is presented as before.
@@ -1203,13 +1204,20 @@ bool CommandProcessor::PresentBeforeVblankWait(memory::RingBuffer peek, int64_t 
   const uint32_t lag_swap_index = count >= 5 ? peek.ReadAndSwap<uint32_t>() : 0;
 
   if (pace_stats::LagOn()) {
-    // Lag marks: the early swap's record, its packet time = now (the wake comes later, after the present).
+    // Lag marks: the early swap's record, its packet time = now (the wake comes later, after the present). The
+    // wait is this one (counted in waits, its parameters known); its wake, vblank and duration are not known yet.
     pace_stats::LagGpuSwapIndex() = lag_swap_index;
     pace_stats::LagGpuSwap& pending = pace_stats::LagGpuPending();
     pace_stats::LagGpuSwap record = pending;
     record.qpc_wait_enter = lag_wait_enter;
     record.qpc_wait_wake = 0;
     record.qpc_vblank = 0;
+    ++record.waits;
+    record.wait_poll = wait_poll;
+    record.wait_ref = wait_ref;
+    record.wait_info = wait_info;
+    record.after_wait_packets = 0;
+    record.after_wait_sig = 0;
     record.qpc_swap = int64_t(rex::chrono::Clock::host_tick_count_platform());
     record.flags |= pace_stats::kLagGpuSwapEarly;
     pace_stats::LagGpuLastSwap() = record;
@@ -1329,7 +1337,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         if (!early_tried && REXCVAR_GET(vsync) && REXCVAR_GET(present_before_vblank_wait) &&
             !early_swap_.valid) {
           early_tried = true;
-          PresentBeforeVblankWait(*reader, lag_wait_enter);
+          PresentBeforeVblankWait(*reader, lag_wait_enter, poll_reg_addr, ref, wait_info);
         }
         PrepareForWait();
         if (!REXCVAR_GET(vsync)) {

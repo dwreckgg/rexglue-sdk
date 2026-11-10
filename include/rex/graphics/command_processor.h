@@ -294,7 +294,9 @@ class CommandProcessor {
     uint32_t fetch[6] = {};
   };
   EarlySwap early_swap_;
-  bool PresentBeforeVblankWait(memory::RingBuffer peek, int64_t lag_wait_enter);
+  // wait_poll, wait_ref, wait_info: the wait packet's, for the lag marks' early record.
+  bool PresentBeforeVblankWait(memory::RingBuffer peek, int64_t lag_wait_enter, uint32_t wait_poll, uint32_t wait_ref,
+                               uint32_t wait_info);
   // The fetch constant IssueSwap presents (texture fetch 0): the register file's, or, during the early present, the
   // swap's own six dwords read from the packet after the wait (the register file keeps the guest's values).
   const uint32_t* swap_fetch_override_ = nullptr;
