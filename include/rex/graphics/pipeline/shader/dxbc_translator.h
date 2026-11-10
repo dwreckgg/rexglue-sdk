@@ -237,6 +237,23 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // should be safe at least temporarily).
     kSysFlag_ROVDepthStencilEarlyWrite_Shift,
 
+    // The Xenos applies the blend factors before the min / max blend
+    // operations (max(src * src_factor, dest * dest_factor)), while the host
+    // output-merger min / max (Direct3D) and the ROV min / max emulation take
+    // the colors without the factors. For a min / max operation whose source
+    // factor is SRC_ALPHA, the pixel shader multiplies its output by the source
+    // alpha before the output-merger (RGB for the color operation, A for the
+    // alpha operation), in both paths. Set per render target in
+    // UpdateSystemConstantValues.
+    kSysFlag_MinMaxSrcAlphaColor0_Shift,
+    kSysFlag_MinMaxSrcAlphaColor1_Shift,
+    kSysFlag_MinMaxSrcAlphaColor2_Shift,
+    kSysFlag_MinMaxSrcAlphaColor3_Shift,
+    kSysFlag_MinMaxSrcAlphaAlpha0_Shift,
+    kSysFlag_MinMaxSrcAlphaAlpha1_Shift,
+    kSysFlag_MinMaxSrcAlphaAlpha2_Shift,
+    kSysFlag_MinMaxSrcAlphaAlpha3_Shift,
+
     kSysFlag_Count,
 
     kSysFlag_SharedMemoryIsUAV = 1u << kSysFlag_SharedMemoryIsUAV_Shift,
@@ -260,6 +277,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
     kSysFlag_ROVDepthWrite = 1u << kSysFlag_ROVDepthWrite_Shift,
     kSysFlag_ROVStencilTest = 1u << kSysFlag_ROVStencilTest_Shift,
     kSysFlag_ROVDepthStencilEarlyWrite = 1u << kSysFlag_ROVDepthStencilEarlyWrite_Shift,
+    kSysFlag_MinMaxSrcAlphaColor0 = 1u << kSysFlag_MinMaxSrcAlphaColor0_Shift,
+    kSysFlag_MinMaxSrcAlphaAlpha0 = 1u << kSysFlag_MinMaxSrcAlphaAlpha0_Shift,
   };
   static_assert(kSysFlag_Count <= 32, "Too many flags in the system constants");
 
@@ -778,6 +797,10 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // manually even for RTV to maintain the guest dithering pattern and because
   // alpha can be exponent-biased.
   void CompletePixelShader_AlphaToMask();
+  // Applies the SRC_ALPHA source factor of a min / max blend operation to the
+  // color of render target rt_index (kSysFlag_MinMaxSrcAlpha*), after the
+  // exponent bias, in both the RTV and the ROV paths.
+  void CompletePixelShader_ApplyMinMaxSrcAlpha(uint32_t rt_index);
   void CompletePixelShader_WriteToRTVs();
   void CompletePixelShader_DSV_DepthTo24Bit();
   void CompletePixelShader_WriteToROV();

@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -3764,6 +3765,40 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     for (uint32_t i = 0; i < 4; ++i) {
       if (color_infos[i].color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
         flags |= DxbcShaderTranslator::kSysFlag_ConvertColor0ToGamma << i;
+      }
+    }
+  }
+  // Min / max blending: the Xenos applies the factors before the operation,
+  // the host output-merger (and the ROV min / max emulation) does not. A
+  // SRC_ALPHA source factor is applied in the pixel shader; ONE needs nothing.
+  // Other factors with min / max are not emulated (logged once).
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (!((normalized_color_mask >> (4 * i)) & 0b1111)) {
+      continue;
+    }
+    auto blend_control = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+    bool color_min_max = blend_control.color_comb_fcn == xenos::BlendOp::kMin ||
+                         blend_control.color_comb_fcn == xenos::BlendOp::kMax;
+    bool alpha_min_max = blend_control.alpha_comb_fcn == xenos::BlendOp::kMin ||
+                         blend_control.alpha_comb_fcn == xenos::BlendOp::kMax;
+    if (color_min_max && blend_control.color_srcblend == xenos::BlendFactor::kSrcAlpha) {
+      flags |= DxbcShaderTranslator::kSysFlag_MinMaxSrcAlphaColor0 << i;
+    }
+    if (alpha_min_max && blend_control.alpha_srcblend == xenos::BlendFactor::kSrcAlpha) {
+      flags |= DxbcShaderTranslator::kSysFlag_MinMaxSrcAlphaAlpha0 << i;
+    }
+    if ((color_min_max && ((blend_control.color_srcblend != xenos::BlendFactor::kSrcAlpha &&
+                            blend_control.color_srcblend != xenos::BlendFactor::kOne) ||
+                           blend_control.color_destblend != xenos::BlendFactor::kOne)) ||
+        (alpha_min_max && ((blend_control.alpha_srcblend != xenos::BlendFactor::kSrcAlpha &&
+                            blend_control.alpha_srcblend != xenos::BlendFactor::kOne) ||
+                           blend_control.alpha_destblend != xenos::BlendFactor::kOne))) {
+      static std::atomic<bool> s_min_max_factors_logged{false};
+      if (!s_min_max_factors_logged.exchange(true)) {
+        REXGPU_WARN(
+            "Min / max blending with factors that are not emulated (RB_BLENDCONTROL{} = {:08X}): "
+            "only a SRC_ALPHA or ONE source and a ONE destination factor are applied (logged once)",
+            i, blend_control.value);
       }
     }
   }

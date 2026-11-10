@@ -1530,6 +1530,28 @@ void DxbcShaderTranslator::ROV_HandleAlphaBlendFactorCases(uint32_t src_temp, ui
   a_.OpBreak();
 }
 
+void DxbcShaderTranslator::CompletePixelShader_ApplyMinMaxSrcAlpha(uint32_t rt_index) {
+  uint32_t system_temp_color = system_temps_color_[rt_index];
+  uint32_t flag_temp = PushSystemTemp();
+  dxbc::Dest flag_temp_x_dest(dxbc::Dest::R(flag_temp, 0b0001));
+  dxbc::Src flag_temp_x_src(dxbc::Src::R(flag_temp, dxbc::Src::kXXXX));
+  // The color first, while the alpha is still the unmultiplied source alpha.
+  a_.OpAnd(flag_temp_x_dest, LoadFlagsSystemConstant(),
+           dxbc::Src::LU(kSysFlag_MinMaxSrcAlphaColor0 << rt_index));
+  a_.OpIf(true, flag_temp_x_src);
+  a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+           dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
+  a_.OpEndIf();
+  a_.OpAnd(flag_temp_x_dest, LoadFlagsSystemConstant(),
+           dxbc::Src::LU(kSysFlag_MinMaxSrcAlphaAlpha0 << rt_index));
+  a_.OpIf(true, flag_temp_x_src);
+  a_.OpMul(dxbc::Dest::R(system_temp_color, 0b1000), dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW),
+           dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
+  a_.OpEndIf();
+  // Release flag_temp.
+  PopSystemTemp();
+}
+
 void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
   uint32_t shader_writes_color_targets = current_shader().writes_color_targets();
   if (!shader_writes_color_targets) {
@@ -1548,6 +1570,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
              LoadSystemConstant(SystemConstants::Index::kColorExpBias,
                                 offsetof(SystemConstants, color_exp_bias) + sizeof(float) * i,
                                 dxbc::Src::kXXXX));
+    CompletePixelShader_ApplyMinMaxSrcAlpha(i);
     if (gamma_render_target_as_unorm8_) {
       // Convert to gamma space - this is incorrect, since it must be done after
       // blending on the Xbox 360, but this is just one of many blending issues
@@ -1923,6 +1946,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
              LoadSystemConstant(SystemConstants::Index::kColorExpBias,
                                 offsetof(SystemConstants, color_exp_bias) + sizeof(float) * i,
                                 dxbc::Src::kXXXX));
+    CompletePixelShader_ApplyMinMaxSrcAlpha(i);
 
     dxbc::Src rt_format_flags_src(LoadSystemConstant(
         SystemConstants::Index::kEdramRTFormatFlags,

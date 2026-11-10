@@ -202,6 +202,9 @@ bool D3D12RenderTargetCache::Initialize() {
   if (path_ == Path::kPixelShaderInterlock && !provider.AreRasterizerOrderedViewsSupported()) {
     path_ = Path::kHostRenderTargets;
   }
+  REXGPU_INFO("D3D12 render target path: {} (render_target_path_d3d12 = \"{}\")",
+              path_ == Path::kPixelShaderInterlock ? "rov" : "rtv",
+              REXCVAR_GET(render_target_path_d3d12));
 
   // Create the buffer for reinterpreting EDRAM contents.
   uint32_t edram_buffer_size =
