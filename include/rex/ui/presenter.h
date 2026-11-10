@@ -370,6 +370,10 @@ class Presenter {
   // Whether this presenter can enter exclusive fullscreen at all (D3D12: yes). Without it, a desired exclusive
   // fullscreen changes nothing, painting included.
   virtual bool SupportsExclusiveFullscreen() const { return false; }
+  // Whether every present must run on the UI thread now for a reason of the implementation's own (D3D12: present_vsync,
+  // a present that waits for the monitor's refresh). Read by the presenting thread at each guest output refresh and by
+  // GetDesiredPaintModeFromUIThread; any thread; cheap (a flag read).
+  virtual bool WantsUIThreadPresentation() const { return false; }
 
  protected:
   enum class PaintResult {
@@ -898,6 +902,8 @@ class Presenter {
   // UI thread only: the reason of an exclusive fullscreen update that arrived during a UI thread paint, posted again
   // when the paint ends (null: none).
   const char* exclusive_fullscreen_update_after_paint_ = nullptr;
+  // UI thread only: the WantsUIThreadPresentation value last logged (SetPaintModeFromUIThread).
+  bool ui_thread_presentation_logged_ = false;
 
   // The surface of the `window_` the presenter is currently attached to.
   Surface* surface_ = nullptr;

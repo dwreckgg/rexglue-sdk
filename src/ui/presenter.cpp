@@ -643,6 +643,13 @@ bool Presenter::RefreshGuestOutput(
         break;
       case PaintMode::kGuestOutputThreadImmediately:
         // Both painting and window paint requesting are accessible.
+        if (WantsUIThreadPresentation()) {
+          // The implementation now wants UI-thread presents (present_vsync turned on mid-run): do not present here;
+          // the UI thread paints this frame, and its paint sets the paint mode to the desired kUIThreadOnRequest at
+          // its end (PaintFromUIThread). The guest output thread only requests the paint (no wait on the UI thread).
+          RequestPaintOrConnectionRecoveryViaWindow(true);
+          break;
+        }
         if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
           paint_result = PaintAndPresent(false);
           if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
@@ -1411,6 +1418,17 @@ void Presenter::SetPaintModeFromUIThread(PaintMode new_mode) {
     std::lock_guard<std::mutex> lock(paint_mode_mutex_);
     paint_mode_ = new_mode;
   }
+  // One line when the implementation's own wish for UI-thread presents (present_vsync) flips, at the paint mode change
+  // it causes (UI thread; never per frame).
+  const bool wants_ui_thread = WantsUIThreadPresentation();
+  if (wants_ui_thread != ui_thread_presentation_logged_) {
+    ui_thread_presentation_logged_ = wants_ui_thread;
+    REXLOG_INFO("Presenter: {} (present_vsync {}); paint mode now {}",
+                wants_ui_thread ? "presenting on the UI thread" : "UI-thread presenting no longer required",
+                wants_ui_thread, new_mode == PaintMode::kUIThreadOnRequest
+                                     ? "the UI thread on request"
+                                     : (new_mode == PaintMode::kNone ? "none" : "the guest output thread"));
+  }
   UpdateUITicksNeededFromUIThread();
 }
 
@@ -1435,9 +1453,9 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
     // it to "active" (for example to stop UI-thread presenting while entering is blocked) without another guard.
     return PaintMode::kUIThreadOnRequest;
   }
-  if (surface_paint_connection_has_implicit_vsync_) {
+  if (surface_paint_connection_has_implicit_vsync_ || WantsUIThreadPresentation()) {
     // Don't be causing host vertical sync CPU waits in the thread generating
-    // the guest output.
+    // the guest output (present_vsync: Task 9b review I1).
     return PaintMode::kUIThreadOnRequest;
   }
   if (!ui_drawers_.empty()) {

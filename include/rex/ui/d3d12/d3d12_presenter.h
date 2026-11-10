@@ -97,6 +97,8 @@ class D3D12Presenter final : public Presenter {
     return paint_context_.swap_chain_exclusive;
   }
   bool SupportsExclusiveFullscreen() const override { return true; }
+  // present_vsync on: present on the UI thread (a Present that waits for the refresh must not block the GPU thread).
+  bool WantsUIThreadPresentation() const override;
 
   // The display mode exclusive fullscreen enters on `output`: fullscreen_exclusive_mode's mode when the output offers
   // it for the swap chain's format, else (the cvar empty, not a mode text, or a mode not offered: logged) the output's

@@ -553,6 +553,8 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
   return SurfacePaintConnectResult::kSuccess;
 }
 
+bool D3D12Presenter::WantsUIThreadPresentation() const { return REXCVAR_GET(present_vsync); }
+
 void D3D12Presenter::DisconnectPaintingFromSurfaceFromUIThreadImpl() {
   paint_context_.DestroySwapChain();
 }
@@ -940,6 +942,7 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
   swap_chain_allows_tearing = false;
   swap_chain_exclusive = false;
   swap_chain_resize_forced = false;
+  present_choice_logged = -1;  // the next swap chain's first present logs its call again (Task 9b review M1)
   swap_chain_height = 0;
   swap_chain_width = 0;
 }
@@ -1574,7 +1577,8 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
       DXGI_PRESENT_RESTART | (choice.allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
   const int32_t choice_code = int32_t(choice.sync_interval * 2 + (choice.allow_tearing ? 1 : 0));
   if (choice_code != paint_context_.present_choice_logged) {
-    // At the first present and when the call changes (the cvar, exclusive fullscreen, a new swap chain): one line.
+    // At the first present of each swap chain (DestroySwapChain resets it) and when the call changes (the cvar,
+    // exclusive fullscreen): one line.
     paint_context_.present_choice_logged = choice_code;
     REXLOG_INFO("D3D12Presenter: present: sync interval {}, tearing flag {} (present_vsync {}, exclusive {})",
                 choice.sync_interval, choice.allow_tearing ? "on" : "off", vsync, exclusive);
