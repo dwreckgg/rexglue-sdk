@@ -564,6 +564,7 @@ bool Presenter::RefreshGuestOutput(
   writable_properties.is_8bpc = false;
   // Lag marks (rex/pace_stats.h): the swap packet's ordinal, set by the GPU thread that calls this from IssueSwap.
   writable_properties.lag_swap_index = pace_stats::LagOn() ? pace_stats::LagGpuSwapIndex() : 0;
+  writable_properties.lag_gpu = pace_stats::LagOn() ? pace_stats::LagGpuLastSwap() : pace_stats::LagGpuSwap{};
   bool is_active = writable_properties.IsActive();
   if (is_active) {
     if (!RefreshGuestOutputImpl(guest_output_mailbox_writable_, frontbuffer_width,

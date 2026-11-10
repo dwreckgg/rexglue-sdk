@@ -28,6 +28,7 @@
 
 #include <rex/assert.h>
 #include <rex/math.h>
+#include <rex/pace_stats.h>
 #include <rex/platform.h>
 #include <rex/types.h>
 #include <rex/ui/flags.h>
@@ -390,6 +391,8 @@ class Presenter {
     bool is_8bpc;
     // Lag marks (rex/pace_stats.h): the VdSwap ordinal of the guest swap this output came from, 0 if unknown.
     uint32_t lag_swap_index;
+    // Lag marks: the GPU thread's marks of that swap packet (all 0 if unknown).
+    pace_stats::LagGpuSwap lag_gpu;
 
     GuestOutputProperties() { SetToInactive(); }
 
@@ -405,6 +408,7 @@ class Presenter {
       display_aspect_ratio_y = 0;
       is_8bpc = false;
       lag_swap_index = 0;
+      lag_gpu = pace_stats::LagGpuSwap{};
     }
   };
 

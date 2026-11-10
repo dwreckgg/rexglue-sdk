@@ -1222,6 +1222,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     // Lag marks (rex/pace_stats.h): the present's call and return times and the guest swap it paints.
     pace_stats::LagPresentMark mark;
     mark.swap_index = guest_output_resource ? guest_output_properties.lag_swap_index : 0;
+    if (guest_output_resource) mark.gpu = guest_output_properties.lag_gpu;
     mark.flags = paint_context_.swap_chain_allows_tearing ? 1u : 0u;
     mark.qpc_before = int64_t(rex::chrono::Clock::host_tick_count_platform());
     present_result = present();

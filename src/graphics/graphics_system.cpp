@@ -19,6 +19,7 @@
 #include <mutex>
 #include <utility>
 
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
@@ -380,6 +381,10 @@ void GraphicsSystem::MarkVblank() {
   // SCOPE_profile_cpu_f("gpu");
 
   pace_stats::Mark(pace_stats::kVblank);
+  if (pace_stats::LagOn()) {  // lag marks (pace_stats.h): the GPU thread stamps its wait wakes with it
+    pace_stats::LagLastVblankQpc().store(int64_t(rex::chrono::Clock::host_tick_count_platform()),
+                                         std::memory_order_relaxed);
+  }
 
   // Increment vblank counter (so the game sees us making progress).
   if (command_processor_) {

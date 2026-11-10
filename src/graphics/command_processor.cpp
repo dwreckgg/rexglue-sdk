@@ -782,6 +782,17 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
     REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
   }
 
+  if (pace_stats::LagOn()) {
+    // Lag marks (pace_stats.h): the packets between the last wait's wake and the swap packet (the swap included).
+    pace_stats::LagGpuSwap& pending = pace_stats::LagGpuPending();
+    const bool nop = packet_type == 0x02 || (packet_type == 0x03 && ((packet >> 8) & 0x7F) == PM4_NOP);
+    if (pending.qpc_wait_wake && !nop) {
+      const uint32_t code = packet_type == 0x03 ? ((packet >> 8) & 0x7F) : (0x80u | packet_type);
+      if (pending.after_wait_packets < 4) pending.after_wait_sig |= code << (8 * pending.after_wait_packets);
+      ++pending.after_wait_packets;
+    }
+  }
+
   switch (packet_type) {
     case 0x00:
       return ExecutePacketType0(reader, packet);
@@ -1108,6 +1119,14 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   }
   reader->AdvanceRead((count - data_read) * sizeof(uint32_t));
 
+  if (pace_stats::LagOn()) {
+    // Lag marks: this swap packet's record (for IssueSwap's RefreshGuestOutput); the next swap's starts empty.
+    pace_stats::LagGpuSwap& pending = pace_stats::LagGpuPending();
+    pending.qpc_swap = int64_t(rex::chrono::Clock::host_tick_count_platform());
+    pace_stats::LagGpuLastSwap() = pending;
+    pending = pace_stats::LagGpuSwap{};
+  }
+
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   ++counter_;
@@ -1140,6 +1159,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool is_memory = (wait_info & 0x10) != 0;
 
+  // Lag marks (pace_stats.h): QPC time of the first unmet check, 0 while the condition held at once.
+  int64_t lag_wait_enter = 0;
   bool matched = false;
   do {
     uint32_t value = 0;
@@ -1182,6 +1203,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      if (!lag_wait_enter && pace_stats::LagOn()) {
+        lag_wait_enter = int64_t(rex::chrono::Clock::host_tick_count_platform());
+      }
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
@@ -1213,6 +1237,21 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     }
   } while (!matched);
 
+  if (lag_wait_enter) {
+    // Lag marks (pace_stats.h): this wait, for the next swap packet's record.
+    const int64_t wake = int64_t(rex::chrono::Clock::host_tick_count_platform());
+    pace_stats::LagGpuSwap& pending = pace_stats::LagGpuPending();
+    pending.qpc_wait_enter = lag_wait_enter;
+    pending.qpc_wait_wake = wake;
+    pending.qpc_vblank = pace_stats::LagLastVblankQpc().load(std::memory_order_relaxed);
+    pending.wait_ticks += wake - lag_wait_enter;
+    ++pending.waits;
+    pending.wait_poll = poll_reg_addr;
+    pending.wait_ref = ref;
+    pending.wait_info = wait_info;
+    pending.after_wait_packets = 0;
+    pending.after_wait_sig = 0;
+  }
   return true;
 }
 

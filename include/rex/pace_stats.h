@@ -29,6 +29,31 @@ enum Channel : int { kVblank = 0, kSwap = 1, kPresent = 2, kGuestSwap = 3, kChan
 // On, every guest VdSwap gets an ordinal (from 1) that travels in its PM4_XE_SWAP packet (a fifth data dword) to
 // the GPU thread, then in the guest output's properties (Presenter::GuestOutputProperties::lag_swap_index) to the
 // host present that paints it. Times are QueryPerformanceCounter ticks.
+// The GPU command processor thread's view of one swap packet (PM4_XE_SWAP), filled on that thread
+// (command_processor.cpp) and carried with the guest output it refreshes (GuestOutputProperties::lag_gpu) to the
+// present that paints it. A "wait" is a WAIT_REG_MEM whose condition did not hold at its first check.
+struct LagGpuSwap {
+  int64_t qpc_swap = 0;        // the swap packet's handler entry (IssueSwap follows at once)
+  int64_t qpc_wait_enter = 0;  // the last wait since the previous swap packet: its first unmet check
+  int64_t qpc_wait_wake = 0;   // ... and the check at which its condition held
+  int64_t qpc_vblank = 0;      // the last guest vblank (GraphicsSystem::MarkVblank) before that wake
+  int64_t wait_ticks = 0;      // every wait since the previous swap packet, summed (QPC ticks)
+  uint32_t waits = 0;          // how many waits since the previous swap packet
+  uint32_t wait_poll = 0;      // the last wait's poll address (memory: low 2 bits are the endianness)
+  uint32_t wait_ref = 0;       // ... its reference value
+  uint32_t wait_info = 0;      // ... its wait_info (bit 4: a memory poll; bits 0-2: the compare function)
+  uint32_t after_wait_packets = 0;  // packets executed after that wake up to and including the swap packet (type 0, 1
+                                    // and 3; type-2 and PM4_NOP packets not counted)
+  uint32_t after_wait_sig = 0;      // the first four of them, one byte each from the low byte: a type-3 packet's
+                                    // opcode, 0x80 for a type-0 (register write) packet, 0x81 for a type-1 packet
+  uint32_t flags = 0;               // kLagGpuSwapEarly
+  uint32_t reserved = 0;
+};
+static_assert(sizeof(LagGpuSwap) == 72);
+// LagGpuSwap::flags bit 0: the swap was presented at the wait before its packet (present_before_vblank_wait); the
+// record's qpc_swap is then that early IssueSwap and the wait's wake is not known yet (0).
+constexpr uint32_t kLagGpuSwapEarly = 1;
+
 struct LagPresentMark {
   int64_t qpc_before = 0;   // just before IDXGISwapChain::Present
   int64_t qpc_after = 0;    // just after it returned
@@ -36,8 +61,9 @@ struct LagPresentMark {
   uint32_t flags = 0;       // bit 0: the swap chain allows tearing (swap_chain_allows_tearing)
   int32_t present_hr = 0;   // what Present returned
   uint32_t reserved = 0;
+  LagGpuSwap gpu;           // the GPU thread's marks of that guest output's swap packet (all 0: none painted)
 };
-static_assert(sizeof(LagPresentMark) == 32);
+static_assert(sizeof(LagPresentMark) == 104);
 
 inline std::atomic<bool>& LagMarksOn() {
   static std::atomic<bool> on{false};
@@ -63,6 +89,21 @@ inline LagThreadSwap& LagLastSwapThisThread() {
 inline uint32_t& LagGpuSwapIndex() {
   static uint32_t index = 0;
   return index;
+}
+// The GPU thread's marks (written and read on the GPU thread only): the swap being built since the previous swap
+// packet, and the record of the last swap packet (read by IssueSwap's RefreshGuestOutput).
+inline LagGpuSwap& LagGpuPending() {
+  static LagGpuSwap pending;
+  return pending;
+}
+inline LagGpuSwap& LagGpuLastSwap() {
+  static LagGpuSwap last;
+  return last;
+}
+// QPC time of the last guest vblank (the GPU VSync thread writes it while the marks are on).
+inline std::atomic<int64_t>& LagLastVblankQpc() {
+  static std::atomic<int64_t> qpc{0};
+  return qpc;
 }
 
 inline bool Enabled() {
