@@ -237,14 +237,18 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // should be safe at least temporarily).
     kSysFlag_ROVDepthStencilEarlyWrite_Shift,
 
-    // The Xenos applies the blend factors before the min / max blend
-    // operations (max(src * src_factor, dest * dest_factor)), while the host
-    // output-merger min / max (Direct3D) and the ROV min / max emulation take
-    // the colors without the factors. For a min / max operation whose source
-    // factor is SRC_ALPHA, the pixel shader multiplies its output by the source
-    // alpha before the output-merger (RGB for the color operation, A for the
-    // alpha operation), in both paths. Set per render target in
-    // UpdateSystemConstantValues.
+    // Min / max blending with a SRC_ALPHA source factor. Inferred, not measured
+    // on hardware: the Xenos applies the blend factors before a min / max
+    // operation (max(src * src_factor, dest * dest_factor)); inferred from Dead
+    // or Alive 4's own SRC_ALPHA / ONE factors on a MAX draw, its white alpha-0
+    // texels, the title showing no white rectangle on real hardware, and XNA's
+    // documented Max formula. Upstream Xenia assumes the opposite (the ROV
+    // min / max emulation and the Vulkan FSI path take the colors without the
+    // factors, as does the Direct3D output-merger). When set, the pixel shader
+    // multiplies its output by the source alpha before the output-merger (RGB
+    // for the color operation, A for the alpha operation), in both the RTV and
+    // the ROV path. Set per render target in UpdateSystemConstantValues, which
+    // also says which cases are left out.
     kSysFlag_MinMaxSrcAlphaColor0_Shift,
     kSysFlag_MinMaxSrcAlphaColor1_Shift,
     kSysFlag_MinMaxSrcAlphaColor2_Shift,
