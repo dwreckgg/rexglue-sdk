@@ -102,8 +102,12 @@ class D3D12Presenter final : public Presenter {
 
   // The display mode exclusive fullscreen enters on `output`: fullscreen_exclusive_mode's mode when the output offers
   // it for the swap chain's format, else (the cvar empty, not a mode text, or a mode not offered: logged) the output's
-  // current desktop mode. The one place the target mode is chosen.
-  static bool GetExclusiveFullscreenTargetMode(IDXGIOutput* output, DXGI_MODE_DESC& mode_out);
+  // current desktop mode. The one place the target mode is chosen. While exclusive fullscreen is active
+  // (exclusive_active) the output's live mode is the one it set, so captured_desktop (the desktop mode captured at
+  // entry, before the first ResizeTarget; null if none) stands for the desktop mode then
+  // (display_mode::DesktopForChoice; Task 9c re-review N1).
+  static bool GetExclusiveFullscreenTargetMode(IDXGIOutput* output, DXGI_MODE_DESC& mode_out, bool exclusive_active,
+                                               const DXGI_MODE_DESC* captured_desktop);
 
   // The menu's list of exclusive fullscreen modes (Task 9c): the modes of the monitor the window `hwnd` is on, for the
   // swap chain's format, one per display_mode::ModeText, largest first, the desktop mode included; desktop_out is the
@@ -289,9 +293,13 @@ class D3D12Presenter final : public Presenter {
     uint32_t exclusive_present_count = 0;
     bool exclusive_occlusion_logged = false;
     bool exclusive_loss_requested = false;
-    // The mode exclusive fullscreen was entered at, or last switched to (ReapplyExclusiveFullscreenModeFromUIThreadImpl);
-    // UI thread only, meaningful while swap_chain_exclusive.
+    // The mode exclusive fullscreen was entered at, or last switched to and confirmed on the output
+    // (ReapplyExclusiveFullscreenModeFromUIThreadImpl; a switch the output does not show leaves it unchanged); UI thread
+    // only, meaningful while swap_chain_exclusive.
     DXGI_MODE_DESC exclusive_mode = {};
+    // The output's desktop mode captured at the entry, before the first ResizeTarget: what "" and the not-offered
+    // fallback mean while exclusive (Task 9c re-review N1). Same thread and validity as exclusive_mode.
+    DXGI_MODE_DESC exclusive_desktop_mode = {};
     // The Present call last logged (rex/ui/present_choice.h): -1 none yet, else sync interval * 2 + tearing flag. Only
     // the presenting thread (painting is owned by one thread at a time) reads and writes it.
     int32_t present_choice_logged = -1;

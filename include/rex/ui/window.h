@@ -344,10 +344,12 @@ class Window {
     }
   }
   // Applies a changed exclusive fullscreen mode (the fullscreen_exclusive_mode cvar, set by the caller first) while
-  // exclusive fullscreen is active: the posted update switches the display mode in place (ResizeTarget, then the
-  // buffers; no pass through windowed or the desktop mode; Task 9c review I2). When exclusive fullscreen is not active
-  // nothing needs doing (the mode is read at each entry) and this only asks for the update, which then changes nothing
-  // or enters. UI thread; `reason` must be a string literal (logged when the posted update runs).
+  // exclusive fullscreen is active: the posted update asks DXGI to switch the display mode in place (ResizeTarget, once
+  // more if the output does not show it, then the buffers; Task 9c review I2). "" and a mode the monitor does not offer
+  // mean the desktop mode captured when exclusive fullscreen was entered (re-review N1). A switch the output does not
+  // show is logged (WARN) and leaves the recorded mode as it was. When exclusive fullscreen is not active nothing needs
+  // doing (the mode is read at each entry) and this only asks for the update, which then changes nothing or enters.
+  // UI thread; `reason` must be a string literal (logged when the posted update runs).
   void ReapplyFullscreenExclusiveMode(const char* reason = "ReapplyFullscreenExclusiveMode") {
     if (fullscreen_ && fullscreen_exclusive_) {
       fullscreen_exclusive_mode_reapply_ = true;

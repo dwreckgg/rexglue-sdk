@@ -159,6 +159,33 @@ inline Choice ChooseMode(std::string_view text, const std::vector<DisplayMode>& 
   return {Pick::kFallback, desktop, "the monitor does not offer this mode"};
 }
 
+// The desktop mode ChooseMode is given (for "" and for the fallback). While exclusive fullscreen is active, the output's
+// live mode is the one exclusive fullscreen set, not the desktop's: the desktop mode captured at entry, before the first
+// ResizeTarget, stands for it then (Task 9c re-review N1: a switch back to "Desktop" while exclusive). Otherwise, or
+// without a capture, the live desktop mode.
+template <typename Mode>
+constexpr const Mode& DesktopForChoice(bool exclusive_active, bool captured_valid, const Mode& captured,
+                                       const Mode& live) {
+  return exclusive_active && captured_valid ? captured : live;
+}
+
+// What the output reports after a mode switch while exclusive (EnumDisplaySettings: its size and whole-Hz refresh),
+// against the target. The refresh counts within 1.5 Hz of the target's rational (Windows reported a 60/1 mode as 59 Hz
+// on the run PC, c2); an unspecified target refresh (den 0) matches any. The size counts when it is the target's, or,
+// as kTargetScaled, the desktop's (with GPU scaling the output keeps the desktop size: c2 reported 2560x1440 for a
+// 1920x1080 mode). Anything else: kNotTarget, the switch did not happen (or not as asked).
+enum class Observed { kTarget, kTargetScaled, kNotTarget };
+inline Observed ObserveModeSwitch(const DisplayMode& target, uint32_t width, uint32_t height, uint32_t whole_hz,
+                                  uint32_t desktop_width, uint32_t desktop_height) {
+  if (target.refresh_den) {
+    const int64_t diff = int64_t(whole_hz) * target.refresh_den - int64_t(target.refresh_num);
+    if ((diff < 0 ? -diff : diff) * 2 > int64_t(target.refresh_den) * 3) return Observed::kNotTarget;
+  }
+  if (width == target.width && height == target.height) return Observed::kTarget;
+  if (width == desktop_width && height == desktop_height) return Observed::kTargetScaled;
+  return Observed::kNotTarget;
+}
+
 // One axis of a window's placement inside a monitor's work area [area_begin, area_end): the start of a span of `size`
 // at `pos` where it fits, else moved in (the area's begin when the span is larger than the area). The area must be in
 // the coordinates `pos` is in: screen coordinates for a live window, workspace coordinates (screen minus the primary

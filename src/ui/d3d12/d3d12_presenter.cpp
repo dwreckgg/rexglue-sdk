@@ -14,6 +14,7 @@
 #include <climits>
 #include <cmath>
 #include <memory>
+#include <optional>
 #include <utility>
 
 #include <string>
@@ -618,11 +619,16 @@ display_mode::DisplayMode FromDesc(const DXGI_MODE_DESC& m) {
 }
 }  // namespace
 
-bool D3D12Presenter::GetExclusiveFullscreenTargetMode(IDXGIOutput* output, DXGI_MODE_DESC& mode_out) {
-  DXGI_MODE_DESC desktop;
-  if (!DesktopModeDesc(output, kSwapChainFormat, desktop)) {
+bool D3D12Presenter::GetExclusiveFullscreenTargetMode(IDXGIOutput* output, DXGI_MODE_DESC& mode_out,
+                                                      bool exclusive_active, const DXGI_MODE_DESC* captured_desktop) {
+  DXGI_MODE_DESC live = {};
+  const bool live_known = DesktopModeDesc(output, kSwapChainFormat, live);
+  const bool captured_valid = captured_desktop != nullptr;
+  if (!live_known && !(exclusive_active && captured_valid)) {
     return false;
   }
+  const DXGI_MODE_DESC desktop =
+      display_mode::DesktopForChoice(exclusive_active, captured_valid, captured_valid ? *captured_desktop : live, live);
   const std::string& text = REXCVAR_GET(fullscreen_exclusive_mode);
   if (text.empty()) {
     mode_out = desktop;
@@ -805,10 +811,14 @@ Presenter::ExclusiveFullscreenChange D3D12Presenter::SetExclusiveFullscreenFromU
     return ExclusiveFullscreenChange::kFailed;
   }
   DXGI_MODE_DESC mode;
-  if (!GetExclusiveFullscreenTargetMode(output.Get(), mode)) {
+  if (!GetExclusiveFullscreenTargetMode(output.Get(), mode, false, nullptr)) {
     REXLOG_WARN("D3D12Presenter: exclusive fullscreen not entered ({}): no target mode for the output", reason);
     return ExclusiveFullscreenChange::kFailed;
   }
+  // The desktop mode as it is now, before the first ResizeTarget changes the output: what "" means while exclusive
+  // (Task 9c re-review N1). Kept only if the entry completes.
+  DXGI_MODE_DESC desktop_at_entry = {};
+  const bool desktop_at_entry_known = DesktopModeDesc(output.Get(), kSwapChainFormat, desktop_at_entry);
   paint_context_.AwaitSwapChainUsageCompletion();
   // Before the transition, ResizeTarget gives DXGI the mode to enter. At a mode other than the desktop's it resizes
   // the (borderless) window to the mode; a leave, or an entry that does not complete, puts the window's placement
@@ -865,6 +875,8 @@ Presenter::ExclusiveFullscreenChange D3D12Presenter::SetExclusiveFullscreenFromU
   paint_context_.exclusive_occlusion_logged = false;
   paint_context_.exclusive_loss_requested = false;
   paint_context_.exclusive_mode = mode;
+  // Without a reading of the desktop mode, the target (chosen from the same live reading just before) stands for it.
+  paint_context_.exclusive_desktop_mode = desktop_at_entry_known ? desktop_at_entry : mode;
   in_fullscreen_after = FALSE;
   swap_chain->GetFullscreenState(&in_fullscreen_after, nullptr);
   const double hz = mode.RefreshRate.Denominator
@@ -905,13 +917,16 @@ Presenter::ExclusiveFullscreenChange D3D12Presenter::ReapplyExclusiveFullscreenM
   Microsoft::WRL::ComPtr<IDXGIOutput> output;
   HRESULT hr = swap_chain->GetContainingOutput(&output);
   DXGI_MODE_DESC mode;
-  if (FAILED(hr) || !GetExclusiveFullscreenTargetMode(output.Get(), mode)) {
+  // "" and the not-offered fallback mean the desktop mode captured at entry: the output's live mode is the one this
+  // exclusive fullscreen set (Task 9c re-review N1).
+  if (FAILED(hr) ||
+      !GetExclusiveFullscreenTargetMode(output.Get(), mode, true, &paint_context_.exclusive_desktop_mode)) {
     REXLOG_WARN("D3D12Presenter: exclusive fullscreen mode not changed ({}): no target mode (GetContainingOutput hr "
                 "{:08X}); the current mode stays",
                 reason, uint32_t(hr));
     return ExclusiveFullscreenChange::kUnchanged;
   }
-  const DXGI_MODE_DESC& was = paint_context_.exclusive_mode;
+  const DXGI_MODE_DESC was = paint_context_.exclusive_mode;
   if (mode.Width == was.Width && mode.Height == was.Height &&
       uint64_t(mode.RefreshRate.Numerator) * was.RefreshRate.Denominator ==
           uint64_t(was.RefreshRate.Numerator) * mode.RefreshRate.Denominator) {
@@ -920,8 +935,10 @@ Presenter::ExclusiveFullscreenChange D3D12Presenter::ReapplyExclusiveFullscreenM
     return ExclusiveFullscreenChange::kUnchanged;
   }
   paint_context_.AwaitSwapChainUsageCompletion();
-  hr = swap_chain->ResizeTarget(&mode);
-  if (paint_context_.swap_chain.Get() != swap_chain) {
+  const auto recreated = [&]() {
+    if (paint_context_.swap_chain.Get() == swap_chain) {
+      return false;
+    }
     // Recreated during the call (a failed resize in the re-entered WM_SIZE): leave fullscreen on the old one before it
     // is released (as `replaced` does in SetExclusiveFullscreenFromUIThreadImpl), and block like a loss.
     BOOL old_in_fullscreen = FALSE;
@@ -931,6 +948,10 @@ Presenter::ExclusiveFullscreenChange D3D12Presenter::ReapplyExclusiveFullscreenM
     REXLOG_WARN("D3D12Presenter: exclusive fullscreen ({}): the swap chain was recreated during the mode change "
                 "ResizeTarget; stopped",
                 reason);
+    return true;
+  };
+  hr = swap_chain->ResizeTarget(&mode);
+  if (recreated()) {
     return ExclusiveFullscreenChange::kFailed;
   }
   if (FAILED(hr)) {
@@ -940,17 +961,51 @@ Presenter::ExclusiveFullscreenChange D3D12Presenter::ReapplyExclusiveFullscreenM
                 uint32_t(hr));
     return ExclusiveFullscreenChange::kUnchanged;
   }
-  paint_context_.exclusive_mode = mode;
-  paint_context_.swap_chain_resize_forced = true;
-  paint_context_.exclusive_present_count = 0;
+  // Verify the mode the output shows, as the entry does ("mode set again"): one more ResizeTarget if it is not the
+  // target, then exclusive_mode records only a mode the output shows (display_mode::ObserveModeSwitch).
+  const DXGI_MODE_DESC& desktop = paint_context_.exclusive_desktop_mode;
+  const display_mode::DisplayMode target = FromDesc(mode);
   DEVMODEW now;
-  const bool now_known = GetOutputDesktopMode(output.Get(), now, nullptr);
+  const auto observe = [&]() {
+    if (!GetOutputDesktopMode(output.Get(), now, nullptr)) {
+      return std::optional<display_mode::Observed>();
+    }
+    return std::optional<display_mode::Observed>(display_mode::ObserveModeSwitch(
+        target, now.dmPelsWidth, now.dmPelsHeight, now.dmDisplayFrequency, desktop.Width, desktop.Height));
+  };
+  std::optional<display_mode::Observed> seen = observe();
+  bool mode_set_again = false;
+  if (seen && *seen == display_mode::Observed::kNotTarget) {
+    swap_chain->ResizeTarget(&mode);
+    if (recreated()) {
+      return ExclusiveFullscreenChange::kFailed;
+    }
+    mode_set_again = true;
+    seen = observe();
+  }
+  paint_context_.swap_chain_resize_forced = true;
+  if (seen && *seen == display_mode::Observed::kNotTarget) {
+    // The output does not show the new mode: exclusive_mode stays what the output had (the switch did not happen, or
+    // not as asked). The buffers follow the window's size through its own WM_SIZE, if it changed.
+    REXLOG_WARN(
+        "D3D12Presenter: exclusive fullscreen mode not changed ({}): asked {}x{} @ {}/{} Hz{}, the output shows "
+        "{}x{} @ {} Hz; still recorded as {}x{} @ {}/{} Hz",
+        reason, mode.Width, mode.Height, mode.RefreshRate.Numerator, mode.RefreshRate.Denominator,
+        mode_set_again ? " twice" : "", now.dmPelsWidth, now.dmPelsHeight, now.dmDisplayFrequency, was.Width,
+        was.Height, was.RefreshRate.Numerator, was.RefreshRate.Denominator);
+    return ExclusiveFullscreenChange::kUnchanged;
+  }
+  paint_context_.exclusive_mode = mode;
+  paint_context_.exclusive_present_count = 0;
   REXLOG_INFO(
       "D3D12Presenter: exclusive fullscreen mode changed ({}): {}x{} @ {}/{} Hz -> {}x{} @ {}/{} Hz; output now at "
-      "{}x{} @ {} Hz",
+      "{}x{} @ {} Hz{}{}",
       reason, was.Width, was.Height, was.RefreshRate.Numerator, was.RefreshRate.Denominator, mode.Width, mode.Height,
-      mode.RefreshRate.Numerator, mode.RefreshRate.Denominator, now_known ? now.dmPelsWidth : 0,
-      now_known ? now.dmPelsHeight : 0, now_known ? now.dmDisplayFrequency : 0);
+      mode.RefreshRate.Numerator, mode.RefreshRate.Denominator, seen ? now.dmPelsWidth : 0,
+      seen ? now.dmPelsHeight : 0, seen ? now.dmDisplayFrequency : 0,
+      !seen ? " (not verified: no reading of the output's mode)"
+            : (*seen == display_mode::Observed::kTargetScaled ? " (the desktop size: scaled by the GPU)" : ""),
+      mode_set_again ? " (mode set again with ResizeTarget)" : "");
   return ExclusiveFullscreenChange::kModeChanged;
 }
 

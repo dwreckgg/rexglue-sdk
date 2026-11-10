@@ -879,11 +879,22 @@ void Presenter::UpdateExclusiveFullscreenFromUIThread(const char* reason, bool l
   if (actions.retry && !window_->OnFullscreenExclusiveRetryLater()) {
     // The budget is spent (exclusive_fullscreen::AfterRetryLater): blocked, so only the window's activation, its next
     // focus gain or a new request try again (Task 9c review I1 (b)).
+    // OnFullscreenExclusiveRetryLater is also false, with fewer tries made, when the window cannot apply state now
+    // (closing): logged as that, not as a spent budget (Task 9c re-review, minor).
+    const uint32_t tries_made = window_->FullscreenExclusiveRetries();
     window_->OnFullscreenExclusiveBlocked();
-    REXLOG_INFO(
-        "Presenter: exclusive fullscreen still refused after {} retries {} ms apart; blocked until the window is "
-        "activated, gets the focus or exclusive fullscreen is requested again",
-        exclusive_fullscreen::kRetryTries, exclusive_fullscreen::kRetryIntervalMs);
+    if (exclusive_fullscreen::AfterRetryLater(tries_made) == exclusive_fullscreen::RetryStep::kBlock) {
+      REXLOG_INFO(
+          "Presenter: exclusive fullscreen still refused after {} retries {} ms apart; blocked until the window is "
+          "activated, gets the focus or exclusive fullscreen is requested again",
+          exclusive_fullscreen::kRetryTries, exclusive_fullscreen::kRetryIntervalMs);
+    } else {
+      REXLOG_INFO(
+          "Presenter: exclusive fullscreen refused for now after {} retries; no retry scheduled (the window cannot "
+          "apply state now); blocked until the window is activated, gets the focus or exclusive fullscreen is "
+          "requested again",
+          tries_made);
+    }
   }
   if (actions.restore_placement) {
     // DXGI put back the window rect it saved at entry, or the ResizeTarget before an entry that did not complete
