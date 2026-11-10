@@ -95,13 +95,6 @@ class D3D12Presenter final : public Presenter {
     return paint_context_.swap_chain_exclusive;
   }
 
-  // The flags of the swap chain's Present call (sync interval 0): DXGI_PRESENT_RESTART, plus ALLOW_TEARING when the
-  // swap chain allows tearing and is not in exclusive fullscreen (the flag is an invalid call in exclusive fullscreen).
-  static UINT PresentFlags(bool exclusive, bool swap_chain_allows_tearing) {
-    return DXGI_PRESENT_RESTART |
-           ((swap_chain_allows_tearing && !exclusive) ? DXGI_PRESENT_ALLOW_TEARING : 0);
-  }
-
   // The display mode exclusive fullscreen enters on `output`: the output's current desktop mode (its size and refresh
   // rate, matched to a mode of the swap chain's format). The one place the target mode is chosen.
   static bool GetExclusiveFullscreenTargetMode(IDXGIOutput* output, DXGI_MODE_DESC& mode_out);
@@ -281,6 +274,9 @@ class D3D12Presenter final : public Presenter {
     uint32_t exclusive_present_count = 0;
     bool exclusive_occlusion_logged = false;
     bool exclusive_loss_requested = false;
+    // The Present call last logged (rex/ui/present_choice.h): -1 none yet, else sync interval * 2 + tearing flag. Only
+    // the presenting thread (painting is owned by one thread at a time) reads and writes it.
+    int32_t present_choice_logged = -1;
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kSwapChainBufferCount> swap_chain_buffers;
   };

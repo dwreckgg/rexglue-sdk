@@ -25,6 +25,7 @@
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+#include <rex/ui/present_choice.h>
 #include <rex/ui/surface_win.h>
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -35,6 +36,11 @@
 
 REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
                     "Allow variable refresh rate and tearing");
+
+// Host presentation only (not the guest's `vsync`, its emulated 60 Hz vblank clock): read at every present, so a
+// change applies from the next frame (rex/ui/present_choice.h decides the call).
+REXCVAR_DEFINE_BOOL(present_vsync, false, "UI/D3D12",
+                    "Wait for the monitor's refresh when presenting (no tearing, more input lag)");
 
 namespace {
 // The lag marks' ring (rex/pace_stats.h): one writer (the presenting thread), one reader (the title's trace writer).
@@ -1384,7 +1390,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     ui_submission_tracker_.NextSubmission();
   }
   paint_context_.paint_submission_tracker.NextSubmission();
-  // Present as soon as possible, without waiting for vsync (the host refresh
+  // By default (present_vsync off), present as soon as possible, without waiting for vsync (the host refresh
   // rate may be something like 144 Hz, which is not a multiple of the common
   // 30 Hz or 60 Hz guest refresh rate), and allowing dropping outdated queued
   // frames for lower latency. Also, if possible, allowing tearing to use
@@ -1392,11 +1398,26 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // fullscreen is ever used in, the allow tearing flag must not be passed in
   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
   // presentation model used in Direct3D 12).
-  // In DXGI exclusive fullscreen (Task 9) the tearing flag is never passed (PresentFlags); this present then runs on
-  // the UI thread (Presenter::UpdateExclusiveFullscreenFromUIThread). Not exclusive: the flags are as before.
+  // The call is rex/ui/present_choice.h's: in DXGI exclusive fullscreen (Task 9) the tearing flag is never passed, and
+  // this present then runs on the UI thread (Presenter::UpdateExclusiveFullscreenFromUIThread); present_vsync (read at
+  // every present, so a change applies from the next frame) waits for the monitor's refresh, without the tearing flag.
+  // present_vsync off and not exclusive: the call is as before (interval 0, the tearing flag if the swap chain has it).
   const bool exclusive = paint_context_.swap_chain_exclusive;
-  const UINT present_flags = PresentFlags(exclusive, paint_context_.swap_chain_allows_tearing);
-  auto present = [&] { return paint_context_.swap_chain->Present(0, present_flags); };
+  const bool vsync = REXCVAR_GET(present_vsync);
+  const present_choice::PresentChoice choice =
+      present_choice::Choose(exclusive, vsync, paint_context_.swap_chain_allows_tearing);
+  const UINT present_flags =
+      DXGI_PRESENT_RESTART | (choice.allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+  const int32_t choice_code = int32_t(choice.sync_interval * 2 + (choice.allow_tearing ? 1 : 0));
+  if (choice_code != paint_context_.present_choice_logged) {
+    // At the first present and when the call changes (the cvar, exclusive fullscreen, a new swap chain): one line.
+    paint_context_.present_choice_logged = choice_code;
+    REXLOG_INFO("D3D12Presenter: present: sync interval {}, tearing flag {} (present_vsync {}, exclusive {})",
+                choice.sync_interval, choice.allow_tearing ? "on" : "off", vsync, exclusive);
+  }
+  auto present = [&] {
+    return paint_context_.swap_chain->Present(choice.sync_interval, present_flags);
+  };
   HRESULT present_result;
   if (!pace_stats::LagOn()) {
     present_result = present();
@@ -1405,7 +1426,8 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     pace_stats::LagPresentMark mark;
     mark.swap_index = guest_output_resource ? guest_output_properties.lag_swap_index : 0;
     if (guest_output_resource) mark.gpu = guest_output_properties.lag_gpu;
-    mark.flags = (paint_context_.swap_chain_allows_tearing ? 1u : 0u) | (exclusive ? 2u : 0u);
+    mark.flags = (paint_context_.swap_chain_allows_tearing ? 1u : 0u) | (exclusive ? 2u : 0u) |
+                 (choice.sync_interval ? 4u : 0u);
     mark.qpc_before = int64_t(rex::chrono::Clock::host_tick_count_platform());
     present_result = present();
     mark.qpc_after = int64_t(rex::chrono::Clock::host_tick_count_platform());
