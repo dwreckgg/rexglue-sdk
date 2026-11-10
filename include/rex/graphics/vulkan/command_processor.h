@@ -261,7 +261,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   void OnGammaRampPWLValueWritten() override;
   void OnPrimaryBufferEnd() override;
 
-  void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+  bool IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,

@@ -117,7 +117,8 @@ class CommandProcessor {
   // means like written to by the CPU or loaded from a file (the disclaimer
   // screen right in the beginning of 4D530AA4 is not a resolved render target,
   // for instance).
-  virtual void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+  // Returns whether the guest output was refreshed with this swap's picture (Presenter::RefreshGuestOutput).
+  virtual bool IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                          uint32_t frontbuffer_height) = 0;
 
   // May be called not only from the command processor thread when the command
@@ -286,7 +287,7 @@ class CommandProcessor {
   // wait before that swap's packet. The packet itself then skips IssueSwap (the picture is on the host already) and
   // does the rest of its work where it always did.
   struct EarlySwap {
-    bool valid = false;
+    bool valid = false;  // the early IssueSwap refreshed the guest output and counted the swap
     uint32_t frontbuffer_ptr = 0;
     uint32_t width = 0;
     uint32_t height = 0;

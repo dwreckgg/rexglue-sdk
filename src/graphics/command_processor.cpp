@@ -22,6 +22,7 @@
 #include <rex/perf/counter.h>
 #include <rex/chrono/clock.h>
 #include <rex/graphics/command_processor.h>
+#include <rex/graphics/early_swap.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -1135,15 +1136,17 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   // present_before_vblank_wait: this swap may have been presented already, from the wait before this packet
   // (PresentBeforeVblankWait); then only its picture's fetch constant, written by the packet before this one, must
   // match what was presented.
-  bool presented_early = false;
-  if (early_swap_.valid) {
-    presented_early = early_swap_.frontbuffer_ptr == frontbuffer_ptr && early_swap_.width == frontbuffer_width &&
-                      early_swap_.height == frontbuffer_height;
-    for (uint32_t i = 0; i < 6 && presented_early; ++i) {
-      presented_early =
-          register_file_->values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + i] == early_swap_.fetch[i];
+  // The compare is exact on purpose: the peek and this packet read the same ring bytes (below the write-pointer
+  // snapshot of this batch), so a mismatch is unreachable by reading; do not loosen it.
+  const bool presented_early = early_swap_.valid;
+  bool matches = false;
+  if (presented_early) {
+    matches = early_swap_.frontbuffer_ptr == frontbuffer_ptr && early_swap_.width == frontbuffer_width &&
+              early_swap_.height == frontbuffer_height;
+    for (uint32_t i = 0; i < 6 && matches; ++i) {
+      matches = register_file_->values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + i] == early_swap_.fetch[i];
     }
-    if (!presented_early) {
+    if (!matches) {
       static bool logged = false;
       if (!logged) {
         logged = true;
@@ -1153,13 +1156,14 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
     }
     early_swap_.valid = false;
   }
-  if (!presented_early) {
+  // One swap_count per guest swap on every path (an early swap counted itself when it refreshed the guest output).
+  const early_swap::PacketAction action = early_swap::AtSwapPacket(presented_early, matches);
+  if (action.issue_swap) {
     IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   }
 
   ++counter_;
-  if (!presented_early) {
-    // An early swap counted itself when it refreshed the guest output (swap_count's contract).
+  if (action.count_swap) {
     swap_count_.fetch_add(1, std::memory_order_release);
   }
   return true;
@@ -1219,8 +1223,14 @@ bool CommandProcessor::PresentBeforeVblankWait(memory::RingBuffer peek, int64_t 
     saved[i] = fetch_regs[i];
     fetch_regs[i] = fetch[i];
   }
-  IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  const bool refreshed = IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   for (uint32_t i = 0; i < 6; ++i) fetch_regs[i] = saved[i];
+  if (!refreshed) {
+    // Not shown (no presenter, a failed submission or swap texture, a transient refresh failure): the swap packet
+    // presents it as before, and counts it.
+    if (pace_stats::LagOn()) pace_stats::LagGpuLastSwap().flags &= ~pace_stats::kLagGpuSwapEarly;
+    return false;
+  }
 
   early_swap_.valid = true;
   early_swap_.frontbuffer_ptr = frontbuffer_ptr;
