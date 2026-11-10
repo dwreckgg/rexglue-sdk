@@ -622,6 +622,33 @@ void Win32Window::RequestPaintImpl() {
   InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
+void Win32Window::ScheduleFullscreenExclusiveRetryImpl() {
+  if (hwnd_) {
+    SetTimer(hwnd_, kTimerFullscreenExclusiveRetry, exclusive_fullscreen::kRetryIntervalMs, nullptr);
+  }
+}
+
+void Win32Window::RestoreFullscreenPlacementImpl() {
+  HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO monitor_info;
+  monitor_info.cbSize = sizeof(monitor_info);
+  RECT window_rect;
+  if (!monitor || !GetMonitorInfo(monitor, &monitor_info) || !GetWindowRect(hwnd_, &window_rect)) {
+    return;
+  }
+  const RECT& m = monitor_info.rcMonitor;
+  if (EqualRect(&window_rect, &m)) {
+    return;
+  }
+  REXLOG_INFO(
+      "Win32Window: fullscreen placement put back after exclusive fullscreen: {}x{} at ({},{}) -> {}x{} at ({},{})",
+      window_rect.right - window_rect.left, window_rect.bottom - window_rect.top, window_rect.left, window_rect.top,
+      m.right - m.left, m.bottom - m.top, m.left, m.top);
+  // No Z order change and no activation: after a focus loss the window must not come back in front.
+  SetWindowPos(hwnd_, nullptr, m.left, m.top, m.right - m.left, m.bottom - m.top,
+               SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
 void Win32Window::RequestFullscreenExclusiveUpdateImpl(const char* reason) {
   // UI thread. The latest reason wins; one message is pending at a time (dropped if the window is destroyed first).
   fullscreen_exclusive_update_reason_ = reason;
@@ -1064,6 +1091,7 @@ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
       // DXGI exclusive fullscreen is left while the window and its swap chain still exist (before the listeners may
       // tear the presenter down).
       LeaveFullscreenExclusiveNow("shutdown (the window closes)");
+      KillTimer(hWnd, kTimerFullscreenExclusiveRetry);
       if (cursor_auto_hide_timer_) {
         DeleteTimerQueueTimer(nullptr, cursor_auto_hide_timer_, nullptr);
         cursor_auto_hide_timer_ = nullptr;
@@ -1250,6 +1278,24 @@ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
         SetCursorIfFocusedOnClientArea(nullptr);
       }
       return 0;
+    } break;
+
+    case WM_ACTIVATEAPP: {
+      // The window became the foreground window (Task 9c Step 0): an entry refused while it was not in front is tried
+      // again now. Falls through to DefWindowProc after this.
+      if (wParam) {
+        OnActivatedForFullscreenExclusive();
+      }
+    } break;
+
+    case WM_TIMER: {
+      if (wParam == kTimerFullscreenExclusiveRetry) {
+        KillTimer(hWnd, kTimerFullscreenExclusiveRetry);
+        if (presenter()) {
+          presenter()->UpdateExclusiveFullscreenFromUIThread("a retry after a refusal");
+        }
+        return 0;
+      }
     } break;
 
     case kUserMessageFullscreenExclusiveUpdate: {

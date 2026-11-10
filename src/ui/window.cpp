@@ -276,6 +276,7 @@ void Window::SetFullscreen(bool new_fullscreen) {
   fullscreen_ = new_fullscreen;
   if (new_fullscreen) {
     fullscreen_exclusive_blocked_ = false;  // a new request: may try exclusive fullscreen again
+    fullscreen_exclusive_retries_ = 0;
   }
   if (!CanApplyState()) {
     return;
@@ -303,6 +304,7 @@ void Window::SetFullscreenExclusive(bool new_fullscreen_exclusive, const char* r
   const bool retry = new_fullscreen_exclusive && fullscreen_exclusive_blocked_;
   if (new_fullscreen_exclusive) {
     fullscreen_exclusive_blocked_ = false;
+    fullscreen_exclusive_retries_ = 0;
   }
   if (fullscreen_exclusive_ == new_fullscreen_exclusive && !retry) {
     return;
@@ -594,6 +596,7 @@ void Window::OnFocusUpdate(bool new_has_focus, WindowDestructionReceiver& destru
   if (fullscreen_ && fullscreen_exclusive_) {
     if (has_focus_) {
       fullscreen_exclusive_blocked_ = false;
+      fullscreen_exclusive_retries_ = 0;
     }
     RequestFullscreenExclusiveUpdate(has_focus_ ? "the window got the focus" : "focus loss");
   }

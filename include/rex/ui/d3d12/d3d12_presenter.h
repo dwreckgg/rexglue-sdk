@@ -94,6 +94,7 @@ class D3D12Presenter final : public Presenter {
   bool IsExclusiveFullscreenActiveFromUIThread() const override {
     return paint_context_.swap_chain_exclusive;
   }
+  bool SupportsExclusiveFullscreen() const override { return true; }
 
   // The display mode exclusive fullscreen enters on `output`: the output's current desktop mode (its size and refresh
   // rate, matched to a mode of the swap chain's format). The one place the target mode is chosen.

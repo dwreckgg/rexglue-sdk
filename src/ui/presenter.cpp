@@ -809,7 +809,7 @@ void Presenter::RequestUIPaintFromUIThread() {
 void Presenter::UpdateExclusiveFullscreenFromUIThread(const char* reason, bool leave) {
   // No intrusive lifetime management must be performed from UI drawers.
   assert_false(is_executing_ui_drawers_);
-  if (!window_ || !surface_) {
+  if (!window_ || !surface_ || !SupportsExclusiveFullscreen()) {
     return;
   }
   if (is_in_ui_thread_paint_) {
@@ -823,21 +823,57 @@ void Presenter::UpdateExclusiveFullscreenFromUIThread(const char* reason, bool l
     return;
   }
   const bool want = !leave && window_->WantsFullscreenExclusiveNow();
+  // A leave is logged under its cause (Task 9 review M5): the requests coalesce into one posted update, so `reason` is
+  // whichever request ran it, while the cause of a leave is the condition that is false now.
+  const char* why = reason;
+  if (!want && !leave) {
+    if (const char* not_wanted = window_->FullscreenExclusiveNotWantedReason()) {
+      why = not_wanted;
+    }
+  }
   // Take painting from the guest output thread (waits on paint_mode_mutex_ for a present in progress there, which is
   // never an exclusive fullscreen one: those are all presented on this thread).
   if (paint_mode_ == PaintMode::kGuestOutputThreadImmediately) {
     SetPaintModeFromUIThread(PaintMode::kUIThreadOnRequest);
   }
-  const ExclusiveFullscreenChange change = SetExclusiveFullscreenFromUIThreadImpl(want, reason);
-  if (change == ExclusiveFullscreenChange::kFailed || change == ExclusiveFullscreenChange::kLost) {
+  const uint32_t retries_before = window_->FullscreenExclusiveRetries();
+  const ExclusiveFullscreenChange change = SetExclusiveFullscreenFromUIThreadImpl(want, why);
+  const exclusive_fullscreen::Actions actions = exclusive_fullscreen::ActionsFor(change);
+  if (actions.block) {
     window_->OnFullscreenExclusiveBlocked();
   }
-  if (change == ExclusiveFullscreenChange::kEntered || change == ExclusiveFullscreenChange::kLeft ||
-      change == ExclusiveFullscreenChange::kLost) {
+  if (change == ExclusiveFullscreenChange::kEntered) {
+    if (retries_before) {
+      REXLOG_INFO("Presenter: exclusive fullscreen entered after {} retries", retries_before);
+    }
+    window_->ResetFullscreenExclusiveRetries();
+  }
+  if (actions.retry && !window_->OnFullscreenExclusiveRetryLater()) {
+    REXLOG_INFO(
+        "Presenter: exclusive fullscreen still refused after {} retries {} ms apart; tried again when the window is "
+        "activated or gets the focus",
+        exclusive_fullscreen::kRetryTries, exclusive_fullscreen::kRetryIntervalMs);
+  }
+  if (actions.restore_placement) {
+    // DXGI put back the window rect it saved at entry, or the ResizeTarget before an entry that did not complete
+    // resized the window: a borderless fullscreen window gets its placement back (Task 9 review M7). That may send
+    // WM_SIZE, whose resize may give painting back to the guest output thread (exclusive is neither active nor,
+    // perhaps, desired now): take it again before anything else here.
+    window_->OnFullscreenExclusiveLeft();
+    if (!window_ || !surface_) {
+      return;
+    }
+    if (paint_mode_ == PaintMode::kGuestOutputThreadImmediately) {
+      SetPaintModeFromUIThread(PaintMode::kUIThreadOnRequest);
+    }
+  }
+  if (actions.resize) {
     // The buffers are resized for the new state (forced by the implementation), and the paint mode set to the
     // desired one.
-    bool request_repaint = false;
-    UpdateSurfacePaintConnectionFromUIThread(&request_repaint, true);
+    if (IsConnectedSurfacePaintConnectionState(surface_paint_connection_state_)) {
+      bool request_repaint = false;
+      UpdateSurfacePaintConnectionFromUIThread(&request_repaint, true);
+    }
     if (change == ExclusiveFullscreenChange::kEntered && !IsExclusiveFullscreenActiveFromUIThread()) {
       // The resize failed and the swap chain was recreated (windowed): no new attempt until the next focus gain.
       window_->OnFullscreenExclusiveBlocked();
@@ -848,6 +884,10 @@ void Presenter::UpdateExclusiveFullscreenFromUIThread(const char* reason, bool l
   if (paint_mode_ != PaintMode::kNone) {
     RequestPaintOrConnectionRecoveryViaWindow(true);
   }
+}
+
+uint32_t Presenter::ExclusiveFullscreenRetriesFromUIThread() const {
+  return window_ ? window_->FullscreenExclusiveRetries() : 0;
 }
 
 void Presenter::RequestExclusiveFullscreenUpdateViaWindow(const char* reason) {
@@ -1385,9 +1425,14 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
     return PaintMode::kUIThreadOnRequest;
   }
   if (IsExclusiveFullscreenActiveFromUIThread() ||
-      (window_ && window_->IsFullscreen() && window_->IsFullscreenExclusive())) {
+      (SupportsExclusiveFullscreen() && window_ && window_->IsFullscreen() &&
+       window_->IsFullscreenExclusive())) {
     // Exclusive fullscreen desired or active: every present on the UI thread, which owns the window's messages
-    // (UpdateExclusiveFullscreenFromUIThread says why).
+    // (UpdateExclusiveFullscreenFromUIThread says why). The "desired" half is load-bearing, not only policy (Task 9
+    // review M1): DXGI's SetFullscreenState and ResizeTarget send WM_SIZE synchronously while entering, before the
+    // presenter marks the swap chain active, and that resize sets the paint mode through this function; only the
+    // desired half then keeps the guest output thread from presenting in the middle of the transition. Do not narrow
+    // it to "active" (for example to stop UI-thread presenting while entering is blocked) without another guard.
     return PaintMode::kUIThreadOnRequest;
   }
   if (surface_paint_connection_has_implicit_vsync_) {
@@ -1456,7 +1501,8 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
           }
           // A new or resized swap chain: enter exclusive fullscreen if the window wants it (posted, so never inside
           // this connection update; a no-op when nothing changed).
-          if (window_ && window_->IsFullscreen() && window_->IsFullscreenExclusive()) {
+          if (SupportsExclusiveFullscreen() && window_ && window_->IsFullscreen() &&
+              window_->IsFullscreenExclusive()) {
             window_->RequestFullscreenExclusiveUpdate("the swap chain was connected");
           }
           // Fallthrough to common success handling.

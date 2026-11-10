@@ -16,6 +16,10 @@
 #include <memory>
 #include <utility>
 
+#include <string>
+
+#include <fmt/format.h>
+
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
@@ -591,14 +595,47 @@ bool D3D12Presenter::GetExclusiveFullscreenTargetMode(IDXGIOutput* output, DXGI_
   return true;
 }
 
+namespace {
+// Task 9c Step 0: the foreground state at an entry attempt, for its log line (DXGI refuses SetFullscreenState(TRUE)
+// with DXGI_ERROR_NOT_CURRENTLY_AVAILABLE unless the window is the foreground window).
+std::string ForegroundState(HWND ours) {
+  const HWND foreground = GetForegroundWindow();
+  DWORD foreground_pid = 0;
+  if (foreground) {
+    GetWindowThreadProcessId(foreground, &foreground_pid);
+  }
+  LASTINPUTINFO last_input = {};
+  last_input.cbSize = sizeof(last_input);
+  const DWORD input_age_ms = GetLastInputInfo(&last_input) ? GetTickCount() - last_input.dwTime : DWORD(-1);
+  DWORD lock_timeout_ms = 0;
+  SystemParametersInfoW(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, &lock_timeout_ms, 0);
+  return fmt::format(
+      "foreground window {} (pid {}, this process {}); this thread's focus window is ours: {}; minimized {}; last user "
+      "input {} ms ago; foreground lock timeout {} ms",
+      foreground == ours ? "ours" : (foreground ? "another" : "none"), foreground_pid, GetCurrentProcessId(),
+      GetFocus() == ours, IsIconic(ours) != FALSE, input_age_ms, lock_timeout_ms);
+}
+}  // namespace
+
 Presenter::ExclusiveFullscreenChange D3D12Presenter::SetExclusiveFullscreenFromUIThreadImpl(
     bool want, const char* reason) {
   // UI thread, painting owned by it (Presenter::UpdateExclusiveFullscreenFromUIThread): nothing else calls the swap
-  // chain meanwhile.
-  IDXGISwapChain3* swap_chain = paint_context_.swap_chain.Get();
+  // chain meanwhile. DXGI's transition calls send WM_SIZE to this thread synchronously, and that resize may recreate the
+  // swap chain (a failed ResizeBuffers, ConnectOrReconnect): hold a reference to the one this transition started on and
+  // stop if paint_context_ no longer has it (Task 9 review M1).
+  const Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain_ref = paint_context_.swap_chain;
+  IDXGISwapChain3* swap_chain = swap_chain_ref.Get();
   if (!swap_chain) {
     return ExclusiveFullscreenChange::kUnchanged;
   }
+  const auto replaced = [&](const char* after) {
+    if (paint_context_.swap_chain.Get() == swap_chain) {
+      return false;
+    }
+    REXLOG_WARN("D3D12Presenter: exclusive fullscreen ({}): the swap chain was recreated during {}; stopped", reason,
+                after);
+    return true;
+  };
   BOOL in_fullscreen = FALSE;
   if (FAILED(swap_chain->GetFullscreenState(&in_fullscreen, nullptr))) {
     in_fullscreen = FALSE;
@@ -610,13 +647,16 @@ Presenter::ExclusiveFullscreenChange D3D12Presenter::SetExclusiveFullscreenFromU
     }
     paint_context_.AwaitSwapChainUsageCompletion();
     const HRESULT hr = in_fullscreen ? swap_chain->SetFullscreenState(FALSE, nullptr) : S_OK;
+    if (replaced("SetFullscreenState(FALSE)")) {
+      return ExclusiveFullscreenChange::kFailed;
+    }
     paint_context_.swap_chain_exclusive = false;
     paint_context_.swap_chain_resize_forced = true;
     if (want) {
       // Still wanted (focused), but DXGI left it by itself (another window or a mode change took the output).
       REXLOG_WARN(
           "D3D12Presenter: left exclusive fullscreen ({}): DXGI had left it while it was wanted; not entered again "
-          "until the window gets the focus again",
+          "until the window gets the focus again or is activated",
           reason);
       return ExclusiveFullscreenChange::kLost;
     }
@@ -638,7 +678,21 @@ Presenter::ExclusiveFullscreenChange D3D12Presenter::SetExclusiveFullscreenFromU
     return ExclusiveFullscreenChange::kLeft;
   }
 
-  // Enter, at the target mode on the output the window is on.
+  // Enter, at the target mode on the output the window is on, and only as the foreground window (Task 9c Step 0: DXGI
+  // refuses with DXGI_ERROR_NOT_CURRENTLY_AVAILABLE otherwise; a window can have its thread's focus without being in
+  // front, when its start was not allowed to take the foreground). Not in front: try again later (activation, timer).
+  const bool first_try = ExclusiveFullscreenRetriesFromUIThread() == 0;
+  HWND hwnd = nullptr;
+  swap_chain->GetHwnd(&hwnd);
+  if (hwnd && GetForegroundWindow() != hwnd) {
+    if (first_try) {
+      REXLOG_INFO(
+          "D3D12Presenter: exclusive fullscreen waits ({}): the window is not the foreground window ({}); tried again "
+          "when it is activated, and up to {} times {} ms apart",
+          reason, ForegroundState(hwnd), exclusive_fullscreen::kRetryTries, exclusive_fullscreen::kRetryIntervalMs);
+    }
+    return ExclusiveFullscreenChange::kRetryLater;
+  }
   Microsoft::WRL::ComPtr<IDXGIOutput> output;
   HRESULT hr = swap_chain->GetContainingOutput(&output);
   if (FAILED(hr)) {
@@ -652,15 +706,37 @@ Presenter::ExclusiveFullscreenChange D3D12Presenter::SetExclusiveFullscreenFromU
     return ExclusiveFullscreenChange::kFailed;
   }
   paint_context_.AwaitSwapChainUsageCompletion();
-  // Before the transition, ResizeTarget gives DXGI the mode to enter (the window is already that size, borderless).
+  // Before the transition, ResizeTarget gives DXGI the mode to enter. At a mode other than the desktop's it resizes
+  // the (borderless) window to the mode; a leave, or an entry that does not complete, puts the window's placement
+  // back (Presenter::UpdateExclusiveFullscreenFromUIThread, Window::OnFullscreenExclusiveLeft).
   const HRESULT resize_target_hr = swap_chain->ResizeTarget(&mode);
-  hr = swap_chain->SetFullscreenState(TRUE, output.Get());
-  if (FAILED(hr)) {
-    REXLOG_WARN(
-        "D3D12Presenter: exclusive fullscreen not entered ({}): SetFullscreenState(TRUE) hr {:08X} (ResizeTarget hr "
-        "{:08X}); not tried again until the window gets the focus again",
-        reason, uint32_t(hr), uint32_t(resize_target_hr));
+  if (replaced("ResizeTarget")) {
     return ExclusiveFullscreenChange::kFailed;
+  }
+  hr = swap_chain->SetFullscreenState(TRUE, output.Get());
+  if (replaced("SetFullscreenState(TRUE)")) {
+    return ExclusiveFullscreenChange::kFailed;
+  }
+  BOOL in_fullscreen_after = FALSE;
+  swap_chain->GetFullscreenState(&in_fullscreen_after, nullptr);
+  switch (exclusive_fullscreen::ClassifyEnter(uint32_t(hr), in_fullscreen_after != FALSE)) {
+    case exclusive_fullscreen::EnterOutcome::kRetryLater:
+      if (first_try) {
+        REXLOG_INFO(
+            "D3D12Presenter: exclusive fullscreen waits ({}): SetFullscreenState(TRUE) hr {:08X}, GetFullscreenState "
+            "{} ({}); tried again when the window is activated, and up to {} times {} ms apart",
+            reason, uint32_t(hr), in_fullscreen_after ? "TRUE" : "FALSE", ForegroundState(hwnd),
+            exclusive_fullscreen::kRetryTries, exclusive_fullscreen::kRetryIntervalMs);
+      }
+      return ExclusiveFullscreenChange::kRetryLater;
+    case exclusive_fullscreen::EnterOutcome::kFailed:
+      REXLOG_WARN(
+          "D3D12Presenter: exclusive fullscreen not entered ({}): SetFullscreenState(TRUE) hr {:08X} (ResizeTarget hr "
+          "{:08X}; {}); not tried again until the window gets the focus again or is activated",
+          reason, uint32_t(hr), uint32_t(resize_target_hr), ForegroundState(hwnd));
+      return ExclusiveFullscreenChange::kFailed;
+    case exclusive_fullscreen::EnterOutcome::kEntered:
+      break;
   }
   // In fullscreen ResizeTarget sets the display mode: make sure it is the target (SetFullscreenState may pick another
   // refresh rate of the same size).
@@ -668,17 +744,14 @@ Presenter::ExclusiveFullscreenChange D3D12Presenter::SetExclusiveFullscreenFromU
   DXGI_OUTPUT_DESC output_desc = {};
   bool now_known = GetOutputDesktopMode(output.Get(), now, &output_desc);
   bool mode_set_again = false;
-  // Windows reports a fractional rate (59.94) rounded either way (59 or 60).
-  const uint32_t hz_floor =
-      mode.RefreshRate.Denominator ? mode.RefreshRate.Numerator / mode.RefreshRate.Denominator : 0;
-  const uint32_t hz_round =
-      mode.RefreshRate.Denominator
-          ? (mode.RefreshRate.Numerator + mode.RefreshRate.Denominator / 2) / mode.RefreshRate.Denominator
-          : 0;
   if (now_known && mode.RefreshRate.Denominator &&
       (now.dmPelsWidth != mode.Width || now.dmPelsHeight != mode.Height ||
-       (now.dmDisplayFrequency != hz_floor && now.dmDisplayFrequency != hz_round))) {
+       !exclusive_fullscreen::RefreshMatchesWholeHz(mode.RefreshRate.Numerator, mode.RefreshRate.Denominator,
+                                                     now.dmDisplayFrequency))) {
     swap_chain->ResizeTarget(&mode);
+    if (replaced("the second ResizeTarget")) {
+      return ExclusiveFullscreenChange::kFailed;
+    }
     mode_set_again = true;
     now_known = GetOutputDesktopMode(output.Get(), now, &output_desc);
   }
@@ -687,7 +760,7 @@ Presenter::ExclusiveFullscreenChange D3D12Presenter::SetExclusiveFullscreenFromU
   paint_context_.exclusive_present_count = 0;
   paint_context_.exclusive_occlusion_logged = false;
   paint_context_.exclusive_loss_requested = false;
-  BOOL in_fullscreen_after = FALSE;
+  in_fullscreen_after = FALSE;
   swap_chain->GetFullscreenState(&in_fullscreen_after, nullptr);
   const double hz = mode.RefreshRate.Denominator
                         ? double(mode.RefreshRate.Numerator) / double(mode.RefreshRate.Denominator)
@@ -698,13 +771,13 @@ Presenter::ExclusiveFullscreenChange D3D12Presenter::SetExclusiveFullscreenFromU
   }
   REXLOG_INFO(
       "D3D12Presenter: entered exclusive fullscreen ({}): mode {}x{} @ {}/{} Hz ({:.3f} Hz), format {}, scanline "
-      "ordering {}, scaling {}; GetFullscreenState {}; output {} now at {}x{} @ {} Hz{}{}",
+      "ordering {}, scaling {}; GetFullscreenState {}; output {} now at {}x{} @ {} Hz{}{}; {}",
       reason, mode.Width, mode.Height, mode.RefreshRate.Numerator, mode.RefreshRate.Denominator, hz,
       uint32_t(mode.Format), uint32_t(mode.ScanlineOrdering), uint32_t(mode.Scaling),
       in_fullscreen_after ? "TRUE" : "FALSE", device_name, now_known ? now.dmPelsWidth : 0,
       now_known ? now.dmPelsHeight : 0, now_known ? now.dmDisplayFrequency : 0,
       mode_set_again ? " (mode set again with ResizeTarget)" : "",
-      SUCCEEDED(resize_target_hr) ? "" : " (the ResizeTarget before entering failed)");
+      SUCCEEDED(resize_target_hr) ? "" : " (the ResizeTarget before entering failed)", ForegroundState(hwnd));
   return ExclusiveFullscreenChange::kEntered;
 }
 

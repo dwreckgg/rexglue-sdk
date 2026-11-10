@@ -305,6 +305,48 @@ class Window {
   // Leaves exclusive fullscreen now (synchronously, UI thread, not from a UI drawer), without changing the desired
   // state: for shutdown paths that run after the message loop has ended or before the window closes.
   void LeaveFullscreenExclusiveNow(const char* reason);
+  // For the presenter's log (Task 9 review M5): why WantsFullscreenExclusiveNow is false now, the first unmet
+  // condition (null when it is true). A leave is logged under this, not under the reason of whichever request happened
+  // to run the update.
+  const char* FullscreenExclusiveNotWantedReason() const {
+    if (!fullscreen_) return "the window is not fullscreen";
+    if (!fullscreen_exclusive_) return "exclusive fullscreen is turned off";
+    if (!HasFocus()) return "focus loss";
+    if (fullscreen_exclusive_blocked_) return "blocked after a failed or lost attempt";
+    return nullptr;
+  }
+  // For the presenter, after a kRetryLater (rex/ui/exclusive_fullscreen.h): schedules the next try (Win32: a
+  // kRetryIntervalMs timer on the UI thread) if fewer than kRetryTries were made since the last reset; returns whether
+  // it did. The count resets on a focus gain, an activation, a new request and a successful entry.
+  bool OnFullscreenExclusiveRetryLater() {
+    if (fullscreen_exclusive_retries_ >= exclusive_fullscreen::kRetryTries || !CanApplyState()) {
+      return false;
+    }
+    ++fullscreen_exclusive_retries_;
+    ScheduleFullscreenExclusiveRetryImpl();
+    return true;
+  }
+  uint32_t FullscreenExclusiveRetries() const { return fullscreen_exclusive_retries_; }
+  void ResetFullscreenExclusiveRetries() { fullscreen_exclusive_retries_ = 0; }
+  // For the platform: the window was activated (it became the foreground window). With exclusive fullscreen desired,
+  // clears the block and the retry count and asks for the update: entering refused because the window was not in front
+  // (Task 9c Step 0) is tried again here.
+  void OnActivatedForFullscreenExclusive() {
+    if (fullscreen_ && fullscreen_exclusive_) {
+      fullscreen_exclusive_blocked_ = false;
+      fullscreen_exclusive_retries_ = 0;
+      RequestFullscreenExclusiveUpdate("the window was activated");
+    }
+  }
+  // For the presenter, after leaving exclusive fullscreen (Task 9 review M7): DXGI puts back the window rect it saved
+  // when entering, which a ResizeTarget at a mode other than the desktop's had changed. While the window is still
+  // (borderless) fullscreen the platform puts its fullscreen placement back, without activating it or changing its
+  // Z order. UI thread.
+  void OnFullscreenExclusiveLeft() {
+    if (CanApplyState() && fullscreen_) {
+      RestoreFullscreenPlacementImpl();
+    }
+  }
 
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.
@@ -557,6 +599,9 @@ class Window {
   virtual void FocusImpl() {}
   // Called only if state can be applied. Win32 posts a message to the window that runs the presenter's update.
   virtual void RequestFullscreenExclusiveUpdateImpl(const char* reason) { (void)reason; }
+  // Called only if state can be applied (see the public callers).
+  virtual void ScheduleFullscreenExclusiveRetryImpl() {}
+  virtual void RestoreFullscreenPlacementImpl() {}
 
   Presenter* presenter() const { return presenter_; }
   bool HasSurface() const { return presenter_surface_ != nullptr; }
@@ -716,6 +761,8 @@ class Window {
   // Set by OnFullscreenExclusiveBlocked, cleared on a focus gain and on a new request (SetFullscreenExclusive(true),
   // SetFullscreen(true)).
   bool fullscreen_exclusive_blocked_ = false;
+  // Tries scheduled since the last reset (OnFullscreenExclusiveRetryLater).
+  uint32_t fullscreen_exclusive_retries_ = 0;
 
   std::string title_;
 

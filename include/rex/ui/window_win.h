@@ -66,8 +66,13 @@ class Win32Window : public Window {
   std::unique_ptr<Surface> CreateSurfaceImpl(Surface::TypeFlags allowed_types) override;
   void RequestPaintImpl() override;
   void RequestFullscreenExclusiveUpdateImpl(const char* reason) override;
+  void ScheduleFullscreenExclusiveRetryImpl() override;
+  void RestoreFullscreenPlacementImpl() override;
 
  private:
+  // The exclusive fullscreen retry timer (SetTimer on hwnd_, WM_TIMER on the UI thread).
+  static constexpr UINT_PTR kTimerFullscreenExclusiveRetry = 0x4F55;
+
   enum : UINT {
     kUserMessageAutoHideCursor = WM_USER,
     // Runs the presenter's exclusive fullscreen update (Presenter::UpdateExclusiveFullscreenFromUIThread) from the

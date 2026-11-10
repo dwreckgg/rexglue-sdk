@@ -32,6 +32,7 @@
 #include <rex/platform.h>
 #include <rex/types.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/exclusive_fullscreen.h>
 #include <rex/ui/surface.h>
 #include <rex/ui/ui_drawer.h>
 
@@ -366,6 +367,9 @@ class Presenter {
   void UpdateExclusiveFullscreenFromUIThread(const char* reason, bool leave = false);
   // Whether the swap chain is in exclusive fullscreen now (the presenter's own state). UI thread only.
   virtual bool IsExclusiveFullscreenActiveFromUIThread() const { return false; }
+  // Whether this presenter can enter exclusive fullscreen at all (D3D12: yes). Without it, a desired exclusive
+  // fullscreen changes nothing, painting included.
+  virtual bool SupportsExclusiveFullscreen() const { return false; }
 
  protected:
   enum class PaintResult {
@@ -643,10 +647,10 @@ class Presenter {
   // ensure the implementation is only called while the connection is active.
   virtual void DisconnectPaintingFromSurfaceFromUIThreadImpl() = 0;
 
-  // What SetExclusiveFullscreenFromUIThreadImpl did. kEntered, kLeft and kLost need the swap chain's buffers resized
-  // (the implementation forces the next ConnectOrReconnect to resize them); kFailed and kLost block new attempts until
-  // the window's next focus gain (Window::OnFullscreenExclusiveBlocked).
-  enum class ExclusiveFullscreenChange { kUnchanged, kEntered, kLeft, kFailed, kLost };
+  // What SetExclusiveFullscreenFromUIThreadImpl did; what follows from each is rex/ui/exclusive_fullscreen.h's
+  // ActionsFor (resize the buffers, block new attempts until the window's next focus gain or activation, or retry
+  // later).
+  using ExclusiveFullscreenChange = exclusive_fullscreen::Change;
   // Called by UpdateExclusiveFullscreenFromUIThread only while connected and with painting owned by the UI thread.
   // Enters (want) or leaves exclusive fullscreen; logs each transition once.
   virtual ExclusiveFullscreenChange SetExclusiveFullscreenFromUIThreadImpl(bool want, const char* reason) {
@@ -657,6 +661,8 @@ class Presenter {
   // For PaintAndPresentImpl while exclusive (which then runs on the UI thread): asks the window to run the update
   // (posted), for example when DXGI has left exclusive fullscreen by itself.
   void RequestExclusiveFullscreenUpdateViaWindow(const char* reason);
+  // For the implementation's log: the retries scheduled since the window's last reset (0: the first try of a series).
+  uint32_t ExclusiveFullscreenRetriesFromUIThread() const;
 
   // The returned lock interlocks multiple consumers (but not the producer and
   // the consumer) and must be held while accessing implementation-specific

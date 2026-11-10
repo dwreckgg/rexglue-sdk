@@ -410,7 +410,11 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
 
 void ReXApp::OnDestroy() {
   // The message loop has ended: leave DXGI exclusive fullscreen first, before the app's own shutdown (which may end
-  // the process from a watchdog) and while the window and the swap chain exist.
+  // the process from a watchdog) and while the window and the swap chain exist. This runs BEFORE the app's 5 s
+  // shutdown watchdog is armed (the port arms it at the top of OnShutdown), on purpose: a kill in the middle of the
+  // leave is what it avoids. So it is not bounded by that watchdog (Task 9 review M6): it is short (GPU fence waits,
+  // SetFullscreenState(FALSE), one ResizeBuffers; 6 ms in Task 9's run), and nothing else may be added here before
+  // OnShutdown on the same reasoning.
   if (window_) {
     window_->LeaveFullscreenExclusiveNow("shutdown");
   }
