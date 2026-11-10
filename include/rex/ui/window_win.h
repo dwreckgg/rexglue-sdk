@@ -65,11 +65,18 @@ class Win32Window : public Window {
 
   std::unique_ptr<Surface> CreateSurfaceImpl(Surface::TypeFlags allowed_types) override;
   void RequestPaintImpl() override;
+  void RequestFullscreenExclusiveUpdateImpl(const char* reason) override;
 
  private:
   enum : UINT {
     kUserMessageAutoHideCursor = WM_USER,
+    // Runs the presenter's exclusive fullscreen update (Presenter::UpdateExclusiveFullscreenFromUIThread) from the
+    // message loop, outside any paint or focus message handler.
+    kUserMessageFullscreenExclusiveUpdate,
   };
+  // A posted kUserMessageFullscreenExclusiveUpdate not yet handled, and the latest reason for it.
+  bool fullscreen_exclusive_update_posted_ = false;
+  const char* fullscreen_exclusive_update_reason_ = "";
 
   BOOL AdjustWindowRectangle(RECT& rect, DWORD style, BOOL menu, DWORD ex_style, UINT dpi) const;
   BOOL AdjustWindowRectangle(RECT& rect) const;

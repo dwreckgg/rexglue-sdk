@@ -91,11 +91,28 @@ class D3D12Presenter final : public Presenter {
     ui_submission_tracker_.AwaitSubmissionCompletion(submission_index);
   }
 
+  bool IsExclusiveFullscreenActiveFromUIThread() const override {
+    return paint_context_.swap_chain_exclusive;
+  }
+
+  // The flags of the swap chain's Present call (sync interval 0): DXGI_PRESENT_RESTART, plus ALLOW_TEARING when the
+  // swap chain allows tearing and is not in exclusive fullscreen (the flag is an invalid call in exclusive fullscreen).
+  static UINT PresentFlags(bool exclusive, bool swap_chain_allows_tearing) {
+    return DXGI_PRESENT_RESTART |
+           ((swap_chain_allows_tearing && !exclusive) ? DXGI_PRESENT_ALLOW_TEARING : 0);
+  }
+
+  // The display mode exclusive fullscreen enters on `output`: the output's current desktop mode (its size and refresh
+  // rate, matched to a mode of the swap chain's format). The one place the target mode is chosen.
+  static bool GetExclusiveFullscreenTargetMode(IDXGIOutput* output, DXGI_MODE_DESC& mode_out);
+
  protected:
   SurfacePaintConnectResult ConnectOrReconnectPaintingToSurfaceFromUIThread(
       Surface& new_surface, uint32_t new_surface_width, uint32_t new_surface_height,
       bool was_paintable, bool& is_vsync_implicit_out) override;
   void DisconnectPaintingFromSurfaceFromUIThreadImpl() override;
+  ExclusiveFullscreenChange SetExclusiveFullscreenFromUIThreadImpl(bool want,
+                                                                   const char* reason) override;
 
   bool RefreshGuestOutputImpl(uint32_t mailbox_index, uint32_t frontbuffer_width,
                               uint32_t frontbuffer_height,
@@ -207,7 +224,11 @@ class D3D12Presenter final : public Presenter {
       paint_submission_tracker.AwaitAllSubmissionsCompletion();
     }
 
+    // Leaves exclusive fullscreen first if the swap chain is in it (DXGI requires it before the release).
     void DestroySwapChain();
+    // If the swap chain is in DXGI fullscreen: SetFullscreenState(FALSE), one log line naming `reason`. Clears
+    // swap_chain_exclusive. Returns whether it was in fullscreen.
+    bool LeaveFullscreenStateForRelease(const char* reason);
 
     // Connection-independent.
 
@@ -251,6 +272,15 @@ class D3D12Presenter final : public Presenter {
     uint32_t swap_chain_width = 0;
     uint32_t swap_chain_height = 0;
     bool swap_chain_allows_tearing = false;
+    // Exclusive fullscreen (UI thread only: while set, presentation runs on the UI thread). Set when
+    // SetFullscreenState(TRUE) succeeded, cleared when it is left (by us, or found left by DXGI).
+    bool swap_chain_exclusive = false;
+    // The next ConnectOrReconnect resizes the buffers even at the same size (after a fullscreen state change).
+    bool swap_chain_resize_forced = false;
+    // Per entry into exclusive fullscreen: presents since entering, and what was logged once.
+    uint32_t exclusive_present_count = 0;
+    bool exclusive_occlusion_logged = false;
+    bool exclusive_loss_requested = false;
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kSwapChainBufferCount> swap_chain_buffers;
   };

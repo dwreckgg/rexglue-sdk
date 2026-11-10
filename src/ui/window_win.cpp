@@ -622,6 +622,17 @@ void Win32Window::RequestPaintImpl() {
   InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
+void Win32Window::RequestFullscreenExclusiveUpdateImpl(const char* reason) {
+  // UI thread. The latest reason wins; one message is pending at a time (dropped if the window is destroyed first).
+  fullscreen_exclusive_update_reason_ = reason;
+  if (fullscreen_exclusive_update_posted_ || !hwnd_) {
+    return;
+  }
+  if (PostMessageW(hwnd_, kUserMessageFullscreenExclusiveUpdate, 0, 0)) {
+    fullscreen_exclusive_update_posted_ = true;
+  }
+}
+
 BOOL Win32Window::AdjustWindowRectangle(RECT& rect, DWORD style, BOOL menu, DWORD ex_style,
                                         UINT dpi) const {
   const Win32WindowedAppContext& win32_app_context =
@@ -1050,6 +1061,9 @@ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
     // In case the Windows window was somehow forcibly destroyed without
     // WM_CLOSE.
     case WM_DESTROY: {
+      // DXGI exclusive fullscreen is left while the window and its swap chain still exist (before the listeners may
+      // tear the presenter down).
+      LeaveFullscreenExclusiveNow("shutdown (the window closes)");
       if (cursor_auto_hide_timer_) {
         DeleteTimerQueueTimer(nullptr, cursor_auto_hide_timer_, nullptr);
         cursor_auto_hide_timer_ = nullptr;
@@ -1234,6 +1248,14 @@ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
         }
         cursor_currently_auto_hidden_ = true;
         SetCursorIfFocusedOnClientArea(nullptr);
+      }
+      return 0;
+    } break;
+
+    case kUserMessageFullscreenExclusiveUpdate: {
+      fullscreen_exclusive_update_posted_ = false;
+      if (presenter()) {
+        presenter()->UpdateExclusiveFullscreenFromUIThread(fullscreen_exclusive_update_reason_);
       }
       return 0;
     } break;

@@ -356,6 +356,17 @@ class Presenter {
   // Requests (re)painting with the UI if there's UI to draw.
   void RequestUIPaintFromUIThread();
 
+  // Exclusive fullscreen (Window::SetFullscreenExclusive). Enters it if the window wants it now
+  // (Window::WantsFullscreenExclusiveNow) and leave is false, else leaves it. UI thread only, never from a UI drawer;
+  // inside a UI thread paint it is re-posted through the window. While the window desires exclusive fullscreen or it
+  // is active, all presentation runs on the UI thread (the window's message thread): DXGI's fullscreen transitions and
+  // its presents in exclusive fullscreen may send messages to the window and wait for them, so presenting from the
+  // guest output thread while the UI thread waits for it (paint_mode_mutex_) could deadlock. `reason` is a string
+  // literal for the log.
+  void UpdateExclusiveFullscreenFromUIThread(const char* reason, bool leave = false);
+  // Whether the swap chain is in exclusive fullscreen now (the presenter's own state). UI thread only.
+  virtual bool IsExclusiveFullscreenActiveFromUIThread() const { return false; }
+
  protected:
   enum class PaintResult {
     kPresented,
@@ -632,6 +643,21 @@ class Presenter {
   // ensure the implementation is only called while the connection is active.
   virtual void DisconnectPaintingFromSurfaceFromUIThreadImpl() = 0;
 
+  // What SetExclusiveFullscreenFromUIThreadImpl did. kEntered, kLeft and kLost need the swap chain's buffers resized
+  // (the implementation forces the next ConnectOrReconnect to resize them); kFailed and kLost block new attempts until
+  // the window's next focus gain (Window::OnFullscreenExclusiveBlocked).
+  enum class ExclusiveFullscreenChange { kUnchanged, kEntered, kLeft, kFailed, kLost };
+  // Called by UpdateExclusiveFullscreenFromUIThread only while connected and with painting owned by the UI thread.
+  // Enters (want) or leaves exclusive fullscreen; logs each transition once.
+  virtual ExclusiveFullscreenChange SetExclusiveFullscreenFromUIThreadImpl(bool want, const char* reason) {
+    (void)want;
+    (void)reason;
+    return ExclusiveFullscreenChange::kUnchanged;
+  }
+  // For PaintAndPresentImpl while exclusive (which then runs on the UI thread): asks the window to run the update
+  // (posted), for example when DXGI has left exclusive fullscreen by itself.
+  void RequestExclusiveFullscreenUpdateViaWindow(const char* reason);
+
   // The returned lock interlocks multiple consumers (but not the producer and
   // the consumer) and must be held while accessing implementation-specific
   // objects that depend on the image or its index in the mailbox (unless there
@@ -862,6 +888,10 @@ class Presenter {
   // kNone before modifying (that naturally has to be done anyway by
   // disconnecting painting).
   Window* window_ = nullptr;
+
+  // UI thread only: the reason of an exclusive fullscreen update that arrived during a UI thread paint, posted again
+  // when the paint ends (null: none).
+  const char* exclusive_fullscreen_update_after_paint_ = nullptr;
 
   // The surface of the `window_` the presenter is currently attached to.
   Surface* surface_ = nullptr;

@@ -104,6 +104,8 @@ D3D12Presenter::~D3D12Presenter() {
   // From most likely the latest to most likely the earliest to be signaled, so
   // just one sleep will likely be needed.
   paint_context_.AwaitSwapChainUsageCompletion();
+  // Normally the swap chain is gone already (the window detaches first); a fullscreen one is never released.
+  paint_context_.LeaveFullscreenStateForRelease("the presenter is destroyed");
   guest_output_resource_refresher_submission_tracker_.Shutdown();
   ui_submission_tracker_.Shutdown();
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -397,10 +399,14 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
   // been destroyed, if the surface is the same, try resizing.
   if (paint_context_.swap_chain) {
     if (was_paintable && paint_context_.swap_chain_width == new_swap_chain_width &&
-        paint_context_.swap_chain_height == new_swap_chain_height) {
+        paint_context_.swap_chain_height == new_swap_chain_height &&
+        !paint_context_.swap_chain_resize_forced) {
       is_vsync_implicit_out = false;
       return SurfacePaintConnectResult::kSuccessUnchanged;
     }
+    // Resized now, including after an exclusive fullscreen transition (swap_chain_resize_forced; DXGI wants
+    // ResizeBuffers after SetFullscreenState).
+    paint_context_.swap_chain_resize_forced = false;
     paint_context_.AwaitSwapChainUsageCompletion();
     // Using the current swap_chain_allows_tearing_ value that's consistent with
     // the creation of the swap chain because ResizeBuffers can't toggle the
@@ -541,6 +547,161 @@ void D3D12Presenter::DisconnectPaintingFromSurfaceFromUIThreadImpl() {
   paint_context_.DestroySwapChain();
 }
 
+namespace {
+// The output's current desktop mode (EnumDisplaySettings, ENUM_CURRENT_SETTINGS), for the target and the log.
+bool GetOutputDesktopMode(IDXGIOutput* output, DEVMODEW& mode_out, DXGI_OUTPUT_DESC* desc_out) {
+  DXGI_OUTPUT_DESC desc;
+  if (FAILED(output->GetDesc(&desc))) {
+    return false;
+  }
+  if (desc_out) {
+    *desc_out = desc;
+  }
+  mode_out = {};
+  mode_out.dmSize = sizeof(mode_out);
+  return EnumDisplaySettingsW(desc.DeviceName, ENUM_CURRENT_SETTINGS, &mode_out) != FALSE;
+}
+}  // namespace
+
+bool D3D12Presenter::GetExclusiveFullscreenTargetMode(IDXGIOutput* output, DXGI_MODE_DESC& mode_out) {
+  // Today the monitor's current mode (G4c): its size and refresh rate, matched to the closest mode DXGI lists for the
+  // swap chain's format, so the refresh rate is the exact rational the driver uses.
+  DEVMODEW desktop;
+  if (!GetOutputDesktopMode(output, desktop, nullptr)) {
+    return false;
+  }
+  DXGI_MODE_DESC wanted = {};
+  wanted.Width = desktop.dmPelsWidth;
+  wanted.Height = desktop.dmPelsHeight;
+  // 0 and 1 mean the hardware default rate: leave the rate unspecified then.
+  wanted.RefreshRate.Numerator = desktop.dmDisplayFrequency > 1 ? desktop.dmDisplayFrequency : 0;
+  wanted.RefreshRate.Denominator = desktop.dmDisplayFrequency > 1 ? 1 : 0;
+  wanted.Format = kSwapChainFormat;
+  if (FAILED(output->FindClosestMatchingMode(&wanted, &mode_out, nullptr)) ||
+      mode_out.Width != wanted.Width || mode_out.Height != wanted.Height) {
+    // No listed mode of the desktop's size: ask for the desktop mode as it is.
+    mode_out = wanted;
+  }
+  return true;
+}
+
+Presenter::ExclusiveFullscreenChange D3D12Presenter::SetExclusiveFullscreenFromUIThreadImpl(
+    bool want, const char* reason) {
+  // UI thread, painting owned by it (Presenter::UpdateExclusiveFullscreenFromUIThread): nothing else calls the swap
+  // chain meanwhile.
+  IDXGISwapChain3* swap_chain = paint_context_.swap_chain.Get();
+  if (!swap_chain) {
+    return ExclusiveFullscreenChange::kUnchanged;
+  }
+  BOOL in_fullscreen = FALSE;
+  if (FAILED(swap_chain->GetFullscreenState(&in_fullscreen, nullptr))) {
+    in_fullscreen = FALSE;
+  }
+
+  if (paint_context_.swap_chain_exclusive) {
+    if (want && in_fullscreen) {
+      return ExclusiveFullscreenChange::kUnchanged;
+    }
+    paint_context_.AwaitSwapChainUsageCompletion();
+    const HRESULT hr = in_fullscreen ? swap_chain->SetFullscreenState(FALSE, nullptr) : S_OK;
+    paint_context_.swap_chain_exclusive = false;
+    paint_context_.swap_chain_resize_forced = true;
+    if (want) {
+      // Still wanted (focused), but DXGI left it by itself (another window or a mode change took the output).
+      REXLOG_WARN(
+          "D3D12Presenter: left exclusive fullscreen ({}): DXGI had left it while it was wanted; not entered again "
+          "until the window gets the focus again",
+          reason);
+      return ExclusiveFullscreenChange::kLost;
+    }
+    REXLOG_INFO("D3D12Presenter: left exclusive fullscreen ({}){}: SetFullscreenState(FALSE) hr {:08X}", reason,
+                in_fullscreen ? "" : " (DXGI had left it already)", uint32_t(hr));
+    return ExclusiveFullscreenChange::kLeft;
+  }
+
+  if (!want) {
+    if (!in_fullscreen) {
+      return ExclusiveFullscreenChange::kUnchanged;
+    }
+    // In DXGI fullscreen without having entered it here (Alt+Enter is off): leave it too.
+    paint_context_.AwaitSwapChainUsageCompletion();
+    const HRESULT hr = swap_chain->SetFullscreenState(FALSE, nullptr);
+    paint_context_.swap_chain_resize_forced = true;
+    REXLOG_INFO("D3D12Presenter: left a DXGI fullscreen state not entered here ({}): hr {:08X}", reason,
+                uint32_t(hr));
+    return ExclusiveFullscreenChange::kLeft;
+  }
+
+  // Enter, at the target mode on the output the window is on.
+  Microsoft::WRL::ComPtr<IDXGIOutput> output;
+  HRESULT hr = swap_chain->GetContainingOutput(&output);
+  if (FAILED(hr)) {
+    REXLOG_WARN("D3D12Presenter: exclusive fullscreen not entered ({}): GetContainingOutput hr {:08X}", reason,
+                uint32_t(hr));
+    return ExclusiveFullscreenChange::kFailed;
+  }
+  DXGI_MODE_DESC mode;
+  if (!GetExclusiveFullscreenTargetMode(output.Get(), mode)) {
+    REXLOG_WARN("D3D12Presenter: exclusive fullscreen not entered ({}): no target mode for the output", reason);
+    return ExclusiveFullscreenChange::kFailed;
+  }
+  paint_context_.AwaitSwapChainUsageCompletion();
+  // Before the transition, ResizeTarget gives DXGI the mode to enter (the window is already that size, borderless).
+  const HRESULT resize_target_hr = swap_chain->ResizeTarget(&mode);
+  hr = swap_chain->SetFullscreenState(TRUE, output.Get());
+  if (FAILED(hr)) {
+    REXLOG_WARN(
+        "D3D12Presenter: exclusive fullscreen not entered ({}): SetFullscreenState(TRUE) hr {:08X} (ResizeTarget hr "
+        "{:08X}); not tried again until the window gets the focus again",
+        reason, uint32_t(hr), uint32_t(resize_target_hr));
+    return ExclusiveFullscreenChange::kFailed;
+  }
+  // In fullscreen ResizeTarget sets the display mode: make sure it is the target (SetFullscreenState may pick another
+  // refresh rate of the same size).
+  DEVMODEW now;
+  DXGI_OUTPUT_DESC output_desc = {};
+  bool now_known = GetOutputDesktopMode(output.Get(), now, &output_desc);
+  bool mode_set_again = false;
+  // Windows reports a fractional rate (59.94) rounded either way (59 or 60).
+  const uint32_t hz_floor =
+      mode.RefreshRate.Denominator ? mode.RefreshRate.Numerator / mode.RefreshRate.Denominator : 0;
+  const uint32_t hz_round =
+      mode.RefreshRate.Denominator
+          ? (mode.RefreshRate.Numerator + mode.RefreshRate.Denominator / 2) / mode.RefreshRate.Denominator
+          : 0;
+  if (now_known && mode.RefreshRate.Denominator &&
+      (now.dmPelsWidth != mode.Width || now.dmPelsHeight != mode.Height ||
+       (now.dmDisplayFrequency != hz_floor && now.dmDisplayFrequency != hz_round))) {
+    swap_chain->ResizeTarget(&mode);
+    mode_set_again = true;
+    now_known = GetOutputDesktopMode(output.Get(), now, &output_desc);
+  }
+  paint_context_.swap_chain_exclusive = true;
+  paint_context_.swap_chain_resize_forced = true;
+  paint_context_.exclusive_present_count = 0;
+  paint_context_.exclusive_occlusion_logged = false;
+  paint_context_.exclusive_loss_requested = false;
+  BOOL in_fullscreen_after = FALSE;
+  swap_chain->GetFullscreenState(&in_fullscreen_after, nullptr);
+  const double hz = mode.RefreshRate.Denominator
+                        ? double(mode.RefreshRate.Numerator) / double(mode.RefreshRate.Denominator)
+                        : 0.0;
+  char device_name[64] = {};
+  for (size_t i = 0; i + 1 < sizeof(device_name) && output_desc.DeviceName[i]; ++i) {
+    device_name[i] = char(output_desc.DeviceName[i] < 128 ? output_desc.DeviceName[i] : '?');
+  }
+  REXLOG_INFO(
+      "D3D12Presenter: entered exclusive fullscreen ({}): mode {}x{} @ {}/{} Hz ({:.3f} Hz), format {}, scanline "
+      "ordering {}, scaling {}; GetFullscreenState {}; output {} now at {}x{} @ {} Hz{}{}",
+      reason, mode.Width, mode.Height, mode.RefreshRate.Numerator, mode.RefreshRate.Denominator, hz,
+      uint32_t(mode.Format), uint32_t(mode.ScanlineOrdering), uint32_t(mode.Scaling),
+      in_fullscreen_after ? "TRUE" : "FALSE", device_name, now_known ? now.dmPelsWidth : 0,
+      now_known ? now.dmPelsHeight : 0, now_known ? now.dmDisplayFrequency : 0,
+      mode_set_again ? " (mode set again with ResizeTarget)" : "",
+      SUCCEEDED(resize_target_hr) ? "" : " (the ResizeTarget before entering failed)");
+  return ExclusiveFullscreenChange::kEntered;
+}
+
 bool D3D12Presenter::RefreshGuestOutputImpl(
     uint32_t mailbox_index, uint32_t frontbuffer_width, uint32_t frontbuffer_height,
     std::function<bool(GuestOutputRefreshContext& context)> refresher, bool& is_8bpc_out_ref) {
@@ -600,13 +761,34 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
     return;
   }
   AwaitSwapChainUsageCompletion();
+  // Shutdown (the window detaches), a lost surface, or a failed resize: a fullscreen swap chain is never released.
+  LeaveFullscreenStateForRelease("the swap chain is released (shutdown, a lost surface or a failed resize)");
   for (Microsoft::WRL::ComPtr<ID3D12Resource>& swap_chain_buffer_ref : swap_chain_buffers) {
     swap_chain_buffer_ref.Reset();
   }
   swap_chain.Reset();
   swap_chain_allows_tearing = false;
+  swap_chain_exclusive = false;
+  swap_chain_resize_forced = false;
   swap_chain_height = 0;
   swap_chain_width = 0;
+}
+
+bool D3D12Presenter::PaintContext::LeaveFullscreenStateForRelease(const char* reason) {
+  if (!swap_chain) {
+    return false;
+  }
+  BOOL in_fullscreen = FALSE;
+  if (FAILED(swap_chain->GetFullscreenState(&in_fullscreen, nullptr)) || !in_fullscreen) {
+    swap_chain_exclusive = false;
+    return false;
+  }
+  AwaitSwapChainUsageCompletion();
+  const HRESULT hr = swap_chain->SetFullscreenState(FALSE, nullptr);
+  swap_chain_exclusive = false;
+  REXLOG_INFO("D3D12Presenter: left exclusive fullscreen ({}): SetFullscreenState(FALSE) hr {:08X}", reason,
+              uint32_t(hr));
+  return true;
 }
 
 Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers) {
@@ -1210,11 +1392,11 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // fullscreen is ever used in, the allow tearing flag must not be passed in
   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
   // presentation model used in Direct3D 12).
-  auto present = [&] {
-    return paint_context_.swap_chain->Present(
-        0, DXGI_PRESENT_RESTART |
-               (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
-  };
+  // In DXGI exclusive fullscreen (Task 9) the tearing flag is never passed (PresentFlags); this present then runs on
+  // the UI thread (Presenter::UpdateExclusiveFullscreenFromUIThread). Not exclusive: the flags are as before.
+  const bool exclusive = paint_context_.swap_chain_exclusive;
+  const UINT present_flags = PresentFlags(exclusive, paint_context_.swap_chain_allows_tearing);
+  auto present = [&] { return paint_context_.swap_chain->Present(0, present_flags); };
   HRESULT present_result;
   if (!pace_stats::LagOn()) {
     present_result = present();
@@ -1223,7 +1405,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     pace_stats::LagPresentMark mark;
     mark.swap_index = guest_output_resource ? guest_output_properties.lag_swap_index : 0;
     if (guest_output_resource) mark.gpu = guest_output_properties.lag_gpu;
-    mark.flags = paint_context_.swap_chain_allows_tearing ? 1u : 0u;
+    mark.flags = (paint_context_.swap_chain_allows_tearing ? 1u : 0u) | (exclusive ? 2u : 0u);
     mark.qpc_before = int64_t(rex::chrono::Clock::host_tick_count_platform());
     present_result = present();
     mark.qpc_after = int64_t(rex::chrono::Clock::host_tick_count_platform());
@@ -1235,6 +1417,33 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // Discord server.
   paint_context_.present_submission_tracker.NextSubmission();
   pace_stats::Mark(pace_stats::kPresent);
+  if (exclusive) {
+    // Exclusive fullscreen (UI thread): occlusion and a fullscreen state DXGI left by itself are noted once per entry,
+    // and handled by a posted update (never here, mid-paint); the presentation statistics are logged once.
+    PaintContext& pc = paint_context_;
+    ++pc.exclusive_present_count;
+    if (present_result == DXGI_STATUS_OCCLUDED && !pc.exclusive_occlusion_logged) {
+      pc.exclusive_occlusion_logged = true;
+      REXLOG_INFO("D3D12Presenter: exclusive fullscreen: a present returned DXGI_STATUS_OCCLUDED (logged once)");
+    }
+    BOOL in_fullscreen = TRUE;
+    if (!pc.exclusive_loss_requested && SUCCEEDED(pc.swap_chain->GetFullscreenState(&in_fullscreen, nullptr)) &&
+        !in_fullscreen) {
+      pc.exclusive_loss_requested = true;
+      RequestExclusiveFullscreenUpdateViaWindow("DXGI left exclusive fullscreen");
+    }
+    if (pc.exclusive_present_count == 300) {
+      DXGI_FRAME_STATISTICS stats = {};
+      const HRESULT stats_hr = pc.swap_chain->GetFrameStatistics(&stats);
+      UINT last_present_count = 0;
+      pc.swap_chain->GetLastPresentCount(&last_present_count);
+      REXLOG_INFO(
+          "D3D12Presenter: exclusive fullscreen after 300 presents: GetFrameStatistics hr {:08X}, PresentCount {}, "
+          "PresentRefreshCount {}, SyncRefreshCount {}, GetLastPresentCount {}",
+          uint32_t(stats_hr), stats.PresentCount, stats.PresentRefreshCount, stats.SyncRefreshCount,
+          last_present_count);
+    }
+  }
   switch (present_result) {
     case DXGI_ERROR_DEVICE_REMOVED:
       return PaintResult::kGpuLostExternally;

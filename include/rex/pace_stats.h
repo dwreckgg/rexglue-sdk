@@ -58,7 +58,8 @@ struct LagPresentMark {
   int64_t qpc_before = 0;   // just before IDXGISwapChain::Present
   int64_t qpc_after = 0;    // just after it returned
   uint32_t swap_index = 0;  // the VdSwap ordinal of the guest output this present painted; 0: none painted
-  uint32_t flags = 0;       // bit 0: the swap chain allows tearing (swap_chain_allows_tearing)
+  uint32_t flags = 0;       // bit 0: the swap chain allows tearing (swap_chain_allows_tearing); bit 1: presented in
+                            // DXGI exclusive fullscreen (no tearing flag passed, the UI thread presented)
   int32_t present_hr = 0;   // what Present returned
   uint32_t reserved = 0;
   LagGpuSwap gpu;           // the GPU thread's marks of that guest output's swap packet (all 0: none painted)

@@ -274,6 +274,38 @@ class Window {
   bool IsFullscreen() const { return fullscreen_; }
   void SetFullscreen(bool new_fullscreen);
 
+  // Exclusive fullscreen (DXGI, the D3D12 presenter on Win32 only): a sub-mode of fullscreen. While the window is
+  // fullscreen, has the focus and this is set, the presenter's swap chain is in DXGI exclusive fullscreen at the target
+  // mode (today the monitor's current mode); it leaves it on focus loss and re-enters on focus. Desired state, UI
+  // thread only; the change is applied through a message posted to the window (Win32). `reason` must be a string
+  // literal (it is logged when the posted update runs).
+  bool IsFullscreenExclusive() const { return fullscreen_exclusive_; }
+  void SetFullscreenExclusive(bool new_fullscreen_exclusive,
+                              const char* reason = "SetFullscreenExclusive");
+  // Live state, UI thread only: whether the presenter's swap chain is in exclusive fullscreen now (false without
+  // focus, before the posted update has run, or when DXGI could not enter it).
+  bool IsFullscreenExclusiveActive() const {
+    return presenter_ && presenter_->IsExclusiveFullscreenActiveFromUIThread();
+  }
+  // Whether exclusive fullscreen should be in effect now (for the presenter): fullscreen, exclusive desired, focused,
+  // and not blocked by a failed or lost attempt since the last focus gain or request.
+  bool WantsFullscreenExclusiveNow() const {
+    return fullscreen_ && fullscreen_exclusive_ && !fullscreen_exclusive_blocked_ && HasFocus();
+  }
+  // For the presenter: entering failed, or DXGI left exclusive fullscreen while it was still wanted. No new attempt
+  // until the window gets the focus again or exclusive (or fullscreen) is requested again, so a refusal cannot loop.
+  void OnFullscreenExclusiveBlocked() { fullscreen_exclusive_blocked_ = true; }
+  // Asks for the presenter's exclusive fullscreen update (posted on Win32, so never inside a paint or a message
+  // handler that DXGI's own calls may re-enter). No-op on platforms without exclusive fullscreen.
+  void RequestFullscreenExclusiveUpdate(const char* reason) {
+    if (CanApplyState()) {
+      RequestFullscreenExclusiveUpdateImpl(reason);
+    }
+  }
+  // Leaves exclusive fullscreen now (synchronously, UI thread, not from a UI drawer), without changing the desired
+  // state: for shutdown paths that run after the message loop has ended or before the window closes.
+  void LeaveFullscreenExclusiveNow(const char* reason);
+
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.
   const std::string& GetTitle() const { return title_; }
@@ -523,6 +555,8 @@ class Window {
   // nothing otherwise (focus can't be requested before the window is open, a
   // closed window is always assumed to be not in focus).
   virtual void FocusImpl() {}
+  // Called only if state can be applied. Win32 posts a message to the window that runs the presenter's update.
+  virtual void RequestFullscreenExclusiveUpdateImpl(const char* reason) { (void)reason; }
 
   Presenter* presenter() const { return presenter_; }
   bool HasSurface() const { return presenter_surface_ != nullptr; }
@@ -678,6 +712,10 @@ class Window {
   uint32_t actual_physical_height_ = 0;
 
   bool fullscreen_ = false;
+  bool fullscreen_exclusive_ = false;
+  // Set by OnFullscreenExclusiveBlocked, cleared on a focus gain and on a new request (SetFullscreenExclusive(true),
+  // SetFullscreen(true)).
+  bool fullscreen_exclusive_blocked_ = false;
 
   std::string title_;
 

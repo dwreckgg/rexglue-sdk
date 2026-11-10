@@ -517,6 +517,14 @@ void Presenter::PaintFromUIThread(bool force_paint) {
     SetPaintModeFromUIThread(GetDesiredPaintModeFromUIThread(true));
   }
   is_in_ui_thread_paint_ = false;
+  if (exclusive_fullscreen_update_after_paint_) {
+    // An exclusive fullscreen update that arrived during this paint (UpdateExclusiveFullscreenFromUIThread).
+    const char* reason = exclusive_fullscreen_update_after_paint_;
+    exclusive_fullscreen_update_after_paint_ = nullptr;
+    if (window_) {
+      window_->RequestFullscreenExclusiveUpdate(reason);
+    }
+  }
 
   // Check if the device has been lost. There's no point in requesting repaint
   // if it has happened anyway, it won't be possible to satisfy such request
@@ -790,6 +798,61 @@ void Presenter::RequestUIPaintFromUIThread() {
     // The window must be present, otherwise the conditions wouldn't have been
     // met.
     window_->RequestPaint();
+  }
+}
+
+// Threads (Task 9): DXGI's SetFullscreenState, ResizeTarget and ResizeBuffers, and its presents in exclusive
+// fullscreen, may send messages to the window's thread and wait for them. This runs on the UI thread, which is that
+// thread (it runs the message loop), and takes painting away from the guest output thread first; while exclusive
+// fullscreen is desired or active, GetDesiredPaintModeFromUIThread keeps every present on the UI thread, so no other
+// thread calls the swap chain and the UI thread never waits on a thread that waits for its messages.
+void Presenter::UpdateExclusiveFullscreenFromUIThread(const char* reason, bool leave) {
+  // No intrusive lifetime management must be performed from UI drawers.
+  assert_false(is_executing_ui_drawers_);
+  if (!window_ || !surface_) {
+    return;
+  }
+  if (is_in_ui_thread_paint_) {
+    // The painting state is in flux here (for example a modal loop inside a paint dispatched the posted update): run
+    // it once the paint has ended (PaintFromUIThread posts it again), never re-posted from here, which would spin.
+    exclusive_fullscreen_update_after_paint_ = reason;
+    return;
+  }
+  if (!IsConnectedSurfacePaintConnectionState(surface_paint_connection_state_)) {
+    // No swap chain now: when one is connected, UpdateSurfacePaintConnectionFromUIThread posts the update again.
+    return;
+  }
+  const bool want = !leave && window_->WantsFullscreenExclusiveNow();
+  // Take painting from the guest output thread (waits on paint_mode_mutex_ for a present in progress there, which is
+  // never an exclusive fullscreen one: those are all presented on this thread).
+  if (paint_mode_ == PaintMode::kGuestOutputThreadImmediately) {
+    SetPaintModeFromUIThread(PaintMode::kUIThreadOnRequest);
+  }
+  const ExclusiveFullscreenChange change = SetExclusiveFullscreenFromUIThreadImpl(want, reason);
+  if (change == ExclusiveFullscreenChange::kFailed || change == ExclusiveFullscreenChange::kLost) {
+    window_->OnFullscreenExclusiveBlocked();
+  }
+  if (change == ExclusiveFullscreenChange::kEntered || change == ExclusiveFullscreenChange::kLeft ||
+      change == ExclusiveFullscreenChange::kLost) {
+    // The buffers are resized for the new state (forced by the implementation), and the paint mode set to the
+    // desired one.
+    bool request_repaint = false;
+    UpdateSurfacePaintConnectionFromUIThread(&request_repaint, true);
+    if (change == ExclusiveFullscreenChange::kEntered && !IsExclusiveFullscreenActiveFromUIThread()) {
+      // The resize failed and the swap chain was recreated (windowed): no new attempt until the next focus gain.
+      window_->OnFullscreenExclusiveBlocked();
+    }
+  } else if (paint_mode_ != PaintMode::kNone) {
+    SetPaintModeFromUIThread(GetDesiredPaintModeFromUIThread(true));
+  }
+  if (paint_mode_ != PaintMode::kNone) {
+    RequestPaintOrConnectionRecoveryViaWindow(true);
+  }
+}
+
+void Presenter::RequestExclusiveFullscreenUpdateViaWindow(const char* reason) {
+  if (window_) {
+    window_->RequestFullscreenExclusiveUpdate(reason);
   }
 }
 
@@ -1321,6 +1384,12 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
   if (!REXCVAR_GET(host_present_from_non_ui_thread)) {
     return PaintMode::kUIThreadOnRequest;
   }
+  if (IsExclusiveFullscreenActiveFromUIThread() ||
+      (window_ && window_->IsFullscreen() && window_->IsFullscreenExclusive())) {
+    // Exclusive fullscreen desired or active: every present on the UI thread, which owns the window's messages
+    // (UpdateExclusiveFullscreenFromUIThread says why).
+    return PaintMode::kUIThreadOnRequest;
+  }
   if (surface_paint_connection_has_implicit_vsync_) {
     // Don't be causing host vertical sync CPU waits in the thread generating
     // the guest output.
@@ -1384,6 +1453,11 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
         case SurfacePaintConnectResult::kSuccess:
           if (repaint_needed_out) {
             *repaint_needed_out = true;
+          }
+          // A new or resized swap chain: enter exclusive fullscreen if the window wants it (posted, so never inside
+          // this connection update; a no-op when nothing changed).
+          if (window_ && window_->IsFullscreen() && window_->IsFullscreenExclusive()) {
+            window_->RequestFullscreenExclusiveUpdate("the swap chain was connected");
           }
           // Fallthrough to common success handling.
         case SurfacePaintConnectResult::kSuccessUnchanged:

@@ -296,6 +296,8 @@ bool ReXApp::SetupPresentation() {
   window_->AddListener(this);
   window_->AddInputListener(this, 0);
 
+  // Exclusive fullscreen (D3D12) is entered once the window is fullscreen, focused and its swap chain connected.
+  window_->SetFullscreenExclusive(REXCVAR_GET(fullscreen_exclusive), "start-up");
   if (REXCVAR_GET(fullscreen)) {
     window_->SetFullscreen(true);
   }
@@ -407,6 +409,11 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
 }
 
 void ReXApp::OnDestroy() {
+  // The message loop has ended: leave DXGI exclusive fullscreen first, before the app's own shutdown (which may end
+  // the process from a watchdog) and while the window and the swap chain exist.
+  if (window_) {
+    window_->LeaveFullscreenExclusiveNow("shutdown");
+  }
   // Notify subclass before cleanup
   OnShutdown();
 

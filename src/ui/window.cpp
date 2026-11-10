@@ -34,6 +34,11 @@ REXCVAR_DEFINE_INT32(window_height, 0, "UI/Window",
 REXCVAR_DEFINE_BOOL(fullscreen, false, "UI/Window", "Start the window in fullscreen mode")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// Read at start-up beside `fullscreen`; at run time the app switches it with Window::SetFullscreenExclusive.
+REXCVAR_DEFINE_BOOL(fullscreen_exclusive, false, "UI/Window",
+                    "In fullscreen, use DXGI exclusive fullscreen at the monitor's current mode (D3D12; experimental)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
                      "Monitor index to display on (0 = default, 1 = primary, 2 = "
                      "second monitor, etc.)")
@@ -269,13 +274,49 @@ void Window::SetFullscreen(bool new_fullscreen) {
     return;
   }
   fullscreen_ = new_fullscreen;
+  if (new_fullscreen) {
+    fullscreen_exclusive_blocked_ = false;  // a new request: may try exclusive fullscreen again
+  }
   if (!CanApplyState()) {
     return;
   }
   WindowDestructionReceiver destruction_receiver(this);
+  // Exclusive fullscreen (if active) is left before the window gives up its fullscreen placement, and entered (posted)
+  // only after the window has taken it.
+  if (!new_fullscreen && presenter_ && (fullscreen_exclusive_ || IsFullscreenExclusiveActive())) {
+    presenter_->UpdateExclusiveFullscreenFromUIThread("the window leaves fullscreen");
+    if (destruction_receiver.IsWindowDestroyedOrStateInapplicable()) {
+      return;
+    }
+  }
   ApplyNewFullscreen();
   if (destruction_receiver.IsWindowDestroyedOrStateInapplicable()) {
     return;
+  }
+  if (new_fullscreen && fullscreen_exclusive_) {
+    RequestFullscreenExclusiveUpdate("the window enters fullscreen");
+  }
+}
+
+void Window::SetFullscreenExclusive(bool new_fullscreen_exclusive, const char* reason) {
+  // A new request (true) may try again after a failed or lost attempt.
+  const bool retry = new_fullscreen_exclusive && fullscreen_exclusive_blocked_;
+  if (new_fullscreen_exclusive) {
+    fullscreen_exclusive_blocked_ = false;
+  }
+  if (fullscreen_exclusive_ == new_fullscreen_exclusive && !retry) {
+    return;
+  }
+  fullscreen_exclusive_ = new_fullscreen_exclusive;
+  RequestFullscreenExclusiveUpdate(reason);
+}
+
+void Window::LeaveFullscreenExclusiveNow(const char* reason) {
+  // A posted update (from the swap chain reconnect after leaving) must not enter it again before the window closes.
+  fullscreen_exclusive_blocked_ = true;
+  // Only when active (the swap chain's release leaves any other fullscreen state: D3D12Presenter::DestroySwapChain).
+  if (IsFullscreenExclusiveActive()) {
+    presenter_->UpdateExclusiveFullscreenFromUIThread(reason, true);
   }
 }
 
@@ -548,6 +589,13 @@ void Window::OnFocusUpdate(bool new_has_focus, WindowDestructionReceiver& destru
   }
   if (destruction_receiver.IsWindowDestroyed()) {
     return;
+  }
+  // Exclusive fullscreen is left on focus loss and entered again on focus (posted, outside the focus message).
+  if (fullscreen_ && fullscreen_exclusive_) {
+    if (has_focus_) {
+      fullscreen_exclusive_blocked_ = false;
+    }
+    RequestFullscreenExclusiveUpdate(has_focus_ ? "the window got the focus" : "focus loss");
   }
 }
 
