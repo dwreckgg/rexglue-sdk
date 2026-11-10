@@ -282,6 +282,19 @@ class CommandProcessor {
   uint32_t counter_ = 0;
   std::atomic<uint32_t> swap_count_{0};
 
+  // present_before_vblank_wait (command_processor.cpp): the swap the GPU thread presented when it reached the vblank
+  // wait before that swap's packet. The packet itself then skips IssueSwap (the picture is on the host already) and
+  // does the rest of its work where it always did.
+  struct EarlySwap {
+    bool valid = false;
+    uint32_t frontbuffer_ptr = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t fetch[6] = {};
+  };
+  EarlySwap early_swap_;
+  bool PresentBeforeVblankWait(memory::RingBuffer peek, int64_t lag_wait_enter);
+
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;
 

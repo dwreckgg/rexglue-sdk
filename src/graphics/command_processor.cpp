@@ -38,6 +38,11 @@
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
+REXCVAR_DEFINE_BOOL(present_before_vblank_wait, true, "GPU",
+                    "Present a finished guest frame on the host when the GPU thread reaches the vblank wait before its "
+                    "swap (VdSwap's own packets follow the wait), instead of after the wait. Lower input lag; the "
+                    "guest's vblank, its swap and everything it can read keep their order.");
+
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
@@ -1127,10 +1132,110 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
     pending = pace_stats::LagGpuSwap{};
   }
 
-  IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  // present_before_vblank_wait: this swap may have been presented already, from the wait before this packet
+  // (PresentBeforeVblankWait); then only its picture's fetch constant, written by the packet before this one, must
+  // match what was presented.
+  bool presented_early = false;
+  if (early_swap_.valid) {
+    presented_early = early_swap_.frontbuffer_ptr == frontbuffer_ptr && early_swap_.width == frontbuffer_width &&
+                      early_swap_.height == frontbuffer_height;
+    for (uint32_t i = 0; i < 6 && presented_early; ++i) {
+      presented_early =
+          register_file_->values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + i] == early_swap_.fetch[i];
+    }
+    if (!presented_early) {
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        REXGPU_WARN("present_before_vblank_wait: the swap packet after the wait is not the one presented early; "
+                    "presenting it again");
+      }
+    }
+    early_swap_.valid = false;
+  }
+  if (!presented_early) {
+    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  }
 
   ++counter_;
+  if (!presented_early) {
+    // An early swap counted itself when it refreshed the guest output (swap_count's contract).
+    swap_count_.fetch_add(1, std::memory_order_release);
+  }
+  return true;
+}
+
+bool CommandProcessor::PresentBeforeVblankWait(memory::RingBuffer peek, int64_t lag_wait_enter) {
+  // The packets after this wait, read from a copy of the reader (nothing is consumed): type-2 NOPs, then VdSwap's
+  // block (xboxkrnl_video.cpp VdSwap_entry): a type-0 write of the 6 dwords of texture fetch constant 0, then
+  // PM4_XE_SWAP. Anything else (a draw, a resolve, an event, a predicated swap) and the frame is presented as before.
+  auto next_packet = [&peek](uint32_t* packet) {
+    while (peek.read_count() >= sizeof(uint32_t)) {
+      const uint32_t p = peek.ReadAndSwap<uint32_t>();
+      if (p == 0 || (p >> 30) == 0x02) continue;  // the NOP forms ExecutePacket skips
+      *packet = p;
+      return true;
+    }
+    return false;
+  };
+  uint32_t packet = 0;
+  if (!next_packet(&packet) || packet != xenos::MakePacketType0(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, 6) ||
+      peek.read_count() < 6 * sizeof(uint32_t)) {
+    return false;
+  }
+  uint32_t fetch[6];
+  for (uint32_t i = 0; i < 6; ++i) fetch[i] = peek.ReadAndSwap<uint32_t>();
+  if (!next_packet(&packet) || (packet >> 30) != 0x03 || ((packet >> 8) & 0x7F) != PM4_XE_SWAP || (packet & 1)) {
+    return false;
+  }
+  const uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
+  if (count < 4 || peek.read_count() < count * sizeof(uint32_t) ||
+      peek.ReadAndSwap<memory::fourcc_t>() != kSwapSignature) {
+    return false;
+  }
+  const uint32_t frontbuffer_ptr = peek.ReadAndSwap<uint32_t>();
+  const uint32_t frontbuffer_width = peek.ReadAndSwap<uint32_t>();
+  const uint32_t frontbuffer_height = peek.ReadAndSwap<uint32_t>();
+  const uint32_t lag_swap_index = count >= 5 ? peek.ReadAndSwap<uint32_t>() : 0;
+
+  if (pace_stats::LagOn()) {
+    // Lag marks: the early swap's record, its packet time = now (the wake comes later, after the present).
+    pace_stats::LagGpuSwapIndex() = lag_swap_index;
+    pace_stats::LagGpuSwap& pending = pace_stats::LagGpuPending();
+    pace_stats::LagGpuSwap record = pending;
+    record.qpc_wait_enter = lag_wait_enter;
+    record.qpc_wait_wake = 0;
+    record.qpc_vblank = 0;
+    record.qpc_swap = int64_t(rex::chrono::Clock::host_tick_count_platform());
+    record.flags |= pace_stats::kLagGpuSwapEarly;
+    pace_stats::LagGpuLastSwap() = record;
+  }
+
+  // Present it with the swap's fetch constant in place, then put the register file back: the type-0 packet after
+  // the wait writes it again through WriteRegister (its side effects untouched).
+  uint32_t* fetch_regs = &register_file_->values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
+  uint32_t saved[6];
+  for (uint32_t i = 0; i < 6; ++i) {
+    saved[i] = fetch_regs[i];
+    fetch_regs[i] = fetch[i];
+  }
+  IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  for (uint32_t i = 0; i < 6; ++i) fetch_regs[i] = saved[i];
+
+  early_swap_.valid = true;
+  early_swap_.frontbuffer_ptr = frontbuffer_ptr;
+  early_swap_.width = frontbuffer_width;
+  early_swap_.height = frontbuffer_height;
+  for (uint32_t i = 0; i < 6; ++i) early_swap_.fetch[i] = fetch[i];
+  // The guest output holds this swap's picture now.
   swap_count_.fetch_add(1, std::memory_order_release);
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    REXGPU_INFO("present_before_vblank_wait: the first swap presented at the vblank wait before its packet "
+                "(frontbuffer {:08X} {}x{})",
+                frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  }
   return true;
 }
 
@@ -1161,6 +1266,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   // Lag marks (pace_stats.h): QPC time of the first unmet check, 0 while the condition held at once.
   int64_t lag_wait_enter = 0;
+  bool early_tried = false;  // present_before_vblank_wait: tried at this packet's first sleep
   bool matched = false;
   do {
     uint32_t value = 0;
@@ -1208,6 +1314,17 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
       // Wait.
       if (wait >= 0x100) {
+        static bool early_logged = false;
+        if (!early_logged) {
+          early_logged = true;
+          REXGPU_INFO("present_before_vblank_wait {} (vsync {}), at the first WAIT_REG_MEM that sleeps",
+                      REXCVAR_GET(present_before_vblank_wait), REXCVAR_GET(vsync));
+        }
+        if (!early_tried && REXCVAR_GET(vsync) && REXCVAR_GET(present_before_vblank_wait) &&
+            !early_swap_.valid) {
+          early_tried = true;
+          PresentBeforeVblankWait(*reader, lag_wait_enter);
+        }
         PrepareForWait();
         if (!REXCVAR_GET(vsync)) {
           // User wants it fast and dangerous.
