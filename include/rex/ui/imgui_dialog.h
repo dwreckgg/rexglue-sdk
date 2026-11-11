@@ -39,6 +39,14 @@ class ImGuiDialog {
 
   void Draw();
 
+  // Whether the drawer keeps repainting while this dialog exists (asked after each draw). true (the default): the
+  // dialog takes input or animates, so the UI thread repaints at its tick rate. false: a display-only dialog (no input,
+  // no animation) that the guest output's own frames repaint; while every dialog answers false, a paint happens only
+  // when a new guest frame arrives or a paint is requested (Presenter::RequestUIPaintFromUIThread), so the host
+  // presents once per guest frame instead of re-presenting the same frame at the tick rate. A display-only dialog whose
+  // content can change while no guest frame arrives must request its own paints.
+  virtual bool WantsContinuousPaint() const { return true; }
+
  protected:
   ImGuiDialog(ImGuiDrawer* imgui_drawer);
 

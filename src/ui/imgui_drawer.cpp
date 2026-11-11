@@ -89,6 +89,13 @@ void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
     }
   }
   dialogs_.erase(it);
+  // Paint once without the removed dialog when others remain: if they are all display-only
+  // (ImGuiDialog::WantsContinuousPaint false), nothing else repaints until a guest frame arrives, and a dialog that
+  // closed itself during a draw would stay on screen until then. (Not asked of the removed dialog: this runs from
+  // ~ImGuiDialog, where its override is already gone.) The last dialog's removal is DetachIfLastDialogRemoved's.
+  if (!dialogs_.empty() && presenter_) {
+    presenter_->RequestUIPaintFromUIThread();
+  }
   DetachIfLastDialogRemoved();
 }
 
@@ -408,9 +415,14 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   // it now if needed.
   DetachIfLastDialogRemoved();
 
-  if (!dialogs_.empty()) {
-    // Repaint (and handle input) continuously if still active.
-    presenter_->RequestUIPaintFromUIThread();
+  // Repaint (and handle input) continuously while a dialog that wants it is still active. Display-only dialogs
+  // (ImGuiDialog::WantsContinuousPaint false) are repainted by the guest output's frames instead: repainting them at the
+  // tick rate re-presents the same guest frame several times per guest frame.
+  for (const ImGuiDialog* dialog : dialogs_) {
+    if (dialog->WantsContinuousPaint()) {
+      presenter_->RequestUIPaintFromUIThread();
+      break;
+    }
   }
 }
 
