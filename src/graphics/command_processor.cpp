@@ -125,6 +125,29 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
 
 CommandProcessor::~CommandProcessor() = default;
 
+void CommandProcessor::NoteGuestWrite() {
+  guest_write_progress_.fetch_add(1);  // seq_cst: ordered before the waiter count read below
+  if (guest_write_waiters_.load() > 0) {
+    // A waiter between its predicate check and its sleep holds the mutex; taking it here makes the notify land after the
+    // sleep starts. Only a try: a guest thread suspended and terminated while holding it (TerminateTitle on window close)
+    // must not block the vsync or command processor thread for good. A failed try can lose this one wake, which the
+    // waiter's time limit bounds.
+    { std::unique_lock<std::mutex> lock(guest_write_mutex_, std::try_to_lock); }
+    guest_write_cv_.notify_all();
+  }
+}
+
+bool CommandProcessor::WaitForGuestWriteProgress(uint32_t seen, std::chrono::microseconds limit) {
+  guest_write_waiters_.fetch_add(1);  // seq_cst: ordered before the predicate's progress read
+  bool moved;
+  {
+    std::unique_lock<std::mutex> lock(guest_write_mutex_);
+    moved = guest_write_cv_.wait_for(lock, limit, [&] { return guest_write_progress_.load() != seen; });
+  }
+  guest_write_waiters_.fetch_sub(1);
+  return moved;
+}
+
 bool CommandProcessor::Initialize() {
   // Initialize the gamma ramps to their default (linear) values - taken from
   // what games set when starting with the sRGB (return value 1)
@@ -332,6 +355,7 @@ void CommandProcessor::WorkerThreadMain() {
     if (read_ptr_writeback_ptr_) {
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
                                        read_ptr_index_);
+      NoteGuestWrite();
     }
 
     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
@@ -453,6 +477,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+      NoteGuestWrite();
     }
   } else {
     switch (index) {
@@ -1427,6 +1452,7 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
   reg_val = GpuSwap(reg_val, endianness);
   memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
   trace_writer_.WriteMemoryWrite(CpuToGpu(mem_addr), 4);
+  NoteGuestWrite();
 
   return true;
 }
@@ -1444,6 +1470,7 @@ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, 
     trace_writer_.WriteMemoryWrite(CpuToGpu(addr), 4);
     write_addr += 4;
   }
+  NoteGuestWrite();
 
   return true;
 }
@@ -1505,6 +1532,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       write_data = GpuSwap(write_data, endianness);
       memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
       trace_writer_.WriteMemoryWrite(CpuToGpu(write_reg_addr), 4);
+      NoteGuestWrite();
     } else {
       // Register.
       WriteRegister(write_reg_addr, write_data);
@@ -1551,6 +1579,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   data_value = GpuSwap(data_value, endianness);
   memory::store(memory_->TranslatePhysical(address), data_value);
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
+  NoteGuestWrite();
   return true;
 }
 
@@ -1580,6 +1609,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
   memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
                                      rex::countof(extents));
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), sizeof(extents));
+  NoteGuestWrite();
   return true;
 }
 
@@ -1614,6 +1644,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
       pSampleCounts->ZPass_A = fake_sample_count;
       pSampleCounts->Total_A = fake_sample_count;
     }
+    NoteGuestWrite();
   }
 
   return true;

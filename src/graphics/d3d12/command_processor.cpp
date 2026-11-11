@@ -193,7 +193,7 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
     return true;
   }
 
-  auto write_fallback_result = [sample_counts, kQueryFinished]() -> bool {
+  auto write_fallback_result = [this, sample_counts, kQueryFinished]() -> bool {
     auto fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
     if (fake_sample_count < 0) {
       return true;
@@ -207,6 +207,7 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
       sample_counts->ZPass_A = fake_sample_count;
       sample_counts->Total_A = fake_sample_count;
     }
+    NoteGuestWrite();  // idle waits (issue #4)
     return true;
   };
 
@@ -5118,6 +5119,7 @@ void D3D12CommandProcessor::WriteGuestOcclusionResult(
   sample_counts->ZFail_B = 0;
   sample_counts->StencilFail_A = 0;
   sample_counts->StencilFail_B = 0;
+  NoteGuestWrite();  // idle waits (issue #4): a guest thread may poll the counts
 }
 
 void D3D12CommandProcessor::WriteGammaRampSRV(bool is_pwl,

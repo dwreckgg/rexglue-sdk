@@ -12,6 +12,8 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -92,6 +94,20 @@ class CommandProcessor {
   // reached n the presenter's guest output holds the frame of swap n until the
   // next swap is processed. Readable from any thread.
   uint32_t swap_count() const { return swap_count_.load(std::memory_order_acquire); }
+
+  // Guest-write progress (DOA4 Online issue #4, idle waits): a counter bumped after every write the GPU side makes to
+  // guest memory (the read pointer and scratch write-backs, REG_TO_MEM, MEM_WRITE, COND_WRITE, EVENT_WRITE_SHD/EXT/ZPD
+  // including the D3D12/Vulkan host occlusion results, and the return of a guest interrupt callback). A guest thread that
+  // polls such a value (a fence) can sleep in WaitForGuestWriteProgress between its checks instead of spinning. Readable
+  // and waitable from any thread.
+  uint32_t guest_write_progress() const { return guest_write_progress_.load(); }
+  // Blocks until guest_write_progress() differs from `seen` or `limit` has passed; true when it moved. A bump made after
+  // `seen` was read is seen by the predicate; its notify can be lost only when the notifier finds the mutex held (it only
+  // tries the lock, see NoteGuestWrite), which the limit bounds. The limit is a condition-variable timeout: at the
+  // process's timer resolution (up to ~15.6 ms when nothing raised it).
+  bool WaitForGuestWriteProgress(uint32_t seen, std::chrono::microseconds limit);
+  // Bumps the counter and wakes the waiters (cheap when nobody waits).
+  void NoteGuestWrite();
 
   // Wakes a WAIT_REG_MEM poll sleeping on the command processor thread, so it
   // re-checks its condition now instead of at the end of its poll interval.
@@ -282,6 +298,12 @@ class CommandProcessor {
 
   uint32_t counter_ = 0;
   std::atomic<uint32_t> swap_count_{0};
+  // NoteGuestWrite / WaitForGuestWriteProgress. The bump and the waiter count use sequentially consistent operations
+  // (a store then a load on each side), so a bump that sees no waiter is seen by the waiter's own predicate check.
+  std::atomic<uint32_t> guest_write_progress_{0};
+  std::atomic<int> guest_write_waiters_{0};
+  std::mutex guest_write_mutex_;
+  std::condition_variable guest_write_cv_;
 
   // present_before_vblank_wait (command_processor.cpp): the swap the GPU thread presented when it reached the vblank
   // wait before that swap's packet. The packet itself then skips IssueSwap (the picture is on the host already) and

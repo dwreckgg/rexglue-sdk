@@ -374,6 +374,10 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   uint64_t args[] = {source, interrupt_callback_data_};
   function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
                                          rex::countof(args));
+  // The callback may have written a value a guest thread polls (a fence): wake idle waiters (issue #4).
+  if (command_processor_) {
+    command_processor_->NoteGuestWrite();
+  }
 }
 
 void GraphicsSystem::MarkVblank() {

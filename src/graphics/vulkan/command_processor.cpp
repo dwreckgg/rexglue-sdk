@@ -677,7 +677,7 @@ bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuff
     return true;
   }
 
-  auto write_fallback_result = [sample_counts]() -> bool {
+  auto write_fallback_result = [this, sample_counts]() -> bool {
     auto fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
     if (fake_sample_count < 0) {
       return true;
@@ -691,6 +691,7 @@ bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuff
       sample_counts->ZPass_A = fake_sample_count;
       sample_counts->Total_A = fake_sample_count;
     }
+    NoteGuestWrite();  // idle waits (issue #4)
     return true;
   };
 
@@ -4955,6 +4956,7 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
   sample_counts->ZFail_B = 0;
   sample_counts->StencilFail_A = 0;
   sample_counts->StencilFail_B = 0;
+  NoteGuestWrite();  // idle waits (issue #4): a guest thread may poll the counts
 }
 
 void VulkanCommandProcessor::InitializeTrace() {
