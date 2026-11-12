@@ -598,26 +598,16 @@ void ImGuiDrawer::ClearInput() {
 
 void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {
   auto& io = GetIO();
-  const VirtualKey virtual_key = e.virtual_key();
-  if (auto imGuiKey = VirtualKeyToImGuiKey(virtual_key); imGuiKey) {
+  // Modifiers go in as ImGuiMod_ key events, before the key: ImGui (1.87 and later) recomputes io.KeyCtrl/KeyShift/KeyAlt/
+  // KeySuper from them every frame, so writing those fields directly was overwritten and Ctrl+V/C/X/A never reached a text
+  // field. They come from the event's own flags (the modifier keys' state when the message arrived), on every key event:
+  // a modifier released while another window had the focus is put right by the next key (ImGui drops repeated states).
+  io.AddKeyEvent(ImGuiMod_Ctrl, e.is_ctrl_pressed());
+  io.AddKeyEvent(ImGuiMod_Shift, e.is_shift_pressed());
+  io.AddKeyEvent(ImGuiMod_Alt, e.is_alt_pressed());
+  io.AddKeyEvent(ImGuiMod_Super, e.is_super_pressed());
+  if (auto imGuiKey = VirtualKeyToImGuiKey(e.virtual_key()); imGuiKey) {
     io.AddKeyEvent(*imGuiKey, is_down);
-  }
-  switch (virtual_key) {
-    case VirtualKey::kShift:
-      io.KeyShift = is_down;
-      break;
-    case VirtualKey::kControl:
-      io.KeyCtrl = is_down;
-      break;
-    case VirtualKey::kMenu:
-      // FIXME(Triang3l): Doesn't work in xenia-ui-window-demo.
-      io.KeyAlt = is_down;
-      break;
-    case VirtualKey::kLWin:
-      io.KeySuper = is_down;
-      break;
-    default:
-      break;
   }
 }
 
