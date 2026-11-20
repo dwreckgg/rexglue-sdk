@@ -782,9 +782,10 @@ using rex::memory::PhysicalProtectStats;
 
 // The guest's read/write value (MmSetAddressProtect 4).
 constexpr uint32_t kRW = rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite;
-// Plain read only: the one value that makes the host read only on today's path.
+// Plain read only: the one value that makes the host read only on the full path.
 constexpr uint32_t kR = rex::memory::kMemoryProtectRead;
-// The game's read-only value (MmSetAddressProtect 1026): host read/write today.
+// The game's read-only value (MmSetAddressProtect 1026): host read/write on the
+// full path.
 constexpr uint32_t kRWC = rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWriteCombine;
 constexpr uint32_t kReserveCommit =
     rex::memory::kMemoryAllocationReserve | rex::memory::kMemoryAllocationCommit;
@@ -1957,4 +1958,92 @@ TEST_CASE("physprotect 32: cheap_physical_protect is on by default", "[memory][p
   // Every Switches puts back the values it found, so this holds in any order.
   CHECK(REXCVAR_GET(cheap_physical_protect));
   CHECK_FALSE(REXCVAR_GET(physical_protect_timing));
+  // The guard's restore, in this case's own order: both values set the other
+  // way, then put back.
+  { Switches s(false, true); }
+  CHECK(REXCVAR_GET(cheap_physical_protect));
+  CHECK_FALSE(REXCVAR_GET(physical_protect_timing));
+}
+
+// With the default on, MmSetAddressProtect reaches table-only changes on the
+// 0xC0000000 view too: one 16 MB view page over 4096 parent pages of 4 KB.
+// Expected values are base's: an unwatched 3 to 9 or 9 to 3 changes nothing on
+// either host (both read/write), and a watched page needs the host call.
+TEST_CASE("physprotect 33: the 16 MB pages of the C0 view, table-only and watched",
+          "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, true);
+  auto* heap = static_cast<PhysicalHeap*>(MutableHeap(memory.LookupHeap(0xC0000000)));
+  REQUIRE(heap != nullptr);
+  REQUIRE(heap->heap_base() == 0xC0000000u);
+  constexpr uint32_t kC0Page = 16 * 1024 * 1024;
+  REQUIRE(heap->page_size() == kC0Page);
+  REQUIRE(memory.GetPhysicalHeap()->page_size() == 0x1000u);
+  ViewAlloc alloc(heap, kC0Page, kRW, kC0Page);
+  const uint32_t a = alloc.address();
+  // The view page's last 4 KB, over the parent's last page of the range.
+  const uint32_t last = a + kC0Page - 0x1000;
+  RequireFreshReadWrite(memory, heap, a);
+  REQUIRE(ParentTableProtect(memory, heap, last) == kRW);
+  REQUIRE_FALSE(ParentMarked(memory, heap, last));
+  REQUIRE(ParentHost(memory, heap, last) == PageAccess::kReadWrite);
+
+  SECTION("(a) 3 to 9 and back, no watch: both table-only") {
+    auto before = heap->protect_stats();
+    REQUIRE(heap->Protect(a, kC0Page, kRWC));
+    auto d = StatsDelta(before, heap->protect_stats());
+    CHECK(d.calls == 1);
+    CHECK(d.table_only_calls == 1);
+    CHECK(d.host_calls == 0);
+    CHECK(TableProtect(heap, a) == kRWC);
+    CHECK(ParentTableProtect(memory, heap, a) == kRWC);
+    CHECK(ParentTableProtect(memory, heap, last) == kRWC);
+    CHECK(Marked(heap, a));
+    CHECK(ParentMarked(memory, heap, a));
+    CHECK(ParentMarked(memory, heap, last));
+    CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
+    CHECK(ViewHost(memory, last) == PageAccess::kReadWrite);
+    CHECK(ParentHost(memory, heap, a) == PageAccess::kReadWrite);
+    CHECK(ParentHost(memory, heap, last) == PageAccess::kReadWrite);
+
+    before = heap->protect_stats();
+    REQUIRE(heap->Protect(a, kC0Page, kRW));
+    d = StatsDelta(before, heap->protect_stats());
+    CHECK(d.calls == 1);
+    CHECK(d.table_only_calls == 1);
+    CHECK(d.host_calls == 0);
+    CHECK(TableProtect(heap, a) == kRW);
+    CHECK(ParentTableProtect(memory, heap, a) == kRW);
+    CHECK(ParentTableProtect(memory, heap, last) == kRW);
+    CHECK_FALSE(Marked(heap, a));
+    CHECK_FALSE(ParentMarked(memory, heap, a));
+    CHECK_FALSE(ParentMarked(memory, heap, last));
+    CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
+    CHECK(ViewHost(memory, last) == PageAccess::kReadWrite);
+    CHECK(ParentHost(memory, heap, a) == PageAccess::kReadWrite);
+    CHECK(ParentHost(memory, heap, last) == PageAccess::kReadWrite);
+  }
+
+  SECTION("(b) a watch on one 4 KB system page past the first: 3 to 9 takes the full path") {
+    // Watch the sixth 4 KB system page only.
+    memory.EnablePhysicalMemoryAccessCallbacks(heap->GetPhysicalAddress(a) + 0x5000, 0x1000, true,
+                                               false);
+    // Control: only that system page of the view became read only.
+    REQUIRE(ViewHost(memory, a + 0x5000) == PageAccess::kReadOnly);
+    REQUIRE(ViewHost(memory, a) == PageAccess::kReadWrite);
+
+    auto before = heap->protect_stats();
+    REQUIRE(heap->Protect(a, kC0Page, kRWC));
+    auto d = StatsDelta(before, heap->protect_stats());
+    CHECK(d.calls == 1);
+    CHECK(d.table_only_calls == 0);
+    CHECK(d.host_calls == 2);
+    CHECK(TableProtect(heap, a) == kRWC);
+    CHECK(ParentTableProtect(memory, heap, a) == kRWC);
+    CHECK_FALSE(Marked(heap, a));
+    CHECK_FALSE(ParentMarked(memory, heap, a));
+    CHECK_FALSE(ParentMarked(memory, heap, last));
+  }
+
+  alloc.Release();
 }

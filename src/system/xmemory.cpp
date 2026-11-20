@@ -1677,8 +1677,8 @@ bool BaseHeap::ProtectTableOnlyCheck(uint32_t address, uint32_t size, uint32_t p
   }
 
   // The class test; the host access test (an unmarked page whose host access
-  // today is stricter than the new value's would have it raised by the host
-  // call, e.g. plain read 1 to read + write combine 9); and for a change to
+  // now is stricter than the new value's would have it raised by the full
+  // path's host call, e.g. plain read 1 to read + write combine 9); and for a change to
   // read/write the mark test.
   const uint32_t new_access_rank = PageAccessRank(ToPageAccess(protect));
   for (uint32_t page_number = start_page_number; page_number <= end_page_number; ++page_number) {
@@ -1967,7 +1967,8 @@ bool PhysicalHeap::ProtectUntimed(uint32_t address, uint32_t size, uint32_t prot
         !any_watched) {
       // TriggerCallbacks released the global lock. Take it again (global, then
       // the heap mutexes) for the decision and both tables' writes; it is
-      // released at the end of this block, before today's statements run.
+      // released at the end of this block, before the full path's statements
+      // run.
       auto table_only_lock = global_critical_region_.Acquire();
       if (ProtectBothTablesOnly(address, size, protect, true)) {
         if (out_table_only) {
@@ -1979,7 +1980,7 @@ bool PhysicalHeap::ProtectUntimed(uint32_t address, uint32_t size, uint32_t prot
   } else if (REXCVAR_GET(cheap_physical_protect) && !old_protect &&
              IsProtectClassRead(protect)) {
     // Table-only change to read: the global lock taken above is held, as on
-    // today's path.
+    // the full path.
     if (ProtectBothTablesOnly(address, size, protect, false)) {
       if (out_table_only) {
         *out_table_only = true;
@@ -1991,17 +1992,21 @@ bool PhysicalHeap::ProtectUntimed(uint32_t address, uint32_t size, uint32_t prot
   // old_protect is read from the parent's host, which a table-only change
   // (cvar cheap_physical_protect) may have left more permissive than the
   // parent's table says: a marked page, or an unmarked 9 page changed to 1.
-  // Today's path keeps that host at ToPageAccess of the table, so report the
-  // host's value capped at the access of the parent table's first page, read
-  // before the change; where the host is no more permissive, its value
-  // stands, as today. With both cvars off a non-null old_protect still takes
-  // the parent's mutex once for this read (no caller passes old_protect for a
-  // physical heap).
+  // The old path (switch off) keeps that host at ToPageAccess of the table,
+  // so report the host's value capped at the access of the parent table's
+  // first page, read before the change; where the host is no more
+  // permissive, its value stands, as on the old path. With both cvars off a
+  // non-null old_protect still takes the parent's mutex once for this read
+  // (no caller passes old_protect for a physical heap).
   bool old_protect_table_read = false;
   uint32_t old_protect_table_protect = 0;
   if (old_protect) {
     const uint32_t parent_address = GetPhysicalAddress(address);
     // QueryProtect's own bound test lets the page one past the table through.
+    // The table is read in its own lock scope, before the parent's Protect
+    // takes the mutex again: a concurrent full change of the same first page
+    // in between gives a stale value (accepted: only tests ask for
+    // old_protect on a physical heap).
     if (parent_address >= parent_heap_->heap_base() &&
         (parent_address - parent_heap_->heap_base()) / parent_heap_->page_size() <
             parent_heap_->total_page_count()) {
@@ -2016,6 +2021,9 @@ bool PhysicalHeap::ProtectUntimed(uint32_t address, uint32_t size, uint32_t prot
   }
 
   if (old_protect_table_read) {
+    // A minimum of the host's value and the table's, not the table's alone:
+    // after BaseHeap::Restore the host can be below the table (9 is restored
+    // read only). No test separates the two (Restore has no caller).
     const rex::memory::PageAccess table_access = ToPageAccess(old_protect_table_protect);
     if (PageAccessRank(ToPageAccess(*old_protect)) > PageAccessRank(table_access)) {
       *old_protect = FromPageAccess(table_access);
