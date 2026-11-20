@@ -761,3 +761,721 @@ TEST_CASE("LookupHeapByType selects correct heap", "[memory][heap]") {
     // Should be vC0000000 heap
   }
 }
+
+// =============================================================================
+// Table-only guest protection changes on physical memory
+// (cvars cheap_physical_protect and physical_protect_timing)
+// =============================================================================
+
+// Both cvars are defined in rexruntime.dll. The test exe links its own copy of
+// the cvar registry (rexcore is an OBJECT library), so setting them by name
+// would reach the wrong registry: they are set through the DLL's storage
+// accessors. Test 02's table-only result shows the switch reached the DLL.
+REXCVAR_DECLARE(bool, cheap_physical_protect);
+REXCVAR_DECLARE(bool, physical_protect_timing);
+
+namespace {
+
+using rex::memory::PageAccess;
+using rex::memory::PhysicalHeap;
+using rex::memory::PhysicalProtectStats;
+
+// The guest's read/write value (MmSetAddressProtect 4).
+constexpr uint32_t kRW = rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite;
+// Plain read only: the one value that makes the host read only on today's path.
+constexpr uint32_t kR = rex::memory::kMemoryProtectRead;
+// The game's read-only value (MmSetAddressProtect 1026): host read/write today.
+constexpr uint32_t kRWC = rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWriteCombine;
+constexpr uint32_t kReserveCommit =
+    rex::memory::kMemoryAllocationReserve | rex::memory::kMemoryAllocationCommit;
+// Page size of the 0xA0000000 view.
+constexpr uint32_t kViewPage = 0x10000;
+
+// Sets both switches; turns both off when the test ends, also on a failed
+// REQUIRE.
+class Switches {
+ public:
+  Switches(bool cheap, bool timing) { Set(cheap, timing); }
+  ~Switches() { Set(false, false); }
+  Switches(const Switches&) = delete;
+  Switches& operator=(const Switches&) = delete;
+  static void Set(bool cheap, bool timing) {
+    REXCVAR_SET(cheap_physical_protect, cheap);
+    REXCVAR_SET(physical_protect_timing, timing);
+  }
+};
+
+PhysicalHeap* ViewHeap(rex::memory::Memory& memory) {
+  return static_cast<PhysicalHeap*>(MutableHeap(memory.LookupHeap(0xA0000000)));
+}
+
+PageAccess HostAccess(void* host_address) {
+  size_t length = 1;
+  PageAccess access = PageAccess::kExecuteReadWrite;
+  REQUIRE(rex::memory::QueryProtect(host_address, length, access));
+  return access;
+}
+
+PageAccess ViewHost(rex::memory::Memory& memory, uint32_t address) {
+  return HostAccess(memory.TranslateVirtual(address));
+}
+
+PageAccess ParentHost(rex::memory::Memory& memory, PhysicalHeap* heap, uint32_t address) {
+  return HostAccess(memory.TranslatePhysical(heap->GetPhysicalAddress(address)));
+}
+
+uint32_t TableProtect(rex::memory::BaseHeap* heap, uint32_t address) {
+  uint32_t protect = 0xFFFFFFFFu;
+  REQUIRE(heap->QueryProtect(address, &protect));
+  return protect;
+}
+
+uint32_t ParentTableProtect(rex::memory::Memory& memory, PhysicalHeap* heap, uint32_t address) {
+  return TableProtect(memory.GetPhysicalHeap(), heap->GetPhysicalAddress(address));
+}
+
+bool Marked(rex::memory::BaseHeap* heap, uint32_t address) {
+  bool marked = false;
+  REQUIRE(heap->QueryHostKeptWritable(address, &marked));
+  return marked;
+}
+
+bool ParentMarked(rex::memory::Memory& memory, PhysicalHeap* heap, uint32_t address) {
+  return Marked(memory.GetPhysicalHeap(), heap->GetPhysicalAddress(address));
+}
+
+PhysicalProtectStats StatsDelta(const PhysicalProtectStats& before,
+                                const PhysicalProtectStats& after) {
+  return PhysicalProtectStats{after.calls - before.calls,
+                              after.table_only_calls - before.table_only_calls,
+                              after.host_calls - before.host_calls,
+                              after.total_ns - before.total_ns, after.host_ns - before.host_ns};
+}
+
+// One allocation on the 0xA0000000 view, released by the test (REQUIRE on the
+// result) or, after a failed REQUIRE, at scope exit.
+class ViewAlloc {
+ public:
+  ViewAlloc(PhysicalHeap* heap, uint32_t size, uint32_t protect) : heap_(heap) {
+    REQUIRE(heap_->Alloc(size, kViewPage, kReserveCommit, protect, true, &address_));
+    held_ = true;
+  }
+  ~ViewAlloc() {
+    if (held_) {
+      heap_->Release(address_);
+    }
+  }
+  ViewAlloc(const ViewAlloc&) = delete;
+  ViewAlloc& operator=(const ViewAlloc&) = delete;
+  uint32_t address() const { return address_; }
+  void Release() {
+    held_ = false;
+    REQUIRE(heap_->Release(address_));
+  }
+
+ private:
+  PhysicalHeap* heap_;
+  uint32_t address_ = 0;
+  bool held_ = false;
+};
+
+// Fixture precondition after a read/write allocation: table, both host views
+// read/write, no mark in either table.
+void RequireFreshReadWrite(rex::memory::Memory& memory, PhysicalHeap* heap, uint32_t address) {
+  REQUIRE(TableProtect(heap, address) == kRW);
+  REQUIRE(ParentTableProtect(memory, heap, address) == kRW);
+  REQUIRE(ViewHost(memory, address) == PageAccess::kReadWrite);
+  REQUIRE(ParentHost(memory, heap, address) == PageAccess::kReadWrite);
+  REQUIRE_FALSE(Marked(heap, address));
+  REQUIRE_FALSE(ParentMarked(memory, heap, address));
+}
+
+// Counts invalidation callbacks while registered; unregisters at scope exit.
+class CallbackCounter {
+ public:
+  explicit CallbackCounter(rex::memory::Memory& memory) : memory_(memory) {
+    handle_ = memory_.RegisterPhysicalMemoryInvalidationCallback(&Callback, this);
+  }
+  ~CallbackCounter() { memory_.UnregisterPhysicalMemoryInvalidationCallback(handle_); }
+  CallbackCounter(const CallbackCounter&) = delete;
+  CallbackCounter& operator=(const CallbackCounter&) = delete;
+  int count() const { return count_; }
+
+ private:
+  static std::pair<uint32_t, uint32_t> Callback(void* context, uint32_t, uint32_t, bool) {
+    ++static_cast<CallbackCounter*>(context)->count_;
+    return {0, UINT32_MAX};
+  }
+  rex::memory::Memory& memory_;
+  void* handle_ = nullptr;
+  int count_ = 0;
+};
+
+}  // namespace
+
+TEST_CASE("physprotect 01: switch off, RW to R takes the full path", "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(false, true);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  ViewAlloc alloc(heap, kViewPage, kRW);
+  const uint32_t a = alloc.address();
+  RequireFreshReadWrite(memory, heap, a);
+
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kR));
+  auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(TableProtect(heap, a) == kR);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadOnly);
+  CHECK(ParentHost(memory, heap, a) == PageAccess::kReadOnly);
+  CHECK_FALSE(Marked(heap, a));
+  CHECK(d.calls == 1);
+  CHECK(d.table_only_calls == 0);
+  CHECK(d.host_calls == 2);
+  CHECK(d.host_ns > 0);
+  CHECK(d.total_ns >= d.host_ns);
+
+  alloc.Release();
+}
+
+TEST_CASE("physprotect 02: switch on, RW to R is table-only and marks", "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, true);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  ViewAlloc alloc(heap, kViewPage, kRW);
+  const uint32_t a = alloc.address();
+  RequireFreshReadWrite(memory, heap, a);
+
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kR));
+  auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(TableProtect(heap, a) == kR);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
+  CHECK(ParentHost(memory, heap, a) == PageAccess::kReadWrite);
+  CHECK(Marked(heap, a));
+  CHECK(ParentMarked(memory, heap, a));
+  CHECK(d.calls == 1);
+  CHECK(d.host_calls == 0);
+  CHECK(d.table_only_calls == 1);
+
+  alloc.Release();
+}
+
+TEST_CASE("physprotect 03: switch on, marked R to RW is table-only and clears the mark",
+          "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, true);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  ViewAlloc alloc(heap, kViewPage, kRW);
+  const uint32_t a = alloc.address();
+  RequireFreshReadWrite(memory, heap, a);
+  REQUIRE(heap->Protect(a, kViewPage, kR));
+
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kRW));
+  auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(TableProtect(heap, a) == kRW);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
+  CHECK(ParentHost(memory, heap, a) == PageAccess::kReadWrite);
+  CHECK_FALSE(Marked(heap, a));
+  CHECK_FALSE(ParentMarked(memory, heap, a));
+  CHECK(d.calls == 1);
+  CHECK(d.host_calls == 0);
+  CHECK(d.table_only_calls == 1);
+
+  alloc.Release();
+}
+
+TEST_CASE("physprotect 04: switch on, page allocated R to RW takes the full path",
+          "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, true);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  ViewAlloc alloc(heap, kViewPage, kR);
+  const uint32_t a = alloc.address();
+  REQUIRE(TableProtect(heap, a) == kR);
+  REQUIRE_FALSE(Marked(heap, a));
+
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kRW));
+  auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(TableProtect(heap, a) == kRW);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
+  CHECK(ParentHost(memory, heap, a) == PageAccess::kReadWrite);
+  CHECK_FALSE(Marked(heap, a));
+  CHECK(d.calls == 1);
+  CHECK(d.table_only_calls == 0);
+  CHECK(d.host_calls == 2);
+
+  alloc.Release();
+}
+
+TEST_CASE("physprotect 05: switch on, a watched RW page takes the full path both ways",
+          "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, true);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  CallbackCounter callbacks(memory);
+  ViewAlloc alloc(heap, kViewPage, kRW);
+  const uint32_t a = alloc.address();
+  RequireFreshReadWrite(memory, heap, a);
+  memory.EnablePhysicalMemoryAccessCallbacks(heap->GetPhysicalAddress(a), kViewPage, true, false);
+  // Control: the watch made the view host read only.
+  CHECK(ViewHost(memory, a) == PageAccess::kReadOnly);
+
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kR));
+  auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(TableProtect(heap, a) == kR);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadOnly);
+  CHECK(ParentHost(memory, heap, a) == PageAccess::kReadOnly);
+  CHECK_FALSE(Marked(heap, a));
+  CHECK(callbacks.count() == 0);
+  CHECK(d.calls == 1);
+  CHECK(d.table_only_calls == 0);
+  CHECK(d.host_calls == 2);
+
+  before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kRW));
+  d = StatsDelta(before, heap->protect_stats());
+  CHECK(callbacks.count() == 1);
+  CHECK(TableProtect(heap, a) == kRW);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
+  CHECK(ParentHost(memory, heap, a) == PageAccess::kReadWrite);
+  CHECK_FALSE(Marked(heap, a));
+  CHECK(d.calls == 1);
+  CHECK(d.table_only_calls == 0);
+  CHECK(d.host_calls == 2);
+
+  alloc.Release();
+}
+
+TEST_CASE("physprotect 06: marked page to no access takes the full path and clears the mark",
+          "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, true);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  ViewAlloc alloc(heap, kViewPage, kRW);
+  const uint32_t a = alloc.address();
+  RequireFreshReadWrite(memory, heap, a);
+
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kR));
+  auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(Marked(heap, a));
+  CHECK(d.table_only_calls == 1);
+  CHECK(d.host_calls == 0);
+
+  before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, rex::memory::kMemoryProtectNoAccess));
+  d = StatsDelta(before, heap->protect_stats());
+  CHECK(TableProtect(heap, a) == rex::memory::kMemoryProtectNoAccess);
+  CHECK(ViewHost(memory, a) == PageAccess::kNoAccess);
+  CHECK(ParentHost(memory, heap, a) == PageAccess::kNoAccess);
+  CHECK_FALSE(Marked(heap, a));
+  CHECK_FALSE(ParentMarked(memory, heap, a));
+  CHECK(d.calls == 1);
+  CHECK(d.table_only_calls == 0);
+  CHECK(d.host_calls == 2);
+
+  alloc.Release();
+}
+
+TEST_CASE("physprotect 07: old_protect requested takes the full path", "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, true);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  ViewAlloc alloc(heap, kViewPage, kRW);
+  const uint32_t a = alloc.address();
+  RequireFreshReadWrite(memory, heap, a);
+
+  uint32_t old_protect = 0xFFFFFFFFu;
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kR, &old_protect));
+  auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(old_protect == (rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite));
+  CHECK(TableProtect(heap, a) == kR);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadOnly);
+  CHECK_FALSE(Marked(heap, a));
+  CHECK(d.calls == 1);
+  CHECK(d.table_only_calls == 0);
+  CHECK(d.host_calls == 2);
+
+  alloc.Release();
+}
+
+TEST_CASE("physprotect 08: release and reallocate leaves no mark", "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, true);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  ViewAlloc first(heap, kViewPage, kRW);
+  const uint32_t a = first.address();
+  RequireFreshReadWrite(memory, heap, a);
+  REQUIRE(heap->Protect(a, kViewPage, kR));
+  CHECK(Marked(heap, a));
+  first.Release();
+
+  ViewAlloc second(heap, kViewPage, kR);
+  // Without the same address the test proves nothing.
+  CHECK(second.address() == a);
+  const uint32_t b = second.address();
+  CHECK_FALSE(Marked(heap, b));
+  CHECK_FALSE(ParentMarked(memory, heap, b));
+
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(b, kViewPage, kRW));
+  auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(TableProtect(heap, b) == kRW);
+  CHECK(ViewHost(memory, b) == PageAccess::kReadWrite);
+  CHECK(ParentHost(memory, heap, b) == PageAccess::kReadWrite);
+  CHECK_FALSE(Marked(heap, b));
+  CHECK(d.calls == 1);
+  CHECK(d.table_only_calls == 0);
+  CHECK(d.host_calls == 2);
+
+  second.Release();
+}
+
+TEST_CASE("physprotect 09: a range with one unmarked read-only page takes the full path",
+          "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, true);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  ViewAlloc alloc(heap, 2 * kViewPage, kR);
+  const uint32_t a = alloc.address();
+  const uint32_t b = a + kViewPage;
+  REQUIRE(TableProtect(heap, a) == kR);
+  REQUIRE(TableProtect(heap, b) == kR);
+
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kRW));
+  auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(d.table_only_calls == 0);
+  CHECK(d.host_calls == 2);
+
+  before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kR));
+  d = StatsDelta(before, heap->protect_stats());
+  CHECK(d.table_only_calls == 1);
+  CHECK(d.host_calls == 0);
+  CHECK(Marked(heap, a));
+  CHECK_FALSE(Marked(heap, b));
+
+  before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, 2 * kViewPage, kRW));
+  d = StatsDelta(before, heap->protect_stats());
+  CHECK(TableProtect(heap, a) == kRW);
+  CHECK(TableProtect(heap, b) == kRW);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
+  CHECK(ViewHost(memory, b) == PageAccess::kReadWrite);
+  CHECK(ParentHost(memory, heap, a) == PageAccess::kReadWrite);
+  CHECK(ParentHost(memory, heap, b) == PageAccess::kReadWrite);
+  CHECK_FALSE(Marked(heap, a));
+  CHECK_FALSE(Marked(heap, b));
+  CHECK_FALSE(ParentMarked(memory, heap, a));
+  CHECK_FALSE(ParentMarked(memory, heap, b));
+  CHECK(d.calls == 1);
+  CHECK(d.table_only_calls == 0);
+  CHECK(d.host_calls == 2);
+
+  alloc.Release();
+}
+
+TEST_CASE("physprotect 10: the table-only path writes the parent table", "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, true);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  ViewAlloc alloc(heap, kViewPage, kRW);
+  const uint32_t a = alloc.address();
+  RequireFreshReadWrite(memory, heap, a);
+
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kR));
+  auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(ParentTableProtect(memory, heap, a) == kR);
+  CHECK(d.table_only_calls == 1);
+
+  before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kRW));
+  d = StatsDelta(before, heap->protect_stats());
+  CHECK(ParentTableProtect(memory, heap, a) == kRW);
+  CHECK(d.table_only_calls == 1);
+
+  alloc.Release();
+}
+
+TEST_CASE("physprotect 11: a full-path change through the C0 alias clears the parent's mark",
+          "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, true);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  ViewAlloc alloc(heap, kViewPage, kRW);
+  const uint32_t a = alloc.address();
+  RequireFreshReadWrite(memory, heap, a);
+  const uint32_t phys = heap->GetPhysicalAddress(a);
+  const uint32_t alias = 0xC0000000u + phys;
+  auto* alias_heap = static_cast<PhysicalHeap*>(MutableHeap(memory.LookupHeap(alias)));
+  REQUIRE(alias_heap != nullptr);
+  REQUIRE(alias_heap->heap_base() == 0xC0000000u);
+  REQUIRE(alias_heap->GetPhysicalAddress(alias) == phys);
+
+  REQUIRE(heap->Protect(a, kViewPage, kR));
+  CHECK(Marked(heap, a));
+  CHECK(ParentMarked(memory, heap, a));
+
+  // The alias page is uncommitted in the C0 view: the parent's full Protect
+  // runs, then the view's fails.
+  const bool alias_result = alias_heap->Protect(alias, kViewPage, kR);
+  CHECK_FALSE(alias_result);
+  CHECK_FALSE(ParentMarked(memory, heap, a));
+  CHECK(ParentTableProtect(memory, heap, a) == kR);
+  CHECK(ParentHost(memory, heap, a) == PageAccess::kReadOnly);
+
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kRW));
+  auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(TableProtect(heap, a) == kRW);
+  CHECK(ParentTableProtect(memory, heap, a) == kRW);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
+  CHECK(ParentHost(memory, heap, a) == PageAccess::kReadWrite);
+  CHECK_FALSE(Marked(heap, a));
+  CHECK(d.calls == 1);
+  CHECK(d.table_only_calls == 0);
+  CHECK(d.host_calls == 2);
+
+  alloc.Release();
+}
+
+TEST_CASE("physprotect 12: with the switch off a marked page takes the full path",
+          "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, true);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  ViewAlloc alloc(heap, kViewPage, kRW);
+  const uint32_t a = alloc.address();
+  RequireFreshReadWrite(memory, heap, a);
+  REQUIRE(heap->Protect(a, kViewPage, kR));
+  CHECK(Marked(heap, a));
+
+  Switches::Set(false, true);
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kRW));
+  auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(TableProtect(heap, a) == kRW);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
+  CHECK_FALSE(Marked(heap, a));
+  CHECK(d.calls == 1);
+  CHECK(d.table_only_calls == 0);
+  CHECK(d.host_calls == 2);
+
+  alloc.Release();
+}
+
+TEST_CASE("physprotect 13: PageEntry is 16 bytes and the mark is qword bit 62",
+          "[memory][physprotect]") {
+  Switches switches(false, false);
+  static_assert(sizeof(rex::memory::PageEntry) == 16,
+                "PageEntry: a uint64_t and a 12-byte struct, rounded up to 8-byte alignment");
+  rex::memory::PageEntry entry{};
+  entry.host_kept_writable = 1;
+  CHECK(entry.qword == (uint64_t(1) << 62));
+}
+
+TEST_CASE("physprotect 14: with the timing cvar off nothing is counted", "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, false);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  ViewAlloc alloc(heap, kViewPage, kRW);
+  const uint32_t a = alloc.address();
+  RequireFreshReadWrite(memory, heap, a);
+
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kR));
+  CHECK(TableProtect(heap, a) == kR);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
+  CHECK(Marked(heap, a));
+  REQUIRE(heap->Protect(a, kViewPage, kRW));
+  CHECK(TableProtect(heap, a) == kRW);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
+  CHECK_FALSE(Marked(heap, a));
+  auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(d.calls == 0);
+  CHECK(d.table_only_calls == 0);
+  CHECK(d.host_calls == 0);
+  CHECK(d.total_ns == 0);
+  CHECK(d.host_ns == 0);
+
+  alloc.Release();
+}
+
+TEST_CASE("physprotect 15: a watch on a marked page sends the change to RW down the full path",
+          "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, true);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  CallbackCounter callbacks(memory);
+  ViewAlloc alloc(heap, kViewPage, kRW);
+  const uint32_t a = alloc.address();
+  RequireFreshReadWrite(memory, heap, a);
+
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kRWC));
+  auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(TableProtect(heap, a) == kRWC);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
+  CHECK(Marked(heap, a));
+  CHECK(d.table_only_calls == 1);
+  CHECK(d.host_calls == 0);
+
+  memory.EnablePhysicalMemoryAccessCallbacks(heap->GetPhysicalAddress(a), kViewPage, true, false);
+  // Control: the watch made the view host read only (RWC counts as writable
+  // for the watch).
+  CHECK(ViewHost(memory, a) == PageAccess::kReadOnly);
+  CHECK(callbacks.count() == 0);
+
+  before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kRW));
+  d = StatsDelta(before, heap->protect_stats());
+  CHECK(callbacks.count() == 1);
+  CHECK(TableProtect(heap, a) == kRW);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
+  CHECK(ParentHost(memory, heap, a) == PageAccess::kReadWrite);
+  CHECK_FALSE(Marked(heap, a));
+  CHECK(d.calls == 1);
+  CHECK(d.table_only_calls == 0);
+  CHECK(d.host_calls == 2);
+
+  alloc.Release();
+}
+
+TEST_CASE("physprotect 16: the game's pair RW to RWC to RW is table-only both ways",
+          "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, true);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  ViewAlloc alloc(heap, kViewPage, kRW);
+  const uint32_t a = alloc.address();
+  RequireFreshReadWrite(memory, heap, a);
+
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kRWC));
+  auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(TableProtect(heap, a) == kRWC);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
+  CHECK(ParentHost(memory, heap, a) == PageAccess::kReadWrite);
+  CHECK(Marked(heap, a));
+  CHECK(ParentMarked(memory, heap, a));
+  CHECK(d.calls == 1);
+  CHECK(d.host_calls == 0);
+  CHECK(d.table_only_calls == 1);
+
+  before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kRW));
+  d = StatsDelta(before, heap->protect_stats());
+  CHECK(TableProtect(heap, a) == kRW);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
+  CHECK(ParentHost(memory, heap, a) == PageAccess::kReadWrite);
+  CHECK_FALSE(Marked(heap, a));
+  CHECK_FALSE(ParentMarked(memory, heap, a));
+  CHECK(d.calls == 1);
+  CHECK(d.host_calls == 0);
+  CHECK(d.table_only_calls == 1);
+
+  alloc.Release();
+}
+
+TEST_CASE("physprotect 17: read with NoCache takes the full path", "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, true);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  ViewAlloc alloc(heap, kViewPage, kRW);
+  const uint32_t a = alloc.address();
+  RequireFreshReadWrite(memory, heap, a);
+
+  const uint32_t read_nocache = rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectNoCache;
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, read_nocache));
+  auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(TableProtect(heap, a) == read_nocache);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadOnly);
+  CHECK_FALSE(Marked(heap, a));
+  CHECK(d.calls == 1);
+  CHECK(d.table_only_calls == 0);
+  CHECK(d.host_calls == 2);
+
+  alloc.Release();
+}
+
+TEST_CASE("physprotect 18: no access to R takes the full path", "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, true);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  ViewAlloc alloc(heap, kViewPage, kRW);
+  const uint32_t a = alloc.address();
+  RequireFreshReadWrite(memory, heap, a);
+
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, rex::memory::kMemoryProtectNoAccess));
+  auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(d.table_only_calls == 0);
+  CHECK(d.host_calls == 2);
+
+  before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kR));
+  d = StatsDelta(before, heap->protect_stats());
+  CHECK(TableProtect(heap, a) == kR);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadOnly);
+  CHECK(ParentHost(memory, heap, a) == PageAccess::kReadOnly);
+  CHECK_FALSE(Marked(heap, a));
+  CHECK(d.calls == 1);
+  CHECK(d.table_only_calls == 0);
+  CHECK(d.host_calls == 2);
+
+  alloc.Release();
+}
+
+TEST_CASE("physprotect 19: decommit and recommit leave no mark", "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, true);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  ViewAlloc alloc(heap, kViewPage, kRW);
+  const uint32_t a = alloc.address();
+  RequireFreshReadWrite(memory, heap, a);
+  REQUIRE(heap->Protect(a, kViewPage, kR));
+  CHECK(Marked(heap, a));
+
+  REQUIRE(heap->Decommit(a, kViewPage));
+  REQUIRE(heap->AllocFixed(a, kViewPage, kViewPage, rex::memory::kMemoryAllocationCommit, kR));
+  CHECK(TableProtect(heap, a) == kR);
+  CHECK_FALSE(Marked(heap, a));
+  CHECK_FALSE(ParentMarked(memory, heap, a));
+
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kRW));
+  auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(TableProtect(heap, a) == kRW);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
+  CHECK_FALSE(Marked(heap, a));
+  CHECK(d.calls == 1);
+  CHECK(d.table_only_calls == 0);
+  CHECK(d.host_calls == 2);
+
+  alloc.Release();
+}

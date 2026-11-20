@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <utility>
 
@@ -36,6 +37,14 @@ REXCVAR_DEFINE_BOOL(protect_on_release, false, "Memory",
                     "Protect released memory to prevent accesses");
 
 REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allocated heap memory");
+
+REXCVAR_DEFINE_BOOL(cheap_physical_protect, false, "Memory",
+                    "Change physical memory between read only and read/write in the page tables "
+                    "only, without host protection calls, when no page of the range is watched");
+
+REXCVAR_DEFINE_BOOL(physical_protect_timing, false, "Memory",
+                    "Count and time guest protection changes on physical memory and log the "
+                    "totals every 65536 calls of a heap");
 
 namespace rex::memory {
 
@@ -800,6 +809,44 @@ rex::memory::PageAccess ToPageAccess(uint32_t protect) {
   }
 }
 
+namespace {
+
+// Protection classes of the table-only path (cvar cheap_physical_protect).
+// Deliberately not defined through ToPageAccess, which counts write combine as
+// writable: "read" is 1 and 9, "read/write" is 3. A value with NoCache, or
+// without read, is in neither class.
+bool IsProtectClassRead(uint32_t protect) {
+  return (protect & memory::kMemoryProtectRead) && !(protect & memory::kMemoryProtectWrite) &&
+         !(protect & memory::kMemoryProtectNoCache);
+}
+
+bool IsProtectClassReadWrite(uint32_t protect) {
+  return (protect & memory::kMemoryProtectRead) && (protect & memory::kMemoryProtectWrite) &&
+         !(protect & memory::kMemoryProtectNoCache);
+}
+
+// Host protection calls made by BaseHeap::Protect on this thread while the cvar
+// physical_protect_timing is on; PhysicalHeap::Protect reads their deltas, so
+// virtual heaps' calls are never counted.
+thread_local uint64_t host_protect_calls_on_thread = 0;
+thread_local uint64_t host_protect_ns_on_thread = 0;
+
+uint64_t NanosecondsSince(std::chrono::steady_clock::time_point start) {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - start)
+                      .count());
+}
+
+// The one place the stats line is built.
+void LogPhysicalProtectStats(uint32_t heap_base, const PhysicalProtectStats& stats) {
+  REXSYS_DEBUG(
+      "physical protect: heap {:08X} calls {} table_only {} host_calls {} total_us {} host_us {}",
+      heap_base, stats.calls, stats.table_only_calls, stats.host_calls, stats.total_ns / 1000,
+      stats.host_ns / 1000);
+}
+
+}  // namespace
+
 uint32_t FromPageAccess(rex::memory::PageAccess protect) {
   switch (protect) {
     case memory::PageAccess::kNoAccess:
@@ -966,6 +1013,8 @@ bool BaseHeap::Restore(stream::ByteStream* stream) {
   for (size_t i = 0; i < page_table_.size(); i++) {
     auto& page = page_table_[i];
     page.qword = stream->Read<uint64_t>();
+    // The host protection is re-applied from the table below.
+    page.host_kept_writable = 0;
     if (!page.state) {
       // Unallocated.
       continue;
@@ -1133,6 +1182,7 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
     page_entry.allocation_protect = protect;
     page_entry.current_protect = protect;
     page_entry.state = memory::kMemoryAllocationReserve | allocation_type;
+    page_entry.host_kept_writable = 0;
   }
 
   return true;
@@ -1284,6 +1334,7 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
     page_entry.allocation_protect = protect;
     page_entry.current_protect = protect;
     page_entry.state = memory::kMemoryAllocationReserve | allocation_type;
+    page_entry.host_kept_writable = 0;
   }
 
   *out_address = heap_base_ + (start_page_number << page_size_shift_);
@@ -1314,6 +1365,7 @@ bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
   for (uint32_t page_number = start_page_number; page_number <= end_page_number; ++page_number) {
     auto& page_entry = page_table_[page_number];
     page_entry.state &= ~memory::kMemoryAllocationCommit;
+    page_entry.host_kept_writable = 0;
   }
 
   return true;
@@ -1432,9 +1484,18 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32
       (((page_count << page_size_shift_) % rex::memory::page_size() == 0) &&
        ((start_page_number << page_size_shift_) % rex::memory::page_size() == 0))) {
     memory::PageAccess old_protect_access;
-    if (!rex::memory::Protect(TranslateRelative(start_page_number << page_size_shift_),
-                              page_count << page_size_shift_, ToPageAccess(protect),
-                              old_protect ? &old_protect_access : nullptr)) {
+    const bool time_host_call = REXCVAR_GET(physical_protect_timing);
+    const auto host_call_start = time_host_call ? std::chrono::steady_clock::now()
+                                                : std::chrono::steady_clock::time_point();
+    const bool host_call_ok =
+        rex::memory::Protect(TranslateRelative(start_page_number << page_size_shift_),
+                             page_count << page_size_shift_, ToPageAccess(protect),
+                             old_protect ? &old_protect_access : nullptr);
+    if (time_host_call) {
+      host_protect_ns_on_thread += NanosecondsSince(host_call_start);
+      ++host_protect_calls_on_thread;
+    }
+    if (!host_call_ok) {
       REXSYS_ERROR("BaseHeap::Protect failed due to host VirtualProtect failure");
       return false;
     }
@@ -1451,6 +1512,8 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32
   for (uint32_t page_number = start_page_number; page_number <= end_page_number; ++page_number) {
     auto& page_entry = page_table_[page_number];
     page_entry.current_protect = protect;
+    // The host now matches the table.
+    page_entry.host_kept_writable = 0;
   }
 
   return true;
@@ -1547,6 +1610,85 @@ bool BaseHeap::QueryProtect(uint32_t address, uint32_t* out_protect) {
   auto page_entry = page_table_[page_number];
   *out_protect = page_entry.current_protect;
   return true;
+}
+
+bool BaseHeap::QueryHostKeptWritable(uint32_t address, bool* out_marked) {
+  *out_marked = false;
+  uint32_t page_number = (address - heap_base_) >> page_size_shift_;
+  if (address < heap_base_ || page_number >= page_table_.size()) {
+    return false;
+  }
+  std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+  *out_marked = page_table_[page_number].host_kept_writable != 0;
+  return true;
+}
+
+bool BaseHeap::ProtectTableOnlyCheck(uint32_t address, uint32_t size, bool to_read_write,
+                                     uint32_t* out_start_page_number,
+                                     uint32_t* out_end_page_number) {
+  // The checks of Protect, in its order, without its log lines (a failure here
+  // sends the call down the full path, which logs).
+  if (!size) {
+    return false;
+  }
+  uint32_t start_page_number = (address - heap_base_) >> page_size_shift_;
+  if (start_page_number >= page_table_.size()) {
+    return false;
+  }
+  uint32_t end_page_number =
+      uint32_t((uint64_t(address) + size - 1 - heap_base_) >> page_size_shift_);
+  if (end_page_number >= page_table_.size()) {
+    return false;
+  }
+  uint32_t first_base_address = UINT_MAX;
+  for (uint32_t page_number = start_page_number; page_number <= end_page_number; ++page_number) {
+    auto page_entry = page_table_[page_number];
+    if (first_base_address == UINT_MAX) {
+      first_base_address = page_entry.base_address;
+    } else if (first_base_address != page_entry.base_address) {
+      return false;
+    }
+    if (!(page_entry.state & memory::kMemoryAllocationCommit)) {
+      return false;
+    }
+  }
+  uint32_t page_count = end_page_number - start_page_number + 1;
+  if (!(page_size_ == rex::memory::page_size() ||
+        (((page_count << page_size_shift_) % rex::memory::page_size() == 0) &&
+         ((start_page_number << page_size_shift_) % rex::memory::page_size() == 0)))) {
+    return false;
+  }
+
+  // The class test, and for a change to read/write the mark test.
+  for (uint32_t page_number = start_page_number; page_number <= end_page_number; ++page_number) {
+    const PageEntry& page_entry = page_table_[page_number];
+    bool current_read_write = IsProtectClassReadWrite(page_entry.current_protect);
+    if (!current_read_write && !IsProtectClassRead(page_entry.current_protect)) {
+      return false;
+    }
+    if (to_read_write && !current_read_write && !page_entry.host_kept_writable) {
+      return false;
+    }
+  }
+
+  *out_start_page_number = start_page_number;
+  *out_end_page_number = end_page_number;
+  return true;
+}
+
+void BaseHeap::ProtectTableOnlyCommit(uint32_t start_page_number, uint32_t end_page_number,
+                                      uint32_t protect, bool to_read_write) {
+  for (uint32_t page_number = start_page_number; page_number <= end_page_number; ++page_number) {
+    auto& page_entry = page_table_[page_number];
+    if (to_read_write) {
+      page_entry.host_kept_writable = 0;
+    } else if (IsProtectClassReadWrite(page_entry.current_protect)) {
+      // Host left writable under a read-only table entry. A page already in
+      // class "read" keeps its mark as it is.
+      page_entry.host_kept_writable = 1;
+    }
+    page_entry.current_protect = protect;
+  }
 }
 
 rex::memory::PageAccess BaseHeap::QueryRangeAccess(uint32_t low_address, uint32_t high_address) {
@@ -1761,12 +1903,64 @@ bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
 
 bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
                            uint32_t* old_protect) {
+  if (!REXCVAR_GET(physical_protect_timing)) {
+    return ProtectUntimed(address, size, protect, old_protect, nullptr);
+  }
+  const uint64_t host_calls_before = host_protect_calls_on_thread;
+  const uint64_t host_ns_before = host_protect_ns_on_thread;
+  const auto start = std::chrono::steady_clock::now();
+  bool table_only = false;
+  const bool result = ProtectUntimed(address, size, protect, old_protect, &table_only);
+  protect_total_ns_.fetch_add(NanosecondsSince(start), std::memory_order_relaxed);
+  protect_host_calls_.fetch_add(host_protect_calls_on_thread - host_calls_before,
+                                std::memory_order_relaxed);
+  protect_host_ns_.fetch_add(host_protect_ns_on_thread - host_ns_before, std::memory_order_relaxed);
+  if (table_only) {
+    protect_table_only_calls_.fetch_add(1, std::memory_order_relaxed);
+  }
+  const uint64_t calls = protect_calls_.fetch_add(1, std::memory_order_relaxed) + 1;
+  if ((calls & 0xFFFF) == 0) {
+    LogPhysicalProtectStats(heap_base_, protect_stats());
+  }
+  return result;
+}
+
+bool PhysicalHeap::ProtectUntimed(uint32_t address, uint32_t size, uint32_t protect,
+                                  uint32_t* old_protect, bool* out_table_only) {
   auto global_lock = global_critical_region_.Acquire();
 
   // Only invalidate if making writable again, for simplicity - not when simply
   // marking some range as immutable, for instance.
   if (protect & memory::kMemoryProtectWrite) {
-    TriggerCallbacks(std::move(global_lock), address, size, true, true, false);
+    const bool any_watched =
+        TriggerCallbacks(std::move(global_lock), address, size, true, true, false);
+    // Table-only change to read/write (cvar cheap_physical_protect). Not when a
+    // page was watched: the watch may have left the view's host read only, and
+    // TriggerCallbacks (unprotect false) does not restore it; only the host
+    // call of the full path below does.
+    if (REXCVAR_GET(cheap_physical_protect) && !old_protect && IsProtectClassReadWrite(protect) &&
+        !any_watched) {
+      // TriggerCallbacks released the global lock. Take it again (global, then
+      // the heap mutexes) for the decision and both tables' writes; it is
+      // released at the end of this block, before today's statements run.
+      auto table_only_lock = global_critical_region_.Acquire();
+      if (ProtectBothTablesOnly(address, size, protect, true)) {
+        if (out_table_only) {
+          *out_table_only = true;
+        }
+        return true;
+      }
+    }
+  } else if (REXCVAR_GET(cheap_physical_protect) && !old_protect &&
+             IsProtectClassRead(protect)) {
+    // Table-only change to read: the global lock taken above is held, as on
+    // today's path.
+    if (ProtectBothTablesOnly(address, size, protect, false)) {
+      if (out_table_only) {
+        *out_table_only = true;
+      }
+      return true;
+    }
   }
 
   if (!parent_heap_->Protect(GetPhysicalAddress(address), size, protect, old_protect)) {
@@ -2036,6 +2230,57 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
   }
 
   return true;
+}
+
+bool PhysicalHeap::ProtectBothTablesOnly(uint32_t address, uint32_t size, uint32_t protect,
+                                         bool to_read_write) {
+  // Both heap mutexes together, view then parent (the order PhysicalHeap::Alloc
+  // takes them), through both tables' checks and both tables' writes: no table
+  // is written unless both pass.
+  std::lock_guard<std::recursive_mutex> view_lock(heap_mutex_);
+  std::lock_guard<std::recursive_mutex> parent_lock(parent_heap_->heap_mutex());
+  uint32_t view_start_page, view_end_page;
+  if (!ProtectTableOnlyCheck(address, size, to_read_write, &view_start_page, &view_end_page)) {
+    return false;
+  }
+  // A change to read only on a watched page keeps the full path (the watch has
+  // made the view's host read only on purpose).
+  if (!to_read_write && AnySystemPageWatched(view_start_page, view_end_page)) {
+    return false;
+  }
+  uint32_t parent_start_page, parent_end_page;
+  if (!parent_heap_->ProtectTableOnlyCheck(GetPhysicalAddress(address), size, to_read_write,
+                                           &parent_start_page, &parent_end_page)) {
+    return false;
+  }
+  parent_heap_->ProtectTableOnlyCommit(parent_start_page, parent_end_page, protect, to_read_write);
+  ProtectTableOnlyCommit(view_start_page, view_end_page, protect, to_read_write);
+  return true;
+}
+
+bool PhysicalHeap::AnySystemPageWatched(uint32_t start_page_number,
+                                        uint32_t end_page_number) const {
+  // The system pages under the guest pages the change would write.
+  uint64_t first_byte = (uint64_t(start_page_number) << page_size_shift_) + host_address_offset();
+  uint64_t last_byte =
+      ((uint64_t(end_page_number) + 1) << page_size_shift_) - 1 + host_address_offset();
+  uint32_t system_page_first = uint32_t(first_byte / system_page_size_);
+  uint32_t system_page_last =
+      std::min(uint32_t(last_byte / system_page_size_), system_page_count_ - 1);
+  for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
+    if (system_page_flags_[i >> 6].notify_on_invalidation & (uint64_t(1) << (i & 63))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+PhysicalProtectStats PhysicalHeap::protect_stats() const {
+  return PhysicalProtectStats{protect_calls_.load(std::memory_order_relaxed),
+                              protect_table_only_calls_.load(std::memory_order_relaxed),
+                              protect_host_calls_.load(std::memory_order_relaxed),
+                              protect_total_ns_.load(std::memory_order_relaxed),
+                              protect_host_ns_.load(std::memory_order_relaxed)};
 }
 
 uint32_t PhysicalHeap::GetPhysicalAddress(uint32_t address) const {
