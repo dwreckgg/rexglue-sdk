@@ -145,6 +145,16 @@
 #define REX_LACKS_FLOAT_FROM_CHARS 0
 #endif
 
+// Symbols the runtime library exports for the game (the netplay switches): dllexport/dllimport on Windows, default
+// visibility on ELF, where a shared library's symbols bind to the importer without an import attribute.
+#if REX_PLATFORM_WIN32
+#define REX_DLL_EXPORT __declspec(dllexport)
+#define REX_DLL_IMPORT __declspec(dllimport)
+#else
+#define REX_DLL_EXPORT __attribute__((visibility("default")))
+#define REX_DLL_IMPORT
+#endif
+
 namespace rex {
 
 #if REX_PLATFORM_WIN32

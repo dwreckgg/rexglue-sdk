@@ -399,7 +399,7 @@ void XmaDecoder::Resume() {
 
 }  // namespace rex::audio
 
-extern "C" __declspec(dllexport) void rex_xma_stats(uint64_t* ns, uint64_t* n) {
+extern "C" REX_DLL_EXPORT void rex_xma_stats(uint64_t* ns, uint64_t* n) {
   *ns = rex::audio::g_t6_xma_ns.load();
   *n = rex::audio::g_t6_xma_n.load();
 }

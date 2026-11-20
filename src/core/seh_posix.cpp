@@ -11,12 +11,48 @@
 
 static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
 
+#include <pthread.h>
 #include <signal.h>
+
+#include <array>
 #include <cstdlib>  // std::abort()
 
 #include <rex/platform/exceptions.h>
 
 namespace rex::platform {
+
+namespace {
+// The handlers installed before seh_initialize (the runtime's ExceptionHandler, which serves write-watched guest
+// pages): a fault outside an SEH region goes on to them (from upstream 506e6a41, PreviousAction / ForwardSignal).
+constexpr std::array kSehSignals = {SIGSEGV, SIGBUS, SIGFPE, SIGILL};
+std::array<struct sigaction, kSehSignals.size()> g_previous{};
+
+struct sigaction* PreviousAction(int signal_number) {
+  for (size_t i = 0; i < kSehSignals.size(); ++i) {
+    if (kSehSignals[i] == signal_number) {
+      return &g_previous[i];
+    }
+  }
+  return nullptr;
+}
+
+// Calls `previous` as the kernel would have, or ends the process with the default action when it has none.
+void ForwardSignal(const struct sigaction& previous, int sig, siginfo_t* info, void* ucontext) {
+  if (previous.sa_handler == SIG_DFL || previous.sa_handler == SIG_IGN) {
+    signal(sig, SIG_DFL);
+    raise(sig);
+    return;
+  }
+  sigset_t saved;
+  pthread_sigmask(SIG_BLOCK, &previous.sa_mask, &saved);
+  if (previous.sa_flags & SA_SIGINFO) {
+    previous.sa_sigaction(sig, info, ucontext);
+  } else {
+    previous.sa_handler(sig);
+  }
+  pthread_sigmask(SIG_SETMASK, &saved, nullptr);
+}
+}  // namespace
 
 static thread_local SehThreadState tls_seh_state;
 static thread_local bool tls_seh_active = false;
@@ -31,10 +67,13 @@ int seh_filter(uint32_t /*code*/, void* /*ep*/) {
 }
 
 /// Signal handler for SIGSEGV/SIGBUS/SIGFPE/SIGILL
-static void signal_handler(int sig, siginfo_t* info, void* /*ucontext*/) {
-  // Only handle if we're in SEH-protected code
+static void signal_handler(int sig, siginfo_t* info, void* ucontext) {
+  // Only handle if we're in SEH-protected code; anything else goes to the handler that was there before
   if (!tls_seh_active) {
-    // Not in SEH region - restore default handler and re-raise
+    if (struct sigaction* previous = PreviousAction(sig)) {
+      ForwardSignal(*previous, sig, info, ucontext);
+      return;
+    }
     signal(sig, SIG_DFL);
     raise(sig);
     return;
@@ -110,10 +149,9 @@ void seh_initialize() {
   sigemptyset(&sa.sa_mask);
   sa.sa_flags = SA_SIGINFO | SA_NODEFER;  // SA_NODEFER allows re-entry for nested exceptions
 
-  sigaction(SIGSEGV, &sa, nullptr);
-  sigaction(SIGBUS, &sa, nullptr);
-  sigaction(SIGFPE, &sa, nullptr);
-  sigaction(SIGILL, &sa, nullptr);
+  for (size_t i = 0; i < kSehSignals.size(); ++i) {
+    sigaction(kSehSignals[i], &sa, &g_previous[i]);
+  }
 }
 
 bool& seh_active() {

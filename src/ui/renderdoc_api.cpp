@@ -12,6 +12,12 @@
 #include <rex/logging.h>
 #include <rex/ui/renderdoc_api.h>
 
+#include <rex/platform.h>
+
+#if !REX_PLATFORM_WIN32
+#include <dlfcn.h>
+#endif
+
 namespace rex {
 namespace ui {
 
@@ -20,6 +26,15 @@ std::unique_ptr<RenderDocAPI> RenderDocAPI::CreateIfConnected() {
 
   pRENDERDOC_GetAPI get_api = nullptr;
 
+#if !REX_PLATFORM_WIN32
+  // Only a RenderDoc already in the process (attached): RTLD_NOLOAD, as Xenia Canary's renderdoc_api.cc. A plain load
+  // would pull in a system-wide librenderdoc.so on every start, and its layer hides VK_KHR_wayland_surface.
+  void* attached = dlopen(platform::lib_names::kRenderDoc, RTLD_NOW | RTLD_NOLOAD);
+  if (!attached) {
+    return nullptr;
+  }
+  dlclose(attached);  // the Load below holds its own reference
+#endif
   // Try to load the RenderDoc library. If RenderDoc is attached, the library
   // should already be loaded into the process and this will increment the
   // reference count. If not attached, the load will fail and we return nullptr.

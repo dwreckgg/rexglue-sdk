@@ -63,9 +63,12 @@ void Fiber::SwitchTo(Fiber* target) {
 }
 
 void Fiber::Destroy() {
-  // Thread fibers are destroyed from the owning thread itself.
+  // A thread fiber is also destroyed from another thread: ~XThread runs where the last handle to the thread is
+  // closed (NtClose on the game's main thread). Only the owning thread's current fiber is this one.
   if (is_thread_fiber_) {
-    tls_current_ = nullptr;
+    if (tls_current_ == this) {
+      tls_current_ = nullptr;
+    }
   } else {
     assert(this != tls_current_ && "Destroy called on the currently running fiber");
   }

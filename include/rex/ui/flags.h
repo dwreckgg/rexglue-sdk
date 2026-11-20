@@ -33,6 +33,7 @@ REXCVAR_DECLARE(bool, fullscreen_exclusive);
 REXCVAR_DECLARE(std::string, fullscreen_exclusive_mode);
 REXCVAR_DECLARE(std::string, window_client_size);
 REXCVAR_DECLARE(int32_t, monitor);
+REXCVAR_DECLARE(std::string, video_driver);
 
 // D3D12
 REXCVAR_DECLARE(bool, d3d12_debug);

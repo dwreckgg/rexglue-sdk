@@ -158,15 +158,15 @@ object_ref<XNotifyListener> XNotifyListener::Restore(KernelState* kernel_state,
 }  // namespace rex::system
 
 // Netplay: on = 1 starts the lockstep (everything queued so far is visible), 0 ends it.
-extern "C" __declspec(dllexport) void rex_notify_lockstep(int on) {
+extern "C" REX_DLL_EXPORT void rex_notify_lockstep(int on) {
   rex::system::g_notify_visible.store(rex::system::g_notify_seq.load());
   rex::system::g_notify_lockstep.store(on != 0, std::memory_order_release);
 }
 // Netplay: a frame boundary - everything queued so far becomes visible.
-extern "C" __declspec(dllexport) void rex_notify_frame() {
+extern "C" REX_DLL_EXPORT void rex_notify_frame() {
   rex::system::g_notify_visible.store(rex::system::g_notify_seq.load(), std::memory_order_release);
 }
 // Netplay: notifications the guest dequeued in the lockstep.
-extern "C" __declspec(dllexport) uint32_t rex_notify_delivered() {
+extern "C" REX_DLL_EXPORT uint32_t rex_notify_delivered() {
   return rex::system::g_notify_delivered.load(std::memory_order_relaxed);
 }

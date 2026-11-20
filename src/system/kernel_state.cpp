@@ -1261,6 +1261,6 @@ const char* KernelState::GetOrCreateFiberName(uint32_t guest_addr, const char* t
 }  // namespace rex::system
 
 // Netplay lockstep switch (see rex::system::overlapped_inline): 1 = deferred overlapped completions run inline.
-extern "C" __declspec(dllexport) void rex_overlapped_inline(int on) {
+extern "C" REX_DLL_EXPORT void rex_overlapped_inline(int on) {
   rex::system::g_overlapped_inline.store(on != 0, std::memory_order_release);
 }

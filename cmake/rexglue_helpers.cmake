@@ -15,10 +15,6 @@
 #==========================================================
 function(rexglue_apply_target_settings target_name)
     if(UNIX AND NOT APPLE)
-        find_package(PkgConfig REQUIRED)
-        pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
-        target_include_directories(${target_name} PRIVATE ${GTK3_INCLUDE_DIRS})
-        target_link_libraries(${target_name} PRIVATE ${GTK3_LIBRARIES})
         # Large executable support
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
             target_link_options(${target_name} PRIVATE -Wl,--no-relax)
@@ -53,7 +49,7 @@ function(rexglue_configure_target target_name)
             ${REXGLUE_SHARE_DIR}/windowed_app_main_win.cpp)
     else()
         target_sources(${target_name} PRIVATE
-            ${REXGLUE_SHARE_DIR}/windowed_app_main_posix.cpp)
+            ${REXGLUE_SHARE_DIR}/windowed_app_main_sdl.cpp)
     endif()
 
     target_sources(${target_name} PRIVATE

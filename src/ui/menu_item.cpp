@@ -11,6 +11,8 @@
 
 #include <rex/ui/menu_item.h>
 
+#include <rex/platform.h>
+
 namespace rex {
 namespace ui {
 
@@ -26,6 +28,16 @@ std::unique_ptr<MenuItem> MenuItem::Create(Type type, const std::string& text,
                                            std::function<void()> callback) {
   return MenuItem::Create(type, text, "", std::move(callback));
 }
+
+#if !REX_PLATFORM_WIN32
+std::unique_ptr<MenuItem> MenuItem::Create(Type type, const std::string& text,
+                                           const std::string& hotkey,
+                                           std::function<void()> callback) {
+  // No native menu backend with SDL windowing; the plain item still carries
+  // text/hotkey/callback state for callers that walk the tree themselves.
+  return std::unique_ptr<MenuItem>(new MenuItem(type, text, hotkey, std::move(callback)));
+}
+#endif
 
 MenuItem::MenuItem(Type type, const std::string& text, const std::string& hotkey,
                    std::function<void()> callback)

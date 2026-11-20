@@ -263,7 +263,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
 
 // Netplay diagnostics: silence chunks filled because no guest frame was queued (a dropout), and the current
 // output queue depth in guest frames of 256 samples.
-extern "C" __declspec(dllexport) void rex_audio_out_stats(uint64_t* silence_fills, uint32_t* queue_depth) {
+extern "C" REX_DLL_EXPORT void rex_audio_out_stats(uint64_t* silence_fills, uint32_t* queue_depth) {
   *silence_fills = rex::audio::g_out_silence_fills.load(std::memory_order_relaxed);
   *queue_depth = rex::audio::g_out_queue_depth.load(std::memory_order_relaxed);
 }

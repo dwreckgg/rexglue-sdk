@@ -235,8 +235,10 @@ set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_TEST OFF CACHE BOOL "" FORCE)
 set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
 
-# Disable unused subsystems
-set(SDL_VIDEO OFF CACHE BOOL "" FORCE)
+# Video provides the windowing/event layer; presenters create their own
+# D3D12/Vulkan surfaces from native handles, so SDL_RENDER and the SDL
+# graphics API integrations stay off.
+set(SDL_VIDEO ON CACHE BOOL "" FORCE)
 set(SDL_RENDER OFF CACHE BOOL "" FORCE)
 set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
 set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
@@ -260,8 +262,11 @@ set(SDL_DISKAUDIO OFF CACHE BOOL "" FORCE)
 set(SDL_DUMMYAUDIO OFF CACHE BOOL "" FORCE)
 set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
 
-# Linux audio backends
+# Linux video and audio backends. Both video drivers are always built so the
+# one in use stays a runtime choice.
 if(UNIX AND NOT APPLE)
+    set(SDL_X11               ON  CACHE BOOL "" FORCE)
+    set(SDL_WAYLAND           ON  CACHE BOOL "" FORCE)
     set(SDL_ALSA              ON  CACHE BOOL "" FORCE)
     set(SDL_ALSA_SHARED       ON  CACHE BOOL "" FORCE)
     set(SDL_PULSEAUDIO        ON  CACHE BOOL "" FORCE)
@@ -361,6 +366,13 @@ if(REXGLUE_ENABLE_TRACY)
             TRACY_MANUAL_LIFETIME
             TRACY_FIBERS
     )
+
+    # Tracy's Linux crash handler is a sigaction(SIGSEGV) installed when the profiler starts, after the runtime's own:
+    # it replaced the handler that serves the guest's write-watched pages, so the first watched write ended the
+    # process. Windows keeps it (a vectored handler there).
+    if(NOT WIN32)
+        target_compile_definitions(TracyClient PRIVATE TRACY_NO_CRASH_HANDLER)
+    endif()
 
     target_compile_options(TracyClient PRIVATE -w)
 

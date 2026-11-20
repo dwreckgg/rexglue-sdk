@@ -60,6 +60,11 @@ REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
     .range(0, 16)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_STRING(video_driver, "", "UI/Window",
+                      "SDL video driver to use, such as \"wayland\" or \"x11\". Empty picks "
+                      "SDL's default for the session")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_INT32(video_mode_width, 1280, "GPU", "Guest video mode width in pixels")
     .range(640, 0x0FFF)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -446,6 +451,21 @@ void Window::ReleaseMouse() {
   }
 }
 
+void Window::SetTextInputActive(bool active) {
+  if (text_input_active_ == active) {
+    return;
+  }
+  text_input_active_ = active;
+  if (!CanApplyState()) {
+    return;
+  }
+  WindowDestructionReceiver destruction_receiver(this);
+  ApplyNewTextInputActive();
+  if (destruction_receiver.IsWindowDestroyedOrStateInapplicable()) {
+    return;
+  }
+}
+
 void Window::SetCursorVisibility(CursorVisibility new_cursor_visibility) {
   if (cursor_visibility_ == new_cursor_visibility) {
     return;
@@ -503,9 +523,16 @@ void Window::OnSurfaceChanged(bool new_surface_potentially_exists) {
     return;
   }
 
-  presenter_surface_ = CreateSurface(presenter_->GetSupportedSurfaceTypes());
+  Surface::TypeFlags supported_types = presenter_->GetSupportedSurfaceTypes();
+  presenter_surface_ = CreateSurface(supported_types);
   if (presenter_surface_) {
     presenter_->SetWindowSurfaceFromUIThread(this, presenter_surface_.get());
+  } else if (phase_ == Phase::kOpen) {
+    // Usually a session whose native surface extension the driver lacks.
+    REXLOG_ERROR(
+        "No presentable surface for this window. The graphics provider supports surface types "
+        "{:#x}. Set the video_driver cvar to force a different session type.",
+        supported_types);
   }
 }
 
@@ -615,6 +642,42 @@ void Window::OnFocusUpdate(bool new_has_focus, WindowDestructionReceiver& destru
     }
     RequestFullscreenExclusiveUpdate(has_focus_ ? "the window got the focus" : "focus loss");
   }
+}
+
+bool Window::SendCloseRequestToListeners(WindowDestructionReceiver& destruction_receiver) {
+  if (!CanSendEventsToListeners()) {
+    return true;
+  }
+  UIEvent e(this);
+  // Snapshot: listeners may add/remove listeners or destroy the window from
+  // within the callback, and a veto must stop iteration immediately.
+  std::vector<WindowListener*> listeners(listeners_);
+  for (WindowListener* listener : listeners) {
+    bool proceed = listener->OnCloseRequested(e);
+    if (destruction_receiver.IsWindowDestroyed()) {
+      return false;
+    }
+    if (!proceed) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void Window::OnMinimized(WindowDestructionReceiver& destruction_receiver) {
+  if (!CanSendEventsToListeners()) {
+    return;
+  }
+  UIEvent e(this);
+  SendEventToListeners([&e](auto listener) { listener->OnMinimized(e); }, destruction_receiver);
+}
+
+void Window::OnRestored(WindowDestructionReceiver& destruction_receiver) {
+  if (!CanSendEventsToListeners()) {
+    return;
+  }
+  UIEvent e(this);
+  SendEventToListeners([&e](auto listener) { listener->OnRestored(e); }, destruction_receiver);
 }
 
 void Window::OnPaint(bool force_paint) {

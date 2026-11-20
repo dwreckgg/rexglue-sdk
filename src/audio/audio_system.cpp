@@ -440,7 +440,7 @@ void AudioSystem::Resume() {
 }  // namespace rex::audio
 
 // Netplay audio lockstep (see g_audio_lockstep): on = 1 starts it (budget = callbacks done so far), 0 stops it
-extern "C" __declspec(dllexport) void rex_audio_lockstep(int on) {
+extern "C" REX_DLL_EXPORT void rex_audio_lockstep(int on) {
   {
     std::lock_guard lock(rex::audio::g_audio_mutex);
     rex::audio::g_audio_budget = rex::audio::g_audio_done.load();
@@ -451,9 +451,9 @@ extern "C" __declspec(dllexport) void rex_audio_lockstep(int on) {
   rex::audio::g_audio_cv.notify_all();
 }
 // Sampler: the worker's guest context while it runs a guest callback, else nullptr
-extern "C" __declspec(dllexport) void* rex_audio_callback_context() { return rex::audio::g_audio_cb_ctx.load(std::memory_order_relaxed); }
+extern "C" REX_DLL_EXPORT void* rex_audio_callback_context() { return rex::audio::g_audio_cb_ctx.load(std::memory_order_relaxed); }
 // Allows n more audio callbacks and waits until they ran (1) or timeout_ms passed (0)
-extern "C" __declspec(dllexport) int rex_audio_advance(uint32_t n, int timeout_ms) {
+extern "C" REX_DLL_EXPORT int rex_audio_advance(uint32_t n, int timeout_ms) {
   std::unique_lock lock(rex::audio::g_audio_mutex);
   rex::audio::g_audio_budget += n;
   rex::audio::g_audio_cv.notify_all();
@@ -465,7 +465,7 @@ extern "C" __declspec(dllexport) int rex_audio_advance(uint32_t n, int timeout_m
 // Netplay: the guest audio callback reads the time base once per call; in the lockstep the game gives that thread a
 // time derived from the callback number instead of the host clock. Returns 1 and the callback number since the
 // lockstep start when the calling thread is the audio worker in the lockstep, else 0.
-extern "C" __declspec(dllexport) int rex_audio_worker_callback(uint64_t* index) {
+extern "C" REX_DLL_EXPORT int rex_audio_worker_callback(uint64_t* index) {
   if (!rex::audio::g_audio_lockstep || rex::thread::current_thread_system_id() != rex::audio::g_audio_worker_tid) return 0;
   *index = rex::audio::g_audio_done - rex::audio::g_audio_lock_base;
   return 1;
@@ -474,6 +474,6 @@ extern "C" __declspec(dllexport) int rex_audio_worker_callback(uint64_t* index) 
 // Netplay: how many audio clients the guest has registered. The guest registers on its own thread,
 // so the count read at a frame boundary is the same in every run of a lockstep session: the
 // callbacks start at the first boundary after the registration.
-extern "C" __declspec(dllexport) uint32_t rex_audio_registrations() {
+extern "C" REX_DLL_EXPORT uint32_t rex_audio_registrations() {
   return rex::audio::g_audio_registrations.load(std::memory_order_acquire);
 }
