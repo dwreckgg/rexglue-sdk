@@ -1986,9 +1986,28 @@ bool PhysicalHeap::ProtectUntimed(uint32_t address, uint32_t size, uint32_t prot
     }
   }
 
+  // old_protect is read from the parent's host, which a table-only change may
+  // have left writable under a read-only table entry (the mark). Report what
+  // today's path would: the table's access for a marked first page, read
+  // before the change (cvar cheap_physical_protect; nothing the guest can query
+  // changes). With no mark the value is the host's, as today.
+  bool old_protect_page_marked = false;
+  uint32_t old_protect_page_protect = 0;
+  if (old_protect) {
+    const uint32_t parent_address = GetPhysicalAddress(address);
+    if (parent_heap_->QueryHostKeptWritable(parent_address, &old_protect_page_marked) &&
+        old_protect_page_marked) {
+      parent_heap_->QueryProtect(parent_address, &old_protect_page_protect);
+    }
+  }
+
   if (!parent_heap_->Protect(GetPhysicalAddress(address), size, protect, old_protect)) {
     REXSYS_ERROR("PhysicalHeap::Protect failed due to parent heap failure");
     return false;
+  }
+
+  if (old_protect_page_marked) {
+    *old_protect = FromPageAccess(ToPageAccess(old_protect_page_protect));
   }
 
   return BaseHeap::Protect(address, size, protect);

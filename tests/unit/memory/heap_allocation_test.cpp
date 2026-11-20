@@ -1598,11 +1598,8 @@ TEST_CASE("physprotect 23: old_protect requested on a change to RW takes the ful
   auto before = heap->protect_stats();
   REQUIRE(heap->Protect(a, kViewPage, kRW, &old_protect));
   auto d = StatsDelta(before, heap->protect_stats());
-  // The full path wrote the out value. Which value it should be after a
-  // table-only change is open (fix round 1): today's base gives
-  // kMemoryProtectRead; this code reads the parent's host, which the
-  // table-only change left read/write, and gives Read|Write.
-  CHECK(old_protect != 0xFFFFFFFFu);
+  // What base reports: the page was R before this call (fix round 2 ruling).
+  CHECK(old_protect == rex::memory::kMemoryProtectRead);
   CHECK(TableProtect(heap, a) == kRW);
   CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
   CHECK(ParentHost(memory, heap, a) == PageAccess::kReadWrite);
@@ -1707,6 +1704,35 @@ TEST_CASE("physprotect 26: AllocFixed commit over a committed marked page clears
   auto before = heap->protect_stats();
   REQUIRE(heap->Protect(a, kViewPage, kRW));
   auto d = StatsDelta(before, heap->protect_stats());
+  CHECK(TableProtect(heap, a) == kRW);
+  CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
+  CHECK(ParentHost(memory, heap, a) == PageAccess::kReadWrite);
+  CHECK_FALSE(Marked(heap, a));
+  CHECK(d.calls == 1);
+  CHECK(d.table_only_calls == 0);
+  CHECK(d.host_calls == 2);
+
+  alloc.Release();
+}
+
+TEST_CASE("physprotect 27: old_protect after a table-only change to RWC reports read/write",
+          "[memory][physprotect]") {
+  auto& memory = GetTestMemory();
+  Switches switches(true, true);
+  PhysicalHeap* heap = ViewHeap(memory);
+  REQUIRE(heap != nullptr);
+  ViewAlloc alloc(heap, kViewPage, kRW);
+  const uint32_t a = alloc.address();
+  RequireFreshReadWrite(memory, heap, a);
+  REQUIRE(heap->Protect(a, kViewPage, kRWC));
+  REQUIRE(Marked(heap, a));
+
+  uint32_t old_protect = 0xFFFFFFFFu;
+  auto before = heap->protect_stats();
+  REQUIRE(heap->Protect(a, kViewPage, kRW, &old_protect));
+  auto d = StatsDelta(before, heap->protect_stats());
+  // What base reports: 9 is host read/write (fix round 2 ruling).
+  CHECK(old_protect == (rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite));
   CHECK(TableProtect(heap, a) == kRW);
   CHECK(ViewHost(memory, a) == PageAccess::kReadWrite);
   CHECK(ParentHost(memory, heap, a) == PageAccess::kReadWrite);
