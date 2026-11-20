@@ -38,9 +38,10 @@ REXCVAR_DEFINE_BOOL(protect_on_release, false, "Memory",
 
 REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allocated heap memory");
 
-REXCVAR_DEFINE_BOOL(cheap_physical_protect, false, "Memory",
+REXCVAR_DEFINE_BOOL(cheap_physical_protect, true, "Memory",
                     "Change physical memory between read only and read/write in the page tables "
-                    "only, without host protection calls, when no page of the range is watched");
+                    "only, without host protection calls, when no page of the range is watched. "
+                    "false goes back to the old path (a host protection call on every change)");
 
 REXCVAR_DEFINE_BOOL(physical_protect_timing, false, "Memory",
                     "Count and time guest protection changes on physical memory and log the "
@@ -842,7 +843,8 @@ uint32_t PageAccessRank(rex::memory::PageAccess access) {
 
 // Host protection calls made by BaseHeap::Protect on this thread while the cvar
 // physical_protect_timing is on; PhysicalHeap::Protect reads their deltas, so
-// virtual heaps' calls are never counted.
+// virtual heaps' calls are never counted. The stats' total_ns (whole call)
+// includes the wait for the global lock.
 thread_local uint64_t host_protect_calls_on_thread = 0;
 thread_local uint64_t host_protect_ns_on_thread = 0;
 
@@ -1986,18 +1988,25 @@ bool PhysicalHeap::ProtectUntimed(uint32_t address, uint32_t size, uint32_t prot
     }
   }
 
-  // old_protect is read from the parent's host, which a table-only change may
-  // have left writable under a read-only table entry (the mark). Report what
-  // today's path would: the table's access for a marked first page, read
-  // before the change (cvar cheap_physical_protect; nothing the guest can query
-  // changes). With no mark the value is the host's, as today.
-  bool old_protect_page_marked = false;
-  uint32_t old_protect_page_protect = 0;
+  // old_protect is read from the parent's host, which a table-only change
+  // (cvar cheap_physical_protect) may have left more permissive than the
+  // parent's table says: a marked page, or an unmarked 9 page changed to 1.
+  // Today's path keeps that host at ToPageAccess of the table, so report the
+  // host's value capped at the access of the parent table's first page, read
+  // before the change; where the host is no more permissive, its value
+  // stands, as today. With both cvars off a non-null old_protect still takes
+  // the parent's mutex once for this read (no caller passes old_protect for a
+  // physical heap).
+  bool old_protect_table_read = false;
+  uint32_t old_protect_table_protect = 0;
   if (old_protect) {
     const uint32_t parent_address = GetPhysicalAddress(address);
-    if (parent_heap_->QueryHostKeptWritable(parent_address, &old_protect_page_marked) &&
-        old_protect_page_marked) {
-      parent_heap_->QueryProtect(parent_address, &old_protect_page_protect);
+    // QueryProtect's own bound test lets the page one past the table through.
+    if (parent_address >= parent_heap_->heap_base() &&
+        (parent_address - parent_heap_->heap_base()) / parent_heap_->page_size() <
+            parent_heap_->total_page_count()) {
+      old_protect_table_read =
+          parent_heap_->QueryProtect(parent_address, &old_protect_table_protect);
     }
   }
 
@@ -2006,8 +2015,11 @@ bool PhysicalHeap::ProtectUntimed(uint32_t address, uint32_t size, uint32_t prot
     return false;
   }
 
-  if (old_protect_page_marked) {
-    *old_protect = FromPageAccess(ToPageAccess(old_protect_page_protect));
+  if (old_protect_table_read) {
+    const rex::memory::PageAccess table_access = ToPageAccess(old_protect_table_protect);
+    if (PageAccessRank(ToPageAccess(*old_protect)) > PageAccessRank(table_access)) {
+      *old_protect = FromPageAccess(table_access);
+    }
   }
 
   return BaseHeap::Protect(address, size, protect);
