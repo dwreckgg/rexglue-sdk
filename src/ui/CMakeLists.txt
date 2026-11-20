@@ -11,12 +11,9 @@ set(REXUI_CORE_SOURCES
     menu_item.cpp
     presenter.cpp
     renderdoc_api.cpp
-    sdl_virtual_key.cpp
     window.cpp
-    window_sdl.cpp
     windowed_app.cpp
     windowed_app_context.cpp
-    windowed_app_context_sdl.cpp
 )
 
 # Optional overlay dialogs
@@ -65,9 +62,14 @@ if(WIN32)
         windowed_app_context_win.cpp
     )
 else()
-    # The window is SDL's (window_sdl.cpp, windowed_app_context_sdl.cpp)
+    # The window is SDL's (window_sdl.cpp, windowed_app_context_sdl.cpp, with
+    # sdl_virtual_key.cpp); Windows keeps its own window above and does not
+    # compile these.
     set(REXUI_PLATFORM_SOURCES
         surface_gnulinux.cpp
+        sdl_virtual_key.cpp
+        window_sdl.cpp
+        windowed_app_context_sdl.cpp
     )
 endif()
 
@@ -101,8 +103,13 @@ target_link_libraries(rexui PUBLIC
     rexcore
     renderdoc
     imgui::imgui
-    SDL3::SDL3
 )
+# The SDL window (non-Windows only, see REXUI_PLATFORM_SOURCES) needs SDL3.
+if(NOT WIN32)
+    target_link_libraries(rexui PUBLIC
+        SDL3::SDL3
+    )
+endif()
 target_link_libraries(rexui PRIVATE utf8cpp)
 
 if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include")
