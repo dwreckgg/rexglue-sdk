@@ -1428,9 +1428,11 @@ void XHostThread::Execute() {
   // Let the kernel know we are starting.
   kernel_state_->OnThreadExecute(this);
 
+#if !REX_PLATFORM_WIN32
   // A host thread runs guest callbacks too (the audio worker): its FPSCR shadow starts from the host's, every
   // exception masked, as XThread::Execute's (upstream KernelThread::Execute does both).
   thread_state_->context()->fpscr.InitHost();
+#endif
 
   int ret = host_fn_();
 
