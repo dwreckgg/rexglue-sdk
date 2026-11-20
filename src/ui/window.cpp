@@ -60,10 +60,13 @@ REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
     .range(0, 16)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+#if !REX_PLATFORM_WIN32
+// Read only by the SDL window (windowed_app_context_sdl.cpp), which Windows does not build.
 REXCVAR_DEFINE_STRING(video_driver, "", "UI/Window",
                       "SDL video driver to use, such as \"wayland\" or \"x11\". Empty picks "
                       "SDL's default for the session")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
 
 REXCVAR_DEFINE_INT32(video_mode_width, 1280, "GPU", "Guest video mode width in pixels")
     .range(640, 0x0FFF)
