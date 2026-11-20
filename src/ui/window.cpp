@@ -530,13 +530,16 @@ void Window::OnSurfaceChanged(bool new_surface_potentially_exists) {
   presenter_surface_ = CreateSurface(supported_types);
   if (presenter_surface_) {
     presenter_->SetWindowSurfaceFromUIThread(this, presenter_surface_.get());
-  } else if (phase_ == Phase::kOpen) {
+  }
+#if !REX_PLATFORM_WIN32
+  else if (phase_ == Phase::kOpen) {
     // Usually a session whose native surface extension the driver lacks.
     REXLOG_ERROR(
         "No presentable surface for this window. The graphics provider supports surface types "
         "{:#x}. Set the video_driver cvar to force a different session type.",
         supported_types);
   }
+#endif
 }
 
 void Window::OnBeforeClose(WindowDestructionReceiver& destruction_receiver) {
