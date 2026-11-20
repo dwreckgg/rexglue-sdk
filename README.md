@@ -50,6 +50,7 @@ This project is not intended to promote piracy nor unauthorized use of copyright
 - [sanjay900](https://github.com/sanjay900) - Linux / SDL Contributor
 - [Toby](https://github.com/TbyDtch) - Project Support
 - [Roxxsen](https://github.com/Roxxsen) - CI/CD Contributor
+- [cerroverb](https://github.com/cerroverb) - native Linux port (SDL window, Wayland, Steam Deck)
 
 The list above is not exhaustive. Thanks to everyone in the ReXGlue community who contributes code, files issues, tests builds, and keeps the project moving.
 
