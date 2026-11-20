@@ -120,10 +120,11 @@ union PageEntry {
     // Allocation state of the page as a MemoryAllocationFlag bit mask.
     uint32_t state : 2;
     // Set when this page's protection was last written by the table-only path
-    // (cvar cheap_physical_protect) while its host views were writable: the
-    // host may be writable although current_protect says read only. Cleared by
-    // every full Protect, Alloc*, Decommit, Release, Restore and Reset.
-    // qword bit 62.
+    // (cvar cheap_physical_protect) while this table's own host mapping was
+    // writable: that mapping may be writable although current_protect says
+    // read only. Each table's mark speaks for its own mapping only (the view's
+    // and the parent's are separate). Cleared by every full Protect, Alloc*,
+    // Decommit, Release, Restore and Reset. qword bit 62.
     uint32_t host_kept_writable : 1;
     uint32_t reserved : 14;
   };
@@ -226,16 +227,32 @@ class BaseHeap {
   // false for an address outside the heap.
   bool QueryHostKeptWritable(uint32_t address, bool* out_marked);
 
+  bool Save(stream::ByteStream* stream);
+  bool Restore(stream::ByteStream* stream);
+
+  void Reset();
+
+ protected:
+  // PhysicalHeap reaches its parent's (a VirtualHeap's) table-only members.
+  friend class PhysicalHeap;
+
+  BaseHeap();
+
+  void Initialize(memory::Memory* memory, uint8_t* membase, HeapType heap_type, uint32_t heap_base,
+                  uint32_t heap_size, uint32_t page_size, uint32_t host_address_offset = 0);
+
   // Table-only protection change (cvar cheap_physical_protect), split in a
   // check and a commit so that a caller can check two tables before writing
   // either. Both require the caller to hold heap_mutex() from the check through
   // the commit, and make no host call.
   //
   // Check: the checks of Protect in its order (no log line on failure), then
-  // every page's current_protect must be in class "read" or "read/write", and
-  // when to_read_write every page must be in class "read/write" or carry the
-  // mark. Returns the page range on success.
-  bool ProtectTableOnlyCheck(uint32_t address, uint32_t size, bool to_read_write,
+  // every page's current_protect must be in class "read" or "read/write"; an
+  // unmarked page whose host access (ToPageAccess) for current_protect is
+  // stricter than for the new protection fails (the host call would raise
+  // it); and when to_read_write every page must be in class "read/write" or
+  // carry the mark. Returns the page range on success.
+  bool ProtectTableOnlyCheck(uint32_t address, uint32_t size, uint32_t protect, bool to_read_write,
                              uint32_t* out_start_page_number, uint32_t* out_end_page_number);
   // Commit: writes current_protect for the checked page range; sets the mark
   // (to class "read") on pages in class "read/write" or already marked, clears
@@ -244,17 +261,6 @@ class BaseHeap {
                               uint32_t protect, bool to_read_write);
 
   std::recursive_mutex& heap_mutex() { return heap_mutex_; }
-
-  bool Save(stream::ByteStream* stream);
-  bool Restore(stream::ByteStream* stream);
-
-  void Reset();
-
- protected:
-  BaseHeap();
-
-  void Initialize(memory::Memory* memory, uint8_t* membase, HeapType heap_type, uint32_t heap_base,
-                  uint32_t heap_size, uint32_t page_size, uint32_t host_address_offset = 0);
 
   memory::Memory* memory_;
   uint8_t* membase_;

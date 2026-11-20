@@ -825,6 +825,21 @@ bool IsProtectClassReadWrite(uint32_t protect) {
          !(protect & memory::kMemoryProtectNoCache);
 }
 
+// Order of host access for the table-only path's host access test: no access,
+// read only, read/write.
+uint32_t PageAccessRank(rex::memory::PageAccess access) {
+  switch (access) {
+    case rex::memory::PageAccess::kReadWrite:
+    case rex::memory::PageAccess::kExecuteReadWrite:
+      return 2;
+    case rex::memory::PageAccess::kReadOnly:
+    case rex::memory::PageAccess::kExecuteReadOnly:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
 // Host protection calls made by BaseHeap::Protect on this thread while the cvar
 // physical_protect_timing is on; PhysicalHeap::Protect reads their deltas, so
 // virtual heaps' calls are never counted.
@@ -839,7 +854,7 @@ uint64_t NanosecondsSince(std::chrono::steady_clock::time_point start) {
 
 // The one place the stats line is built.
 void LogPhysicalProtectStats(uint32_t heap_base, const PhysicalProtectStats& stats) {
-  REXSYS_DEBUG(
+  REXSYS_INFO(
       "physical protect: heap {:08X} calls {} table_only {} host_calls {} total_us {} host_us {}",
       heap_base, stats.calls, stats.table_only_calls, stats.host_calls, stats.total_ns / 1000,
       stats.host_ns / 1000);
@@ -1623,8 +1638,8 @@ bool BaseHeap::QueryHostKeptWritable(uint32_t address, bool* out_marked) {
   return true;
 }
 
-bool BaseHeap::ProtectTableOnlyCheck(uint32_t address, uint32_t size, bool to_read_write,
-                                     uint32_t* out_start_page_number,
+bool BaseHeap::ProtectTableOnlyCheck(uint32_t address, uint32_t size, uint32_t protect,
+                                     bool to_read_write, uint32_t* out_start_page_number,
                                      uint32_t* out_end_page_number) {
   // The checks of Protect, in its order, without its log lines (a failure here
   // sends the call down the full path, which logs).
@@ -1659,11 +1674,19 @@ bool BaseHeap::ProtectTableOnlyCheck(uint32_t address, uint32_t size, bool to_re
     return false;
   }
 
-  // The class test, and for a change to read/write the mark test.
+  // The class test; the host access test (an unmarked page whose host access
+  // today is stricter than the new value's would have it raised by the host
+  // call, e.g. plain read 1 to read + write combine 9); and for a change to
+  // read/write the mark test.
+  const uint32_t new_access_rank = PageAccessRank(ToPageAccess(protect));
   for (uint32_t page_number = start_page_number; page_number <= end_page_number; ++page_number) {
     const PageEntry& page_entry = page_table_[page_number];
     bool current_read_write = IsProtectClassReadWrite(page_entry.current_protect);
     if (!current_read_write && !IsProtectClassRead(page_entry.current_protect)) {
+      return false;
+    }
+    if (!page_entry.host_kept_writable &&
+        PageAccessRank(ToPageAccess(page_entry.current_protect)) < new_access_rank) {
       return false;
     }
     if (to_read_write && !current_read_write && !page_entry.host_kept_writable) {
@@ -2240,7 +2263,8 @@ bool PhysicalHeap::ProtectBothTablesOnly(uint32_t address, uint32_t size, uint32
   std::lock_guard<std::recursive_mutex> view_lock(heap_mutex_);
   std::lock_guard<std::recursive_mutex> parent_lock(parent_heap_->heap_mutex());
   uint32_t view_start_page, view_end_page;
-  if (!ProtectTableOnlyCheck(address, size, to_read_write, &view_start_page, &view_end_page)) {
+  if (!ProtectTableOnlyCheck(address, size, protect, to_read_write, &view_start_page,
+                             &view_end_page)) {
     return false;
   }
   // A change to read only on a watched page keeps the full path (the watch has
@@ -2249,8 +2273,8 @@ bool PhysicalHeap::ProtectBothTablesOnly(uint32_t address, uint32_t size, uint32
     return false;
   }
   uint32_t parent_start_page, parent_end_page;
-  if (!parent_heap_->ProtectTableOnlyCheck(GetPhysicalAddress(address), size, to_read_write,
-                                           &parent_start_page, &parent_end_page)) {
+  if (!parent_heap_->ProtectTableOnlyCheck(GetPhysicalAddress(address), size, protect,
+                                           to_read_write, &parent_start_page, &parent_end_page)) {
     return false;
   }
   parent_heap_->ProtectTableOnlyCommit(parent_start_page, parent_end_page, protect, to_read_write);
