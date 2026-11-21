@@ -1,7 +1,9 @@
 # Third-party notices
 
-This SDK (BSD 3-Clause, see LICENSE) builds on and bundles the following. Each library's full licence is in its folder
-under thirdparty/ (RenderDoc's at the top of thirdparty/renderdoc/renderdoc_app.h).
+This SDK (BSD 3-Clause, see LICENSE) builds on and bundles third-party code. The list below is not complete: it names
+the code the native Linux port brings in or relies on. Every other bundled library keeps its own licence in its folder
+under thirdparty/ (FFmpeg, for one, is LGPL), and each listed library's full licence is in its folder there too
+(RenderDoc's at the top of thirdparty/renderdoc/renderdoc_app.h). The Xenia and ReXGlue licence text is in LICENSE.
 
 - Xenia (https://github.com/xenia-project/xenia): BSD 3-Clause, Copyright (c) 2022, Ben Vanik and Xenia project
   contributors. Many runtime files are derived from Xenia (see each file's header); the RenderDoc attach probe follows
