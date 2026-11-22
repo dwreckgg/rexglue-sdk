@@ -177,9 +177,9 @@ static void TestFourthTargetCounts() {
 
 static void TestNanAlphaBitCopied() {
   Case("nan_alpha_bit_copied");
-  const float one = FromBits(0x3F800000);
+  // RGB of kRgba, never 1.0: clang folds 1.0 * x to x, which would keep the NaN's bits under "RGB x A".
   const float snan = FromBits(0x7F800001);
-  const float rgba[4] = {one, one, one, snan};
+  const float rgba[4] = {kRgba[0], kRgba[1], kRgba[2], snan};
   Result r = Run(kFade, kOneZero, kOneZero, kOneZero, 0x1, true, rgba);
   CHECK(r.choice == HostBlendFactorChoice::kAlphaReplicated);
   CHECK(Bits(r.out[0]) == 0x7F800001);
@@ -201,6 +201,23 @@ static void TestRtMask() {
   CHECK(HostBlendColorRtMask(0x00F0, 0x2) == 0);
 }
 
+// Each constant factor alone in its slot: every other fixture holds 14 together with 15, and 13 only beside 12.
+static void TestSrc14Only() {
+  Case("src14_only");
+  // 0x0001010E: colour src 14 (constant alpha), dest 1 (ONE); alpha src 1 (ONE), dest 0 (ZERO).
+  Result r = Run(0x0001010E, kOneZero, kOneZero, kOneZero, 0x1, true);
+  CHECK(r.choice == HostBlendFactorChoice::kAlphaReplicated);
+  CHECK(SameBits4(r.out, kAAAA));
+}
+
+static void TestDest13Mixed() {
+  Case("dest13_mixed");
+  // 0x00010D0E: colour src 14 (constant alpha), dest 13 (one minus constant colour); alpha src 1 (ONE), dest 0.
+  Result r = Run(0x00010D0E, kOneZero, kOneZero, kOneZero, 0x1, true);
+  CHECK(r.choice == HostBlendFactorChoice::kMixed);
+  CHECK(SameBits4(r.out, kRgba));
+}
+
 int main() {
   TestFieldDecode();
   TestFadeDrawReplicates();
@@ -215,6 +232,8 @@ int main() {
   TestFourthTargetCounts();
   TestNanAlphaBitCopied();
   TestRtMask();
+  TestSrc14Only();
+  TestDest13Mixed();
   if (g_failures != 0) {
     std::printf("%d of %d check(s) failed\n", g_failures, g_checks);
     return 1;
