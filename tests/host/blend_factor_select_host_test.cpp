@@ -218,6 +218,20 @@ static void TestDest13Mixed() {
   CHECK(SameBits4(r.out, kRgba));
 }
 
+// The comb fields are not blend factors: a reading of the raw low byte (0x4E here) in place of color_srcblend misses
+// the only constant-alpha term of this fixture.
+static void TestCombFieldsIgnored() {
+  Case("comb_fields_ignored");
+  // 0x0001014E: colour src 14 (constant alpha), comb 2, dest 1 (ONE); alpha src 1 (ONE), comb 0, dest 0 (ZERO).
+  reg::RB_BLENDCONTROL bc;
+  bc.value = 0x0001014E;
+  CHECK(bc.color_srcblend == xenos::BlendFactor::kConstantAlpha);
+  CHECK(uint32_t(bc.color_comb_fcn) != 0);
+  Result r = Run(0x0001014E, kOneZero, kOneZero, kOneZero, 0x1, true);
+  CHECK(r.choice == HostBlendFactorChoice::kAlphaReplicated);
+  CHECK(SameBits4(r.out, kAAAA));
+}
+
 int main() {
   TestFieldDecode();
   TestFadeDrawReplicates();
@@ -234,6 +248,7 @@ int main() {
   TestRtMask();
   TestSrc14Only();
   TestDest13Mixed();
+  TestCombFieldsIgnored();
   if (g_failures != 0) {
     std::printf("%d of %d check(s) failed\n", g_failures, g_checks);
     return 1;

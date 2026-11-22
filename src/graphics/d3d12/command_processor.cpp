@@ -3669,9 +3669,13 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
       blend_controls[i] = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
     }
     const bool constant_alpha_blend_factor = REXCVAR_GET(d3d12_constant_alpha_blend_factor);
-    static std::atomic<bool> s_constant_alpha_blend_factor_logged{false};
-    if (!s_constant_alpha_blend_factor_logged.load(std::memory_order_relaxed) &&
-        !s_constant_alpha_blend_factor_logged.exchange(true)) {
+    // Logged at the first host-path draw and again whenever the value changes: the cvar is hot-reloadable and the F4
+    // settings overlay can set it at any moment, so the log states the value in force (-1 = not logged yet).
+    static std::atomic<int> s_constant_alpha_blend_factor_logged{-1};
+    const int constant_alpha_blend_factor_now = constant_alpha_blend_factor ? 1 : 0;
+    if (s_constant_alpha_blend_factor_logged.load(std::memory_order_relaxed) != constant_alpha_blend_factor_now &&
+        s_constant_alpha_blend_factor_logged.exchange(constant_alpha_blend_factor_now) !=
+            constant_alpha_blend_factor_now) {
       REXGPU_INFO("D3D12: constant alpha blend factor {} (d3d12_constant_alpha_blend_factor)",
                   constant_alpha_blend_factor ? "true" : "false");
     }
