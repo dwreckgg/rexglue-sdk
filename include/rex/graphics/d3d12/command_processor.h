@@ -408,7 +408,9 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   void UpdateFixedFunctionState(const draw_util::ViewportInfo& viewport_info,
                                 const draw_util::Scissor& scissor, bool primitive_polygonal,
-                                reg::RB_DEPTHCONTROL normalized_depth_control);
+                                reg::RB_DEPTHCONTROL normalized_depth_control,
+                                uint32_t normalized_color_mask,
+                                uint32_t bound_depth_and_color_render_target_bits);
   void UpdateSystemConstantValues(bool shared_memory_is_uav, bool primitive_polygonal,
                                   uint32_t line_loop_closing_index, xenos::Endian index_endian,
                                   const draw_util::ViewportInfo& viewport_info,

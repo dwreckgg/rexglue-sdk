@@ -21,6 +21,7 @@
 #include <rex/pace_stats.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
+#include <rex/graphics/d3d12/blend_factor_select.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
@@ -36,6 +37,10 @@
 
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(d3d12_constant_alpha_blend_factor, true, "GPU/D3D12",
+                    "Constant alpha blending (Xenos factors 14 and 15) uses the blend constant's alpha for the "
+                    "colour channels, as the console does. false = draw as 0.3.7 did (the constant's RGB).");
 
 REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
                     "Read data written by memory export in shaders on the CPU")
@@ -2519,7 +2524,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   scissor.extent[1] *= draw_resolution_scale_y;
 
   // Update viewport, scissor, blend factor and stencil reference.
-  UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
+  UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control,
+                           normalized_color_mask, bound_depth_and_color_render_target_bits);
 
   // Update system constants before uploading them.
   // TODO(Triang3l): With ROV, pass the disabled render target mask for safety.
@@ -3622,7 +3628,8 @@ void D3D12CommandProcessor::ClearCommandAllocatorCache() {
 
 void D3D12CommandProcessor::UpdateFixedFunctionState(
     const draw_util::ViewportInfo& viewport_info, const draw_util::Scissor& scissor,
-    bool primitive_polygonal, reg::RB_DEPTHCONTROL normalized_depth_control) {
+    bool primitive_polygonal, reg::RB_DEPTHCONTROL normalized_depth_control,
+    uint32_t normalized_color_mask, uint32_t bound_depth_and_color_render_target_bits) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -3648,15 +3655,45 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
   if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
     const RegisterFile& regs = *register_file_;
 
-    // Blend factor.
-    float blend_factor[] = {
+    // Blend factor. Xenos constant alpha (factors 14 and 15) maps to D3D12_BLEND_BLEND_FACTOR, which reads the
+    // factor per channel, so a draw blending with constant alpha (and no constant colour) gets (A, A, A, A)
+    // (blend_factor_select.h; issue #23).
+    const float blend_constant[] = {
         regs.Get<float>(XE_GPU_REG_RB_BLEND_RED),
         regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
         regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE),
         regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA),
     };
+    reg::RB_BLENDCONTROL blend_controls[4];
+    for (uint32_t i = 0; i < 4; ++i) {
+      blend_controls[i] = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+    }
+    const bool constant_alpha_blend_factor = REXCVAR_GET(d3d12_constant_alpha_blend_factor);
+    static std::atomic<bool> s_constant_alpha_blend_factor_logged{false};
+    if (!s_constant_alpha_blend_factor_logged.load(std::memory_order_relaxed) &&
+        !s_constant_alpha_blend_factor_logged.exchange(true)) {
+      REXGPU_INFO("D3D12: constant alpha blend factor {} (d3d12_constant_alpha_blend_factor)",
+                  constant_alpha_blend_factor ? "true" : "false");
+    }
+    float blend_factor[4];
+    HostBlendFactorChoice blend_factor_choice = SelectHostBlendFactor(
+        blend_controls,
+        HostBlendColorRtMask(normalized_color_mask, bound_depth_and_color_render_target_bits),
+        constant_alpha_blend_factor, blend_constant, blend_factor);
+    if (blend_factor_choice == HostBlendFactorChoice::kMixed) {
+      static std::atomic<bool> s_mixed_blend_factors_logged{false};
+      if (!s_mixed_blend_factors_logged.load(std::memory_order_relaxed) &&
+          !s_mixed_blend_factors_logged.exchange(true)) {
+        REXGPU_WARN(
+            "D3D12: a draw mixes constant colour and constant alpha blend factors (RB_BLENDCONTROL0-3 = "
+            "{:08X} {:08X} {:08X} {:08X}); drawn with the constant's RGB as before (logged once)",
+            blend_controls[0].value, blend_controls[1].value, blend_controls[2].value,
+            blend_controls[3].value);
+      }
+    }
     // std::memcmp instead of != so in case of NaN, every draw won't be
-    // invalidating it.
+    // invalidating it. The cache holds the factor sent, not the registers, so an ordinary draw after a constant
+    // alpha draw with the same RB_BLEND_RED-ALPHA sends (R, G, B, A) again.
     ff_blend_factor_update_needed_ |=
         std::memcmp(ff_blend_factor_, blend_factor, sizeof(float) * 4) != 0;
     if (ff_blend_factor_update_needed_) {
