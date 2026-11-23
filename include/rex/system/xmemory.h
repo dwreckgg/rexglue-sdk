@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -118,6 +119,13 @@ union PageEntry {
     uint32_t current_protect : 4;
     // Allocation state of the page as a MemoryAllocationFlag bit mask.
     uint32_t state : 2;
+    // Set when this page's protection was last written by the table-only path
+    // (cvar cheap_physical_protect) while this table's own host mapping was
+    // writable: that mapping may be writable although current_protect says
+    // read only. Each table's mark speaks for its own mapping only (the view's
+    // and the parent's are separate). Cleared by every full Protect, Alloc*,
+    // Decommit, Release, Restore and Reset. qword bit 62.
+    uint32_t host_kept_writable : 1;
     uint32_t reserved : 14;
   };
 };
@@ -215,16 +223,44 @@ class BaseHeap {
   // range.
   rex::memory::PageAccess QueryRangeAccess(uint32_t low_address, uint32_t high_address);
 
+  // Reads the host_kept_writable mark of the page holding the address. Returns
+  // false for an address outside the heap.
+  bool QueryHostKeptWritable(uint32_t address, bool* out_marked);
+
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);
 
   void Reset();
 
  protected:
+  // PhysicalHeap reaches its parent's (a VirtualHeap's) table-only members.
+  friend class PhysicalHeap;
+
   BaseHeap();
 
   void Initialize(memory::Memory* memory, uint8_t* membase, HeapType heap_type, uint32_t heap_base,
                   uint32_t heap_size, uint32_t page_size, uint32_t host_address_offset = 0);
+
+  // Table-only protection change (cvar cheap_physical_protect), split in a
+  // check and a commit so that a caller can check two tables before writing
+  // either. Both require the caller to hold heap_mutex() from the check through
+  // the commit, and make no host call.
+  //
+  // Check: the checks of Protect in its order (no log line on failure), then
+  // every page's current_protect must be in class "read" or "read/write"; an
+  // unmarked page whose host access (ToPageAccess) for current_protect is
+  // stricter than for the new protection fails (the host call would raise
+  // it); and when to_read_write every page must be in class "read/write" or
+  // carry the mark. Returns the page range on success.
+  bool ProtectTableOnlyCheck(uint32_t address, uint32_t size, uint32_t protect, bool to_read_write,
+                             uint32_t* out_start_page_number, uint32_t* out_end_page_number);
+  // Commit: writes current_protect for the checked page range; sets the mark
+  // (to class "read") on pages in class "read/write" or already marked, clears
+  // it (to class "read/write").
+  void ProtectTableOnlyCommit(uint32_t start_page_number, uint32_t end_page_number,
+                              uint32_t protect, bool to_read_write);
+
+  std::recursive_mutex& heap_mutex() { return heap_mutex_; }
 
   memory::Memory* memory_;
   uint8_t* membase_;
@@ -249,6 +285,20 @@ class VirtualHeap : public BaseHeap {
   // Initializes the heap properties and allocates the page table.
   void Initialize(memory::Memory* memory, uint8_t* membase, HeapType heap_type, uint32_t heap_base,
                   uint32_t heap_size, uint32_t page_size);
+};
+
+// Counters of PhysicalHeap::Protect, kept only while the cvar
+// physical_protect_timing is on (cumulative per heap).
+struct PhysicalProtectStats {
+  // Calls of PhysicalHeap::Protect on this heap.
+  uint64_t calls;
+  // Those of them that took the table-only path (cvar cheap_physical_protect).
+  uint64_t table_only_calls;
+  // Host protection calls made by BaseHeap::Protect inside those calls.
+  uint64_t host_calls;
+  // Whole-call time, and the time inside those host calls.
+  uint64_t total_ns;
+  uint64_t host_ns;
 };
 
 // A heap for ranges of memory that are mapped to physical ranges.
@@ -290,8 +340,28 @@ class PhysicalHeap : public BaseHeap {
 
   uint32_t GetPhysicalAddress(uint32_t address) const;
 
+  PhysicalProtectStats protect_stats() const;
+
  protected:
+  // Protect without the timer; sets *out_table_only when the table-only path
+  // was taken.
+  bool ProtectUntimed(uint32_t address, uint32_t size, uint32_t protect, uint32_t* old_protect,
+                      bool* out_table_only);
+  // Both tables' table-only change (view, then parent), checked before either
+  // is written. Caller holds the global critical region.
+  bool ProtectBothTablesOnly(uint32_t address, uint32_t size, uint32_t protect,
+                             bool to_read_write);
+  // Whether any system page under the view's guest pages start..end has
+  // notify_on_invalidation set. Caller holds the global critical region.
+  bool AnySystemPageWatched(uint32_t start_page_number, uint32_t end_page_number) const;
+
   VirtualHeap* parent_heap_;
+
+  std::atomic<uint64_t> protect_calls_{0};
+  std::atomic<uint64_t> protect_table_only_calls_{0};
+  std::atomic<uint64_t> protect_host_calls_{0};
+  std::atomic<uint64_t> protect_total_ns_{0};
+  std::atomic<uint64_t> protect_host_ns_{0};
 
   uint32_t system_page_size_;
   uint32_t system_page_count_;
