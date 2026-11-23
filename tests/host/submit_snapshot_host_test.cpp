@@ -161,14 +161,22 @@ static uint64_t StatField(const ss::State& s, const char* name) {
 }
 
 // A guest window [base, base + size) with 4096 canary bytes on both sides.
+// Live(): the live guest bytes the upload was copied from (Task 2: the memcpy's source, passed as `live`), in a
+// buffer of their own as in the SDK. Groups 1-21 treat dest's bytes before the splice as live memory, so Live()
+// copies them, at the call, into that buffer (sized here: no allocation in group 18). Group 22 sets live apart.
 struct Window {
   uint32_t base, size;
   std::vector<uint8_t> buf;
+  std::vector<uint8_t> live_buf;
   static constexpr uint32_t kCanary = 4096;
-  Window(uint32_t b, uint32_t n) : base(b), size(n), buf(n + 2 * kCanary, 0xCC) {
+  Window(uint32_t b, uint32_t n) : base(b), size(n), buf(n + 2 * kCanary, 0xCC), live_buf(n) {
     for (uint32_t i = 0; i < n; ++i) dest()[i] = PatB(b + i);
   }
   uint8_t* dest() { return buf.data() + kCanary; }
+  const uint8_t* Live() {
+    std::memcpy(live_buf.data(), dest(), size);
+    return live_buf.data();
+  }
   uint8_t at(uint32_t address) { return dest()[address - base]; }
   void FillFrom(const FakeMem& m) {
     for (uint32_t i = 0; i < size; ++i) dest()[i] = m.bytes[base + i];
@@ -206,7 +214,7 @@ static void TestSpliceTwoRanges() {
   CHECK(c.copied == 2 && c.bytes == 384 + 768);
   Boundary(*s, 6, true, &inv);  // frame 7
   Window w(0x1000, 4096);
-  s->GpuSplice(0x1000, 4096, w.dest(), 12);
+  s->GpuSplice(0x1000, 4096, w.dest(), w.Live(), 12);
   CHECK(AllPat(w, 0x1100, 384, true));
   CHECK(AllPat(w, 0x1800, 768, true));
   CHECK(AllPat(w, 0x1000, 0x100, false));
@@ -225,13 +233,13 @@ static void TestRangeAcrossPageEdge() {
   CHECK(c.copied == 1);
   std::vector<ss::Range> diff;
   Window w1(0x1000, 4096);
-  ss::SpliceResult a = ring.Splice(1, 0x1000, 4096, w1.dest(), {&r, 1}, &diff);
+  ss::SpliceResult a = ring.Splice(1, 0x1000, 4096, w1.dest(), w1.Live(), {&r, 1}, &diff);
   CHECK(a.missing == ss::Missing::kNone && a.spliced == 1);
   CHECK(AllPat(w1, 0x1F00, 0x100, true));
   CHECK(AllPat(w1, 0x1000, 0xF00, false));
   CHECK(w1.CanariesIntact());
   Window w2(0x2000, 4096);
-  ss::SpliceResult b = ring.Splice(1, 0x2000, 4096, w2.dest(), {&r, 1}, &diff);
+  ss::SpliceResult b = ring.Splice(1, 0x2000, 4096, w2.dest(), w2.Live(), {&r, 1}, &diff);
   CHECK(b.missing == ss::Missing::kNone && b.spliced == 1);
   CHECK(AllPat(w2, 0x2000, 0x100, true));
   CHECK(AllPat(w2, 0x2100, 0xF00, false));
@@ -248,18 +256,18 @@ static void TestCopyMissingReasons() {
   std::vector<ss::Range> diff;
   Window w(0x1000, 4096);
   std::vector<uint8_t> saved(w.dest(), w.dest() + 4096);
-  ss::SpliceResult a = ring.Splice(3, 0x1000, 4096, w.dest(), {&r, 1}, &diff);
+  ss::SpliceResult a = ring.Splice(3, 0x1000, 4096, w.dest(), w.Live(), {&r, 1}, &diff);
   CHECK(a.missing == ss::Missing::kReused);
   CHECK(std::memcmp(saved.data(), w.dest(), 4096) == 0);
-  ss::SpliceResult b = ring.Splice(11, 0x1000, 4096, w.dest(), {&r, 1}, &diff);
+  ss::SpliceResult b = ring.Splice(11, 0x1000, 4096, w.dest(), w.Live(), {&r, 1}, &diff);
   CHECK(b.missing == ss::Missing::kNotYet);
   CHECK(std::memcmp(saved.data(), w.dest(), 4096) == 0);
   // Never written: slot 1.
-  ss::SpliceResult n = ring.Splice(5, 0x1000, 4096, w.dest(), {&r, 1}, &diff);
+  ss::SpliceResult n = ring.Splice(5, 0x1000, 4096, w.dest(), w.Live(), {&r, 1}, &diff);
   CHECK(n.missing == ss::Missing::kNotYet);
   CHECK(std::memcmp(saved.data(), w.dest(), 4096) == 0);
   // The slot's own frame splices (positive companion).
-  ss::SpliceResult k = ring.Splice(7, 0x1000, 4096, w.dest(), {&r, 1}, &diff);
+  ss::SpliceResult k = ring.Splice(7, 0x1000, 4096, w.dest(), w.Live(), {&r, 1}, &diff);
   CHECK(k.missing == ss::Missing::kNone && k.spliced == 1 && k.differing == 1);
   CHECK(diff.size() == 1 && diff[0].address == 0x1100 && diff[0].size == 64);
   CHECK(AllPat(w, 0x1100, 64, true));
@@ -277,7 +285,7 @@ static void TestKeptSpans() {
   s->GuestSwap(2, MemRead, &mem, false);
   Window w(0x1000, 0x4000);
   w.FillFrom(mem);  // copy == live
-  s->GpuSplice(0x1000, 0x4000, w.dest(), 12);
+  s->GpuSplice(0x1000, 0x4000, w.dest(), w.Live(), 12);
   CHECK(StatField(*s, "spliced") == 1);
   CHECK(StatField(*s, "differing") == 0);
   inv = InvLog{};
@@ -287,7 +295,7 @@ static void TestKeptSpans() {
   s->GuestSwap(3, MemRead, &mem, false);
   w.FillFrom(mem);
   w.FillB(0x3800, 768);
-  s->GpuSplice(0x1000, 0x4000, w.dest(), 12);
+  s->GpuSplice(0x1000, 0x4000, w.dest(), w.Live(), 12);
   CHECK(StatField(*s, "spliced") == 2);
   CHECK(StatField(*s, "differing") == 1);
   inv = InvLog{};
@@ -302,7 +310,7 @@ static void TestKeptSpans() {
   w.FillFrom(mem);
   w.FillB(0x1100, 384);
   w.FillB(0x2200, 64);
-  s->GpuSplice(0x1000, 0x4000, w.dest(), 12);
+  s->GpuSplice(0x1000, 0x4000, w.dest(), w.Live(), 12);
   CHECK(StatField(*s, "differing") == 2);
   inv = InvLog{};
   Boundary(*s, 4, true, &inv);  // frame 5
@@ -311,7 +319,7 @@ static void TestKeptSpans() {
   LearnS(*s, 0x1F00, 512);  // merges nothing: 0x1F00..0x2100 overlaps neither 0x1100..0x1280 nor 0x2200..0x2240
   s->GuestSwap(5, MemRead, &mem, false);
   Window w2(0x2000, 0x1000);  // pattern B: differs from the copy
-  s->GpuSplice(0x2000, 0x1000, w2.dest(), 12);
+  s->GpuSplice(0x2000, 0x1000, w2.dest(), w2.Live(), 12);
   inv = InvLog{};
   Boundary(*s, 5, true, &inv);
   CHECK(inv.n == 1 && inv.start[0] == 0x2000 && inv.length[0] == 0x1000);
@@ -593,13 +601,13 @@ static void TestListChangeNextSwap() {
   CHECK(c9.copied == 2);
   Boundary(*s, 7, true, &inv);  // frame 8
   Window w(0x1000, 4096);
-  s->GpuSplice(0x1000, 4096, w.dest(), 12);
+  s->GpuSplice(0x1000, 4096, w.dest(), w.Live(), 12);
   CHECK(AllPat(w, 0x1100, 64, true));
   CHECK(AllPat(w, 0x1800, 64, false));  // not in copy 8: live
   CHECK(StatField(*s, "not_in_copy") == 1);
   Boundary(*s, 8, true, &inv);  // frame 9
   Window w9(0x1000, 4096);
-  s->GpuSplice(0x1000, 4096, w9.dest(), 12);
+  s->GpuSplice(0x1000, 4096, w9.dest(), w9.Live(), 12);
   CHECK(AllPat(w9, 0x1100, 64, true));
   CHECK(AllPat(w9, 0x1800, 64, true));
   CHECK(StatField(*s, "not_in_copy") == 1);
@@ -617,7 +625,7 @@ static void TestUnreadableSkipped() {
   CHECK(c.copied == 1 && c.bytes == 64);
   std::vector<ss::Range> diff;
   Window w(0x1000, 4096);
-  ss::SpliceResult r = ring.Splice(5, 0x1000, 4096, w.dest(), list, &diff);
+  ss::SpliceResult r = ring.Splice(5, 0x1000, 4096, w.dest(), w.Live(), list, &diff);
   CHECK(r.missing == ss::Missing::kNone);
   CHECK(r.not_in_copy == 1);
   CHECK(AllPat(w, 0x1200, 64, false));
@@ -662,12 +670,12 @@ static void TestNoFrameBeforeFirstOrdinal() {
   Boundary(*s, 0, true, &inv);            // no current frame (frame 1 would splice copy 1)
   std::string before = s->StatsLine();
   Window w(0x1000, 4096);
-  s->GpuSplice(0x1000, 4096, w.dest(), 12);
+  s->GpuSplice(0x1000, 4096, w.dest(), w.Live(), 12);
   CHECK(AllPat(w, 0x1100, 64, false));
   CHECK(s->StatsLine() == before);
   // Positive companion (A13): the next boundary with an ordinal splices.
   Boundary(*s, 1, true, &inv);  // frame 2
-  s->GpuSplice(0x1000, 4096, w.dest(), 12);
+  s->GpuSplice(0x1000, 4096, w.dest(), w.Live(), 12);
   CHECK(AllPat(w, 0x1100, 64, true));
   CHECK(AllPat(w, 0x1000, 0x100, false));
 }
@@ -683,7 +691,7 @@ static void TestLatchedOff() {
   LearnS(*s, 0x1100, 64);
   s->GuestSwap(2, MemRead, &mem, false);
   Window w(0x1000, 4096);
-  s->GpuSplice(0x1000, 4096, w.dest(), 12);  // differs: a kept span on page 1
+  s->GpuSplice(0x1000, 4096, w.dest(), w.Live(), 12);  // differs: a kept span on page 1
   CHECK(AllPat(w, 0x1100, 64, true));
   s->GuestSwap(3, MemRead, &mem, false);  // a copy for the frame after the off boundary (A6)
   inv = InvLog{};
@@ -695,7 +703,7 @@ static void TestLatchedOff() {
   LearnS(*s, 0x1800, 64);
   CHECK(StatField(*s, "ranges_now") == 1);  // the list is kept, nothing learned
   Window w2(0x1000, 4096);
-  s->GpuSplice(0x1000, 4096, w2.dest(), 12);
+  s->GpuSplice(0x1000, 4096, w2.dest(), w2.Live(), 12);
   CHECK(AllPat(w2, 0x1100, 64, false));
   CHECK(StatField(*s, "spliced") == spliced);
   CHECK(StatField(*s, "frames") == frames);
@@ -707,7 +715,7 @@ static void TestLatchedOff() {
   LearnS(*s, 0x1800, 64);
   CHECK(StatField(*s, "ranges_now") == 2);
   Window w3(0x1000, 4096);
-  s->GpuSplice(0x1000, 4096, w3.dest(), 12);
+  s->GpuSplice(0x1000, 4096, w3.dest(), w3.Live(), 12);
   CHECK(AllPat(w3, 0x1100, 64, true));
 }
 
@@ -767,18 +775,18 @@ static void TestStatsLine() {
   s->GuestSwap(8, MemRead, &mem, false);                      // slot 0; no check
   s->GpuFrameBoundary(6, true, InvFn, &inv, WrittenFn, &wf, 12);  // frames=3, frame 7 (slot 3 = copy 7)
   Window wa(0x1000, 4096);                                    // pattern B: R1 and R2 differ from copy 7
-  s->GpuSplice(0x1000, 4096, wa.dest(), 12);                  // spliced=1, differing=1, not_in_copy +0
+  s->GpuSplice(0x1000, 4096, wa.dest(), wa.Live(), 12);                  // spliced=1, differing=1, not_in_copy +0
   s->GpuFrameBoundary(8, true, InvFn, &inv, WrittenFn, &wf, 12);  // frames=4, frame 9 (slot 1: never written)
   Window wb(0x1000, 4096);
-  s->GpuSplice(0x1000, 4096, wb.dest(), 12);  // missing_not_yet=1
+  s->GpuSplice(0x1000, 4096, wb.dest(), wb.Live(), 12);  // missing_not_yet=1
   s->GuestSwap(13, MemRead, &mem, false);     // slot 1 = 13 > 9
-  s->GpuSplice(0x1000, 4096, wb.dest(), 12);  // missing_reused=1
+  s->GpuSplice(0x1000, 4096, wb.dest(), wb.Live(), 12);  // missing_reused=1
   s->GuestSwap(10, MemRead, &mem, false);     // slot 2 = copy 10 (9 ranges, memory after the flip)
   s->GpuFrameBoundary(9, true, InvFn, &inv, WrittenFn, &wf, 12);  // frames=5, frame 10
   LearnS(*s, 0x1400, 32);                                     // R4: 10 ranges again (ranges_max stays 10)
   Window wc(0x1000, 4096);
   wc.FillFrom(mem);                           // copy == live for R1 and R2
-  s->GpuSplice(0x1000, 4096, wc.dest(), 12);  // spliced=2, differing stays 1, R4 not in copy 10: not_in_copy=1
+  s->GpuSplice(0x1000, 4096, wc.dest(), wc.Live(), 12);  // spliced=2, differing stays 1, R4 not in copy 10: not_in_copy=1
   CHECK(s->StatsLine() ==
         "submit snapshot stats: frames=5 ranges_max=10 ranges_now=10 spliced=2 differing=1 missing_reused=1 "
         "missing_not_yet=1 not_in_copy=1 copy_us_median=7 copy_us_max=3000 check_ranges=10 check_moved=1 "
@@ -806,7 +814,7 @@ static void TestNoAllocationAfterWarmup() {
   s->GuestSwap(2, MemRead, &mem, false);
   s->GuestSwap(3, MemRead, &mem, false);
   Window w(0x1000, 4096);
-  s->GpuSplice(0x1000, 4096, w.dest(), 12);
+  s->GpuSplice(0x1000, 4096, w.dest(), w.Live(), 12);
   Window w2(0x1000, 4096);
   // Scripted frame.
   g_allocs = 0;
@@ -814,7 +822,7 @@ static void TestNoAllocationAfterWarmup() {
   Boundary(*s, 2, true, &inv);  // frame 3
   LearnS(*s, 0x1100, 64);       // no change to the list
   s->GuestSwap(4, MemRead, &mem, false);
-  s->GpuSplice(0x1000, 4096, w2.dest(), 12);
+  s->GpuSplice(0x1000, 4096, w2.dest(), w2.Live(), 12);
   g_count_allocs = false;
   CHECK(g_allocs.load() == 0);
   CHECK(AllPat(w2, 0x1100, 64, true) && AllPat(w2, 0x1800, 64, true));  // the frame did its work
@@ -837,7 +845,7 @@ static void TestResetClears() {
   s->GuestSwap(3, MemRead, &mem, false);  // slot 3
   s->GuestSwap(4, MemRead, &mem, false);  // slot 0
   Window w(0x1000, 4096);
-  s->GpuSplice(0x1000, 4096, w.dest(), 12);  // differs: a kept span
+  s->GpuSplice(0x1000, 4096, w.dest(), w.Live(), 12);  // differs: a kept span
   CHECK(AllPat(w, 0x1100, 64, true));
   CHECK(StatField(*s, "ranges_now") == 1);
   s->Reset();
@@ -850,7 +858,7 @@ static void TestResetClears() {
   CHECK(c5.copied == 0 && mem.reads == 0);                    // published list cleared
   LearnS(*s, 0x1100, 64);
   Window w4(0x1000, 4096);
-  s->GpuSplice(0x1000, 4096, w4.dest(), 12);  // copy 4 existed before Reset: now "never written"
+  s->GpuSplice(0x1000, 4096, w4.dest(), w4.Live(), 12);  // copy 4 existed before Reset: now "never written"
   CHECK(AllPat(w4, 0x1100, 64, false));
   CHECK(StatField(*s, "missing_not_yet") == 1);
   LearnS(*s, 0x9000, 16);  // the ban is gone
@@ -888,11 +896,11 @@ static void TestSpliceOnlyLearnedNow() {
     CHECK(StatField(*s, "ranges_now") == 1);
     CHECK(StatField(*s, "banned") == 1);
     Window w(0x1000, 4096);
-    s->GpuSplice(0x1000, 4096, w.dest(), 12);
+    s->GpuSplice(0x1000, 4096, w.dest(), w.Live(), 12);
     CHECK(AllPat(w, 0x1100, 64, true));   // control: the learned range is spliced
     CHECK(AllPat(w, 0x1800, 64, false));  // the dropped range stays live
     Window w2(0x1800, 64);
-    s->GpuSplice(0x1800, 64, w2.dest(), 12);
+    s->GpuSplice(0x1800, 64, w2.dest(), w2.Live(), 12);
     CHECK(AllPat(w2, 0x1800, 64, false));  // alone in its window: stays live
   }
   auto s = std::make_unique<ss::State>();
@@ -909,29 +917,151 @@ static void TestSpliceOnlyLearnedNow() {
   CHECK(StatField(*s, "ranges_now") == 1);
   // (a) A window overlapping no learned range while copy 3 holds bytes there: nothing spliced, nothing counted.
   Window wa(0x1000, 4096);
-  s->GpuSplice(0x1000, 4096, wa.dest(), 12);
+  s->GpuSplice(0x1000, 4096, wa.dest(), wa.Live(), 12);
   CHECK(AllPat(wa, 0x1100, 64, false));
   CHECK(StatField(*s, "spliced") == 0);
   CHECK(StatField(*s, "not_in_copy") == 0);
   s->GuestSwap(5, MemRead, &mem, false);                          // copy 5 holds R2 only
   s->GpuFrameBoundary(3, true, InvFn, &inv, WrittenFn, &wf, 12);  // frame 4: no copy 4
-  s->GpuSplice(0x1000, 4096, wa.dest(), 12);
+  s->GpuSplice(0x1000, 4096, wa.dest(), wa.Live(), 12);
   CHECK(StatField(*s, "missing_not_yet") == 0);  // no learned range in the window: not a missing copy
   CHECK(StatField(*s, "missing_reused") == 0);
   Window wr(0x5000, 4096);
-  s->GpuSplice(0x5000, 4096, wr.dest(), 12);
+  s->GpuSplice(0x5000, 4096, wr.dest(), wr.Live(), 12);
   CHECK(StatField(*s, "missing_not_yet") == 1);  // control: R2's window counts the missing copy
   // (b) A learned range in the window that the copy does not hold there: not counted as spliced.
   LearnS(*s, 0x6800, 64);                                         // R3, after copy 5
   s->GpuFrameBoundary(4, true, InvFn, &inv, WrittenFn, &wf, 12);  // frame 5
   Window wb(0x6000, 4096);
-  s->GpuSplice(0x6000, 4096, wb.dest(), 12);
+  s->GpuSplice(0x6000, 4096, wb.dest(), wb.Live(), 12);
   CHECK(AllPat(wb, 0x6800, 64, false));
   CHECK(StatField(*s, "spliced") == 0);
   CHECK(StatField(*s, "not_in_copy") == 1);
-  s->GpuSplice(0x5000, 4096, wr.dest(), 12);  // control: R2 is held and learned
+  s->GpuSplice(0x5000, 4096, wr.dest(), wr.Live(), 12);  // control: R2 is held and learned
   CHECK(StatField(*s, "spliced") == 1);
   CHECK(AllPat(wr, 0x5100, 64, true));
+}
+
+// A third byte pattern, different from A and B at every address.
+static uint8_t PatC(uint32_t a) { return uint8_t((a & 0xFF) ^ 0x5F); }
+
+// 22. differing compares the copy with live guest memory, never with dest (review I1): dest (an upload mapping,
+// write-combined or uncached in the SDK) is only written. dest is pre-filled with pattern C, which differs from the
+// copy (A) and from live; live equals the copy for one piece and differs (B) for the other. The likeliest wrong
+// version, comparing with dest (the code before fix round 1), lists both pieces; a version that skips the write
+// where copy == live leaves pattern C in the first piece.
+static void TestDifferingAgainstLive() {
+  Case("differing_against_live_not_dest");
+  FakeMem mem(0x10000);  // pattern A: the copy's bytes
+  {
+    ss::Ring ring;
+    const ss::Range list[2] = {{0x1100, 64}, {0x1800, 64}};
+    ss::CopyResult c = ring.Copy(1, list, MemRead, &mem, false);
+    CHECK(c.copied == 2);
+    Window w(0x1000, 4096);
+    std::vector<uint8_t> live(4096);
+    for (uint32_t i = 0; i < 4096; ++i) {
+      w.dest()[i] = PatC(0x1000 + i);
+      live[i] = PatC(0x1000 + i);
+    }
+    for (uint32_t i = 0; i < 64; ++i) {
+      live[0x100 + i] = PatA(0x1100 + i);  // piece 1: live == copy
+      live[0x800 + i] = PatB(0x1800 + i);  // piece 2: live != copy
+    }
+    bool dest_differs = true;  // precondition: dest differs from the copy and from live in both pieces
+    for (uint32_t a : {0x1100u, 0x1800u}) {
+      for (uint32_t i = 0; i < 64; ++i) {
+        if (w.at(a + i) == PatA(a + i) || w.at(a + i) == live[a - 0x1000 + i]) dest_differs = false;
+      }
+    }
+    CHECK(dest_differs);
+    std::vector<ss::Range> diff;
+    ss::SpliceResult r = ring.Splice(1, 0x1000, 4096, w.dest(), live.data(), list, &diff);
+    CHECK(r.missing == ss::Missing::kNone && r.spliced == 2);
+    CHECK(r.differing == 1);  // NOT 2 (compared with dest), NOT 0
+    CHECK(diff.size() == 1 && diff[0].address == 0x1800 && diff[0].size == 64);
+    CHECK(AllPat(w, 0x1100, 64, true) && AllPat(w, 0x1800, 64, true));  // both pieces written with the copy
+    bool rest_c = true;  // the rest of dest is untouched (not refilled from live)
+    for (uint32_t i = 0; i < 4096; ++i) {
+      const uint32_t a = 0x1000 + i;
+      if ((a >= 0x1100 && a < 0x1140) || (a >= 0x1800 && a < 0x1840)) continue;
+      if (w.at(a) != PatC(a)) rest_c = false;
+    }
+    CHECK(rest_c);
+    CHECK(w.CanariesIntact());
+  }
+  {
+    // Through State::GpuSplice: only the differing piece's page is kept (page 2), not page 1 as well.
+    auto s = std::make_unique<ss::State>();
+    InvLog inv;
+    Boundary(*s, 1, true, &inv);  // frame 2
+    LearnS(*s, 0x1100, 64);       // page 1
+    LearnS(*s, 0x2800, 64);       // page 2
+    s->GuestSwap(2, MemRead, &mem, false);
+    Window w(0x1000, 0x2000);
+    std::vector<uint8_t> live(0x2000);
+    for (uint32_t i = 0; i < 0x2000; ++i) {
+      w.dest()[i] = PatC(0x1000 + i);
+      live[i] = PatC(0x1000 + i);
+    }
+    for (uint32_t i = 0; i < 64; ++i) {
+      live[0x100 + i] = PatA(0x1100 + i);   // live == copy
+      live[0x1800 + i] = PatB(0x2800 + i);  // live != copy
+    }
+    s->GpuSplice(0x1000, 0x2000, w.dest(), live.data(), 12);
+    CHECK(StatField(*s, "spliced") == 1);
+    CHECK(AllPat(w, 0x1100, 64, true) && AllPat(w, 0x2800, 64, true));
+    inv = InvLog{};
+    Boundary(*s, 2, true, &inv);  // frame 3: the kept spans are invalidated
+    CHECK(inv.n == 1 && inv.start[0] == 0x2000 && inv.length[0] == 0x1000);  // NOT {0x1000, 0x2000}
+  }
+}
+
+struct RunLog {
+  int n = 0;
+  uint32_t first[8] = {};
+  uint32_t count[8] = {};
+};
+
+static void RunFn(void* ctx, uint32_t first, uint32_t count) {
+  auto* l = static_cast<RunLog*>(ctx);
+  if (l->n < 8) {
+    l->first[l->n] = first;
+    l->count[l->n] = count;
+  }
+  ++l->n;
+}
+
+// 23. ForEachClearPageRun (review M2's walk): runs of pages whose bit is clear, across a 64-page word edge, clamped
+// to the words held. Bits set: pages 62, 64, 65 (bit 62 of word 0, bits 0 and 1 of word 1).
+static void TestClearPageRuns() {
+  Case("clear_page_runs");
+  const uint64_t bits[2] = {uint64_t(1) << 62, 0x3};
+  {
+    RunLog l;
+    ss::ForEachClearPageRun(bits, 60, 11, RunFn, &l);  // pages 60..70
+    // NOT one run {60, 11} (bits ignored), NOT {62,1},{64,2} (set runs), the last run emitted.
+    CHECK(l.n == 3);
+    CHECK(l.n == 3 && l.first[0] == 60 && l.count[0] == 2);
+    CHECK(l.n == 3 && l.first[1] == 63 && l.count[1] == 1);
+    CHECK(l.n == 3 && l.first[2] == 66 && l.count[2] == 5);
+  }
+  {
+    RunLog l;
+    ss::ForEachClearPageRun(bits, 64, 2, RunFn, &l);  // every page set: no run
+    CHECK(l.n == 0);
+  }
+  {
+    RunLog l;
+    ss::ForEachClearPageRun(bits, 120, 20, RunFn, &l);  // 128 pages held: clamped to 120..127
+    CHECK(l.n == 1 && l.first[0] == 120 && l.count[0] == 8);
+  }
+  {
+    RunLog l;
+    ss::ForEachClearPageRun(bits, 200, 5, RunFn, &l);  // past the words: nothing
+    ss::ForEachClearPageRun(bits, 0, 0, RunFn, &l);    // no pages: nothing
+    CHECK(l.n == 0);
+  }
 }
 
 // Waits until flag is set, polling, for at most ms milliseconds.
@@ -1000,7 +1130,7 @@ static void TestSlotLockedWhileCopying() {
   ss::SpliceResult res{ss::Missing::kNone, 0, 0, 0};
   std::vector<ss::Range> diff;
   std::thread gpu([&] {
-    res = ring->Splice(4, 0x1000, 4096, w.dest(), {&r, 1}, &diff);
+    res = ring->Splice(4, 0x1000, 4096, w.dest(), w.Live(), {&r, 1}, &diff);
     splice_done = true;
   });
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -1095,6 +1225,8 @@ int main() {
   TestNoAllocationAfterWarmup();
   TestResetClears();
   TestSpliceOnlyLearnedNow();
+  TestDifferingAgainstLive();
+  TestClearPageRuns();
   // The threaded groups last, so a stuck thread's early exit leaves every other group's result printed.
   TestSlotLockedWhileCopying();
   TestPublishUnderConcurrency();

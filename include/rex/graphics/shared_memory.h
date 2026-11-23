@@ -107,12 +107,14 @@ class SharedMemory {
   // OnSubmitSnapshotFrameBoundary). swap_ordinal = the packet's VdSwap ordinal
   // (0: none); on = gpu_submit_snapshot read now (the latch for the frame).
   // Holds the global lock through the whole call (the pages kept from the last
-  // frame are invalidated through MemoryInvalidationCallback, the GPU-written
-  // bans read system_page_flags_valid_and_gpu_written_). GPU thread only.
+  // frame that are not GPU-written are invalidated through
+  // MemoryInvalidationCallback, the GPU-written bans read
+  // system_page_flags_valid_and_gpu_written_); returns before the lock when
+  // `on` is off and the latch is off already. GPU thread only.
   void SubmitSnapshotFrameBoundary(uint32_t swap_ordinal, bool on);
   // Submit snapshot at a cache clear (after ClearCache, GPU thread):
   // invalidates every page of a learned range (a superset of the pages kept
-  // this frame), then State::Reset.
+  // this frame) that is not GPU-written, then State::Reset.
   void ResetSubmitSnapshot();
 
   // Marks the range and, if not exact_range, potentially its surroundings
@@ -203,11 +205,14 @@ class SharedMemory {
       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
 
   // Submit snapshot: dest holds guest bytes [start_bytes, start_bytes +
-  // size_bytes) just copied from guest memory into an upload buffer; overwrites
-  // the bytes of learned ranges with the current frame's VdSwap copy (a no-op
-  // unless the frame is latched on and has a copy). Call in UploadRanges right
-  // after each memcpy, without the global lock held. GPU thread only.
-  void SpliceSubmitSnapshot(uint32_t start_bytes, uint32_t size_bytes, uint8_t* dest);
+  // size_bytes) just copied from guest memory (`live`, the memcpy's source)
+  // into an upload buffer; overwrites the bytes of learned ranges with the
+  // current frame's VdSwap copy (a no-op unless the frame is latched on and has
+  // a copy). dest is only written (an upload mapping is write-combined or
+  // uncached); the copy is compared with live. Call in UploadRanges right after
+  // each memcpy, without the global lock held. GPU thread only.
+  void SpliceSubmitSnapshot(uint32_t start_bytes, uint32_t size_bytes, uint8_t* dest,
+                            const uint8_t* live);
 
   const std::vector<std::pair<uint32_t, uint32_t>>& trace_download_ranges() {
     return trace_download_ranges_;
@@ -275,6 +280,10 @@ class SharedMemory {
   // Call with the global lock held: any page of [start, start + length) holds
   // GPU-written data (system_page_flags_valid_and_gpu_written_).
   bool AnyPageGpuWritten(uint32_t start, uint32_t length) const;
+  // Invalidates (as a CPU write, exact) only the pages of [start, start +
+  // length) whose GPU-written bit is clear; a GPU-written page keeps its data
+  // (review M2). Takes the global lock (recursive; both callers hold it).
+  void InvalidateSubmitSnapshotPages(uint32_t start, uint32_t length);
   static void SubmitSnapshotInvalidateThunk(void* context, uint32_t start_bytes,
                                             uint32_t length_bytes);
   static bool SubmitSnapshotGpuWrittenThunk(void* context, uint32_t address, uint32_t size);

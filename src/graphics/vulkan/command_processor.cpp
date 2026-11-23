@@ -3609,10 +3609,14 @@ void VulkanCommandProcessor::OnSubmitSnapshotFrameBoundary(uint32_t swap_ordinal
   if (!shared_memory_) {
     return;
   }
+  submit_snapshot::State& snapshot = submit_snapshot::Global();
+  const bool was_on = snapshot.gpu_on();
   shared_memory_->SubmitSnapshotFrameBoundary(swap_ordinal, REXCVAR_GET(gpu_submit_snapshot));
-  if (submit_snapshot::Global().gpu_on()) {
+  if (snapshot.gpu_on() || was_on) {
     // Spec section 3 (vertex-slot cache): each slot's first draw of the frame goes through RequestRange, so no
-    // slot keeps drawing an earlier frame's copy (IssueSwap clears only the in-sync bits).
+    // slot keeps drawing an earlier frame's copy (IssueSwap clears only the in-sync bits). Also on the boundary
+    // that latches off (review M3): a slot whose last request was a kept range would otherwise keep drawing that
+    // copy, its invalidated page never requested, until the slot's address changes.
     InvalidateAllVertexBufferResidency();
   }
 }
@@ -4049,9 +4053,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
         continue;
       }
+      // Submit snapshot: the uploaded page count only latched on (review M1: no page sum when off).
+      submit_snapshot::State& snapshot = submit_snapshot::Global();
       uint32_t uploaded_pages = 0;
       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2,
-                                        &uploaded_pages)) {
+                                        snapshot.gpu_on() ? &uploaded_pages : nullptr)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
             "memory",
@@ -4059,7 +4065,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         return false;
       }
       // Submit snapshot: learn the ranges a later pass (bin select) of the frame re-uploads.
-      submit_snapshot::State& snapshot = submit_snapshot::Global();
       if (snapshot.gpu_on()) {
         snapshot.GpuNoteRequest(vfetch_constant.address << 2, vfetch_constant.size << 2, bin_select_,
                                 uploaded_pages);

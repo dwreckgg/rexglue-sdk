@@ -85,7 +85,7 @@ CopyResult Ring::Copy(uint32_t ordinal, std::span<const Range> list, ReadFn read
   return res;
 }
 
-SpliceResult Ring::Splice(uint32_t frame, uint32_t start, uint32_t size, uint8_t* dest,
+SpliceResult Ring::Splice(uint32_t frame, uint32_t start, uint32_t size, uint8_t* dest, const uint8_t* live,
                           std::span<const Range> learned, std::vector<Range>* differing) {
   SpliceResult res{Missing::kNone, 0, 0, 0};
   if (differing) differing->clear();
@@ -108,7 +108,11 @@ SpliceResult Ring::Splice(uint32_t frame, uint32_t start, uint32_t size, uint8_t
       const uint8_t* src = s.bytes.data() + s.offsets[i] + (lo - r.address);
       uint8_t* dst = dest + (lo - w0);
       size_t n = size_t(hi - lo);
-      if (std::memcmp(src, dst, n) != 0) {
+      // Compared with live guest memory, not with dst (review I1): `differing` answers "does the GPU's copy of
+      // this page now differ from guest memory", and after the memcpy below dst holds the copy while guest memory
+      // is `live`. live is also cached memory, where dst is an upload mapping (write-combined or uncached) that is
+      // only written here. A guest write after this compare trips the page's write watch as before.
+      if (std::memcmp(src, live + (lo - w0), n) != 0) {
         ++res.differing;
         if (differing) differing->push_back(Range{uint32_t(lo), uint32_t(n)});
       }
@@ -420,12 +424,12 @@ void State::AddKeptSpan(uint64_t start, uint64_t end) {
   kept_.insert(it, {start, end});
 }
 
-void State::GpuSplice(uint32_t start, uint32_t size, uint8_t* dest, uint32_t page_size_log2) {
+void State::GpuSplice(uint32_t start, uint32_t size, uint8_t* dest, const uint8_t* live, uint32_t page_size_log2) {
   if (!on_ || frame_ == 0 || size == 0) return;
   std::span<const Range> learned = learner_.ranges();
   const uint64_t w0 = start, w1 = uint64_t(start) + size;
   if (!AnyOverlap(learned, w0, w1)) return;
-  SpliceResult r = ring_.Splice(frame_, start, size, dest, learned, &differing_);
+  SpliceResult r = ring_.Splice(frame_, start, size, dest, live, learned, &differing_);
   if (r.missing == Missing::kReused) {
     ++missing_reused_;
     return;
@@ -506,6 +510,24 @@ void State::Reset() {
 State& Global() {
   static State s;
   return s;
+}
+
+void ForEachClearPageRun(std::span<const uint64_t> bits, uint32_t page_first, uint32_t page_count, PageRunFn run,
+                         void* ctx) {
+  const uint64_t end = std::min<uint64_t>(uint64_t(page_first) + page_count, uint64_t(bits.size()) * 64);
+  uint64_t run_first = 0;
+  bool in_run = false;
+  for (uint64_t p = page_first; p < end; ++p) {
+    const bool set = (bits[size_t(p >> 6)] >> (p & 63)) & 1;
+    if (!set && !in_run) {
+      run_first = p;
+      in_run = true;
+    } else if (set && in_run) {
+      run(ctx, uint32_t(run_first), uint32_t(p - run_first));
+      in_run = false;
+    }
+  }
+  if (in_run) run(ctx, uint32_t(run_first), uint32_t(end - run_first));
 }
 
 }  // namespace rex::graphics::submit_snapshot

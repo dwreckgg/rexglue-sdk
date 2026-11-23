@@ -60,14 +60,15 @@ class Ring {
   // `read` refuses is skipped (not held by the copy). `check`: re-reads each copied range right after the whole
   // copy and counts the ranges whose bytes moved (or could not be re-read).
   CopyResult Copy(uint32_t ordinal, std::span<const Range> list, ReadFn read, void* ctx, bool check);
-  // dest holds guest bytes [start, start + size); overwrites, inside it, the bytes of copy `frame`'s ranges that
-  // also lie in a `learned` range (a range the copy holds but the learner dropped stays live); appends each spliced
-  // piece (held and learned and inside the window) whose copy bytes differed from dest's prior bytes to *differing
-  // (cleared first). spliced / differing count those pieces.
-  // kNone only when the slot's ordinal equals `frame`; greater -> kReused; smaller or never written -> kNotYet; on
-  // a miss dest is untouched. not_in_copy (kNone only): learned ranges overlapping the window that no single range
-  // of the copy contains.
-  SpliceResult Splice(uint32_t frame, uint32_t start, uint32_t size, uint8_t* dest,
+  // dest holds guest bytes [start, start + size) copied from `live` (the same window of guest memory, the source of
+  // the upload's memcpy); overwrites, inside dest, the bytes of copy `frame`'s ranges that also lie in a `learned`
+  // range (a range the copy holds but the learner dropped stays live); appends each spliced piece (held and learned
+  // and inside the window) whose copy bytes differ from live's bytes to *differing (cleared first). dest is only
+  // written, never read (an upload mapping is write-combined or uncached memory). spliced / differing count those
+  // pieces. kNone only when the slot's ordinal equals `frame`; greater -> kReused; smaller or never written ->
+  // kNotYet; on a miss dest is untouched. not_in_copy (kNone only): learned ranges overlapping the window that no
+  // single range of the copy contains.
+  SpliceResult Splice(uint32_t frame, uint32_t start, uint32_t size, uint8_t* dest, const uint8_t* live,
                       std::span<const Range> learned, std::vector<Range>* differing);
 
  private:
@@ -149,8 +150,9 @@ class State {
                         void* written_ctx, uint32_t page_size_log2);  // kept spans invalidated FIRST, whatever `on`
   bool gpu_on() const;                       // the latch (D6)
   void GpuNoteRequest(uint32_t address, uint32_t size, uint64_t bin_select, uint32_t uploaded_pages);
-  void GpuSplice(uint32_t start, uint32_t size, uint8_t* dest, uint32_t page_size_log2);  // no-op unless latched on
-                                              // and a current frame exists; differing -> kept spans + NoteChanged
+  // dest and live as Ring::Splice. No-op unless latched on and a current frame exists; differing -> kept spans +
+  // NoteChanged.
+  void GpuSplice(uint32_t start, uint32_t size, uint8_t* dest, const uint8_t* live, uint32_t page_size_log2);
   const std::vector<std::pair<uint32_t, uint32_t>>& LearnedPageSpans(uint32_t page_size_log2);
   std::string StatsLine() const;  // the "submit snapshot stats: " line, fields as Task 2 Step 6 (+ A16's three)
   // GPU thread (cache clear): clears the learner, the bans, the published list (generation moves), the ring slots'
@@ -194,5 +196,13 @@ class State {
 };
 
 State& Global();
+
+// Calls run(ctx, first, count) for each maximal run of pages in [page_first, page_first + page_count) whose bit in
+// `bits` is clear (page p is bit p & 63 of word p >> 6: SharedMemory's page flag blocks of 64 pages), in page order.
+// Pages past the last word are not visited. For the kept-span and reset invalidations (review M2): a page whose
+// GPU-written bit is set keeps its data, the rest go the way of a CPU write.
+using PageRunFn = void (*)(void* ctx, uint32_t page_first, uint32_t page_count);
+void ForEachClearPageRun(std::span<const uint64_t> bits, uint32_t page_first, uint32_t page_count, PageRunFn run,
+                         void* ctx);
 
 }  // namespace rex::graphics::submit_snapshot

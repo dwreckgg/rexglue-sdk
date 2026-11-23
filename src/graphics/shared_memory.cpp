@@ -882,12 +882,38 @@ bool SharedMemory::AnyPageGpuWritten(uint32_t start, uint32_t length) const {
   return false;
 }
 
+void SharedMemory::InvalidateSubmitSnapshotPages(uint32_t start, uint32_t length) {
+  if (!length || start >= kBufferSize) {
+    return;
+  }
+  length = std::min(length, kBufferSize - start);
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + (length - 1)) >> page_size_log2_;
+  // Review M2: MemoryInvalidationCallback clears the GPU-written bits too, so a
+  // resolve or memexport that wrote a kept (or learned) page after its splice
+  // would be lost to a CPU re-upload and its range never banned (the boundary's
+  // BanOverlapping runs after this). So only the pages whose
+  // valid-and-GPU-written bit is clear go the way of a CPU write (D3: clears the
+  // valid bits, marks the blocks dirty, fires the watches), in runs; a
+  // GPU-written page keeps its data and BanOverlapping bans its range. The bits
+  // are read under the global lock, as their other readers do (MakeRangeValid,
+  // MemoryInvalidationCallback); both callers already hold it (recursive).
+  auto global_lock = global_critical_region_.Acquire();
+  submit_snapshot::ForEachClearPageRun(
+      system_page_flags_valid_and_gpu_written_, page_first, page_last - page_first + 1,
+      [](void* context, uint32_t run_first, uint32_t run_count) {
+        auto* self = static_cast<SharedMemory*>(context);
+        self->MemoryInvalidationCallback(run_first << self->page_size_log2_,
+                                         run_count << self->page_size_log2_, true);
+      },
+      this);
+}
+
 void SharedMemory::SubmitSnapshotInvalidateThunk(void* context, uint32_t start_bytes,
                                                  uint32_t length_bytes) {
-  // D3: the path a CPU write takes (clears the valid and GPU-written bits, marks
-  // the blocks dirty, fires the watches). Takes the global lock, which the
-  // caller already holds (recursive).
-  static_cast<SharedMemory*>(context)->MemoryInvalidationCallback(start_bytes, length_bytes, true);
+  // Called inside GpuFrameBoundary for each kept span, under the global lock
+  // SubmitSnapshotFrameBoundary holds through the whole call.
+  static_cast<SharedMemory*>(context)->InvalidateSubmitSnapshotPages(start_bytes, length_bytes);
 }
 
 bool SharedMemory::SubmitSnapshotGpuWrittenThunk(void* context, uint32_t address, uint32_t size) {
@@ -901,6 +927,15 @@ void SharedMemory::SubmitSnapshotFrameBoundary(uint32_t swap_ordinal, bool on) {
   // the lag marks gave the packet an ordinal; on at VdSwap, off here: latched off) and never a mixed frame;
   // accepted, only the F4 settings overlay toggles it.
   submit_snapshot::State& snapshot = submit_snapshot::Global();
+  // Review M1 (Global Constraint "Off: ... no new lock"): off now and latched
+  // off already, the boundary would change nothing (no kept span exists while
+  // latched off: GpuSplice adds them only latched on, and the boundary that
+  // latched off cleared them; the latch and the frame stay off and 0), so it
+  // returns before the global lock. The boundary that turns the latch off still
+  // runs whole (gpu_on() is still true there).
+  if (!on && !snapshot.gpu_on()) {
+    return;
+  }
   {
     // B2: one hold of the global lock for the whole boundary. Lock order: the
     // global lock, then the helper's publish mutex (inside); the guest side
@@ -920,19 +955,21 @@ void SharedMemory::ResetSubmitSnapshot() {
     // State::Reset drops the pages kept this frame without invalidating them, and
     // ClearCache leaves CPU pages valid when its refresh finds nothing dirty: so
     // every page of a learned range (within a frame the learned pages only grow,
-    // so they cover every kept page) goes the way of a CPU write first.
+    // so they cover every kept page) goes the way of a CPU write first, except a
+    // GPU-written page, which keeps its data (review M2, as at the boundary).
     auto global_lock = global_critical_region_.Acquire();
     for (const auto& [first, count] : snapshot.LearnedPageSpans(page_size_log2_)) {
-      MemoryInvalidationCallback(first << page_size_log2_, count << page_size_log2_, true);
+      InvalidateSubmitSnapshotPages(first << page_size_log2_, count << page_size_log2_);
     }
   }
   snapshot.Reset();
 }
 
-void SharedMemory::SpliceSubmitSnapshot(uint32_t start_bytes, uint32_t size_bytes, uint8_t* dest) {
+void SharedMemory::SpliceSubmitSnapshot(uint32_t start_bytes, uint32_t size_bytes, uint8_t* dest,
+                                        const uint8_t* live) {
   submit_snapshot::State& snapshot = submit_snapshot::Global();
   if (snapshot.gpu_on()) {
-    snapshot.GpuSplice(start_bytes, size_bytes, dest, page_size_log2_);
+    snapshot.GpuSplice(start_bytes, size_bytes, dest, live, page_size_log2_);
   }
 }
 
