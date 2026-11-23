@@ -261,6 +261,7 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   void OnPrimaryBufferEnd() override;
   void PrefetchFrameUploads() override;
+  void OnSubmitSnapshotFrameBoundary(uint32_t swap_ordinal) override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;

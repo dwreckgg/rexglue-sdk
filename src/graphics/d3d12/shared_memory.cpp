@@ -396,6 +396,9 @@ bool D3D12SharedMemory::UploadRanges(
       std::memcpy(upload_buffer_mapping,
                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
                   upload_buffer_size);
+      // Submit snapshot: learned ranges from the frame's VdSwap copy instead of live memory.
+      SpliceSubmitSnapshot(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size),
+                           upload_buffer_mapping);
       ++command_processor_.gpu_timing_upload_copies_;  // TEMP DIAGNOSTIC
       command_processor_.gpu_timing_upload_bytes_ += upload_buffer_size;
       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),

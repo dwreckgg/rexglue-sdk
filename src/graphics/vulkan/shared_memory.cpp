@@ -378,6 +378,9 @@ bool VulkanSharedMemory::UploadRanges(
       std::memcpy(upload_buffer_mapping,
                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
                   upload_buffer_size);
+      // Submit snapshot: learned ranges from the frame's VdSwap copy instead of live memory.
+      SpliceSubmitSnapshot(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size),
+                           upload_buffer_mapping);
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
         command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,

@@ -26,9 +26,11 @@ enum Channel : int { kVblank = 0, kSwap = 1, kPresent = 2, kGuestSwap = 3, kChan
 
 // ---- Lag marks (the title's latency trace; exported as rex_lag_*, d3d12_presenter.cpp) ----
 // Off unless the title calls rex_lag_marks_enable(1); off, each site below costs one relaxed load and one branch.
-// On, every guest VdSwap gets an ordinal (from 1) that travels in its PM4_XE_SWAP packet (a fifth data dword) to
+// On, every guest VdSwap gets an ordinal that travels in its PM4_XE_SWAP packet (a fifth data dword) to
 // the GPU thread, then in the guest output's properties (Presenter::GuestOutputProperties::lag_swap_index) to the
-// host present that paints it. Times are QueryPerformanceCounter ticks.
+// host present that paints it. Times are QueryPerformanceCounter ticks. The ordinal comes from LagGuestSwapCount,
+// a counter the submit snapshot (gpu_submit_snapshot, xboxkrnl_video.cpp) also mints from at every VdSwap, so the
+// first marked swap need not be 1 (never 0: a wrap skips it).
 // The GPU command processor thread's view of one swap packet (PM4_XE_SWAP), filled on that thread
 // (command_processor.cpp) and carried with the guest output it refreshes (GuestOutputProperties::lag_gpu) to the
 // present that paints it. A "wait" is a WAIT_REG_MEM whose condition did not hold at its first check.

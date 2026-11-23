@@ -22,6 +22,8 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
+#include <rex/graphics/submit_snapshot.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory.h>
 
@@ -45,6 +47,17 @@ REXCVAR_DEFINE_BOOL(gpu_upload_prefetch, false, "GPU",
                     "memory pages draws read two frames ago that are invalid then. Less GPU work a "
                     "frame; moving parts such as hair can be drawn one frame late now and then. "
                     "Off by default.");
+
+// Submit snapshot (include/rex/graphics/submit_snapshot.h): read at each VdSwap
+// (xboxkrnl_video.cpp) and latched by the GPU thread at each swap packet.
+// Descriptions short: the settings overlay's tooltip is unwrapped.
+REXCVAR_DEFINE_BOOL(gpu_submit_snapshot, true, "GPU",
+                    "Draw animated models from a copy of their vertex data taken at the guest's "
+                    "swap, so no model is drawn half from the next frame (seams, jumps). On by "
+                    "default.");
+REXCVAR_DEFINE_BOOL(gpu_submit_snapshot_check, false, "GPU",
+                    "Test switch: counts ranges that moved around the VdSwap copy (submit "
+                    "snapshot stats line). Off by default.");
 
 namespace rex::graphics {
 
@@ -525,7 +538,11 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
   watch_range_first_free_ = range;
 }
 
-bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
+bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count,
+                                 uint32_t* uploaded_pages) {
+  if (uploaded_pages) {
+    *uploaded_pages = 0;
+  }
   if (ranges == nullptr || !count) {
     return true;
   }
@@ -694,12 +711,19 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     return true;
   }
 
+  if (uploaded_pages) {
+    uint32_t pages = 0;
+    for (const std::pair<uint32_t, uint32_t>& upload_range : upload_ranges_) {
+      pages += upload_range.second;
+    }
+    *uploaded_pages = pages;
+  }
   return UploadRanges(upload_ranges_);
 }
 
-bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+bool SharedMemory::RequestRange(uint32_t start, uint32_t length, uint32_t* uploaded_pages) {
   std::pair<uint32_t, uint32_t> range(start, length);
-  return RequestRanges(&range, 1);
+  return RequestRanges(&range, 1, uploaded_pages);
 }
 
 bool SharedMemory::UploadPrefetchEnabled() const { return REXCVAR_GET(gpu_upload_prefetch); }
@@ -767,6 +791,36 @@ uint32_t SharedMemory::PrefetchFrameUploads() {
       }
     }
   }
+  // Submit snapshot (latched on): no page of a learned range is uploaded here;
+  // the next frame's VdSwap copy does not exist yet, so such a page stays
+  // invalid and its draw-time upload splices that copy in. Both lists are
+  // sorted by page and disjoint.
+  submit_snapshot::State& snapshot = submit_snapshot::Global();
+  if (snapshot.gpu_on() && !upload_ranges_.empty()) {
+    const std::vector<std::pair<uint32_t, uint32_t>>& learned =
+        snapshot.LearnedPageSpans(page_size_log2_);
+    if (!learned.empty()) {
+      submit_snapshot_scratch_.clear();
+      size_t j = 0;
+      for (const auto& [first, count] : upload_ranges_) {
+        uint32_t lo = first;
+        const uint32_t hi = first + count;
+        while (j < learned.size() && learned[j].first + learned[j].second <= lo) {
+          ++j;
+        }
+        for (size_t k = j; k < learned.size() && learned[k].first < hi && lo < hi; ++k) {
+          if (learned[k].first > lo) {
+            submit_snapshot_scratch_.emplace_back(lo, learned[k].first - lo);
+          }
+          lo = std::max(lo, learned[k].first + learned[k].second);
+        }
+        if (lo < hi) {
+          submit_snapshot_scratch_.emplace_back(lo, hi - lo);
+        }
+      }
+      upload_ranges_.swap(submit_snapshot_scratch_);
+    }
+  }
   // Only pages still committed: one drawn from a frame or two ago may have
   // been freed since (loading), and reading it faults. Checked here, not under
   // the heap lock through the copy. The on-demand path (no check; it copies
@@ -807,6 +861,79 @@ uint32_t SharedMemory::PrefetchFrameUploads() {
     UploadRanges(prefetch_ranges_);
   }
   return pages;
+}
+
+bool SharedMemory::AnyPageGpuWritten(uint32_t start, uint32_t length) const {
+  if (!length || start >= kBufferSize) {
+    return false;
+  }
+  length = std::min(length, kBufferSize - start);
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + (length - 1)) >> page_size_log2_;
+  const size_t words = system_page_flags_valid_and_gpu_written_.size();
+  for (uint32_t w = page_first >> 6; w <= page_last >> 6 && w < words; ++w) {
+    const uint32_t lo = w == page_first >> 6 ? page_first & 63 : 0;
+    const uint32_t hi = w == page_last >> 6 ? page_last & 63 : 63;
+    const uint64_t mask = (~uint64_t(0) >> (63 - (hi - lo))) << lo;
+    if (system_page_flags_valid_and_gpu_written_[w] & mask) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void SharedMemory::SubmitSnapshotInvalidateThunk(void* context, uint32_t start_bytes,
+                                                 uint32_t length_bytes) {
+  // D3: the path a CPU write takes (clears the valid and GPU-written bits, marks
+  // the blocks dirty, fires the watches). Takes the global lock, which the
+  // caller already holds (recursive).
+  static_cast<SharedMemory*>(context)->MemoryInvalidationCallback(start_bytes, length_bytes, true);
+}
+
+bool SharedMemory::SubmitSnapshotGpuWrittenThunk(void* context, uint32_t address, uint32_t size) {
+  // Called inside GpuFrameBoundary, under the global lock its caller holds.
+  return static_cast<const SharedMemory*>(context)->AnyPageGpuWritten(address, size);
+}
+
+void SharedMemory::SubmitSnapshotFrameBoundary(uint32_t swap_ordinal, bool on) {
+  // D6/W2: `on` is the cvar read live here, not the value VdSwap saw. A toggle between a VdSwap and its packet
+  // gives one frame of live uploads (off at VdSwap, on here: no copy for that ordinal, counted missing_not_yet when
+  // the lag marks gave the packet an ordinal; on at VdSwap, off here: latched off) and never a mixed frame;
+  // accepted, only the F4 settings overlay toggles it.
+  submit_snapshot::State& snapshot = submit_snapshot::Global();
+  {
+    // B2: one hold of the global lock for the whole boundary. Lock order: the
+    // global lock, then the helper's publish mutex (inside); the guest side
+    // (VdSwap) never takes the global lock while it holds swap_mutex().
+    auto global_lock = global_critical_region_.Acquire();
+    snapshot.GpuFrameBoundary(swap_ordinal, on, SubmitSnapshotInvalidateThunk, this,
+                              SubmitSnapshotGpuWrittenThunk, this, page_size_log2_);
+  }
+  if (snapshot.gpu_on() && ++submit_snapshot_frames_on_ % 3600 == 0) {
+    REXGPU_INFO("{}", snapshot.StatsLine());
+  }
+}
+
+void SharedMemory::ResetSubmitSnapshot() {
+  submit_snapshot::State& snapshot = submit_snapshot::Global();
+  {
+    // State::Reset drops the pages kept this frame without invalidating them, and
+    // ClearCache leaves CPU pages valid when its refresh finds nothing dirty: so
+    // every page of a learned range (within a frame the learned pages only grow,
+    // so they cover every kept page) goes the way of a CPU write first.
+    auto global_lock = global_critical_region_.Acquire();
+    for (const auto& [first, count] : snapshot.LearnedPageSpans(page_size_log2_)) {
+      MemoryInvalidationCallback(first << page_size_log2_, count << page_size_log2_, true);
+    }
+  }
+  snapshot.Reset();
+}
+
+void SharedMemory::SpliceSubmitSnapshot(uint32_t start_bytes, uint32_t size_bytes, uint8_t* dest) {
+  submit_snapshot::State& snapshot = submit_snapshot::Global();
+  if (snapshot.gpu_on()) {
+    snapshot.GpuSplice(start_bytes, size_bytes, dest, page_size_log2_);
+  }
 }
 
 std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallbackThunk(

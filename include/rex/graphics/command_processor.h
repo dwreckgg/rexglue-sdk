@@ -215,6 +215,11 @@ class CommandProcessor {
   // At a frame's end (after IssueSwap): SharedMemory::PrefetchFrameUploads in
   // an open submission, when gpu_upload_prefetch is on.
   virtual void PrefetchFrameUploads() {}
+  // Submit snapshot (submit_snapshot.h): the GPU thread's frame boundary, once
+  // per executed swap packet, after its IssueSwap block and before
+  // PrefetchFrameUploads (never at PresentBeforeVblankWait's peek).
+  // swap_ordinal: the packet's VdSwap ordinal, 0 if it carries none.
+  virtual void OnSubmitSnapshotFrameBoundary([[maybe_unused]] uint32_t swap_ordinal) {}
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
@@ -351,6 +356,11 @@ class CommandProcessor {
 
   uint64_t bin_select_ = 0xFFFFFFFFull;
   uint64_t bin_mask_ = 0xFFFFFFFFull;
+
+  // Submit snapshot: the VdSwap ordinal of the last executed swap packet (its
+  // fifth data dword; 0 when it has 4). Its own variable, not LagGpuSwapIndex
+  // (the lag marks own that one). GPU thread only.
+  uint32_t submit_snapshot_swap_ordinal_ = 0;
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;

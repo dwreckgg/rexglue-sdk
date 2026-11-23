@@ -27,6 +27,7 @@
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/submit_snapshot.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/video.h>
@@ -53,6 +54,8 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DECLARE(bool, gpu_submit_snapshot);  // src/graphics/shared_memory.cpp
 
 namespace rex::graphics::d3d12 {
 
@@ -1660,6 +1663,11 @@ bool D3D12CommandProcessor::SetupContext() {
 
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  // Submit snapshot: the teardown stats line (on the GPU thread, which StatsLine requires), then the learned state
+  // goes (the shared memory is destroyed below, so there is no page to invalidate; a later SetupContext starts with
+  // every page invalid and an empty list).
+  REXGPU_INFO("{}", submit_snapshot::Global().StatsLine());
+  submit_snapshot::Global().Reset();
   // TEMP DIAGNOSTIC (d3d12_gpu_timing): the last window, then its resources.
   GpuTimingHarvest(true);
   gpu_timing_failed_ = true;  // no new timestamp resources past this point
@@ -2311,6 +2319,18 @@ void D3D12CommandProcessor::PrefetchFrameUploads() {
   }
 }
 
+void D3D12CommandProcessor::OnSubmitSnapshotFrameBoundary(uint32_t swap_ordinal) {
+  if (!shared_memory_) {
+    return;
+  }
+  shared_memory_->SubmitSnapshotFrameBoundary(swap_ordinal, REXCVAR_GET(gpu_submit_snapshot));
+  if (submit_snapshot::Global().gpu_on()) {
+    // Spec section 3 (vertex-slot cache): each slot's first draw of the frame goes through RequestRange, so no
+    // slot keeps drawing an earlier frame's copy (IssueSwap clears only the in-sync bits).
+    InvalidateAllVertexBufferResidency();
+  }
+}
+
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
   if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) && submission_open_ &&
       CanEndSubmissionImmediately()) {
@@ -2576,12 +2596,20 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
         continue;
       }
-      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
+      uint32_t uploaded_pages = 0;
+      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2,
+                                        &uploaded_pages)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
             "shared memory",
             vfetch_constant.address << 2, vfetch_constant.size << 2);
         return false;
+      }
+      // Submit snapshot: learn the ranges a later pass (bin select) of the frame re-uploads.
+      submit_snapshot::State& snapshot = submit_snapshot::Global();
+      if (snapshot.gpu_on()) {
+        snapshot.GpuNoteRequest(vfetch_constant.address << 2, vfetch_constant.size << 2, bin_select_,
+                                uploaded_pages);
       }
       state.address = vfetch_constant.address;
       state.size = vfetch_constant.size;
@@ -3596,6 +3624,8 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       render_target_cache_->ClearCache();
 
       shared_memory_->ClearCache();
+      // Submit snapshot: after the pages are cleared (B1); the learned pages are invalidated, then State::Reset.
+      shared_memory_->ResetSubmitSnapshot();
     }
   }
 
