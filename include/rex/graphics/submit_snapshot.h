@@ -154,7 +154,11 @@ class State {
   // NoteChanged.
   void GpuSplice(uint32_t start, uint32_t size, uint8_t* dest, const uint8_t* live, uint32_t page_size_log2);
   const std::vector<std::pair<uint32_t, uint32_t>>& LearnedPageSpans(uint32_t page_size_log2);
-  std::string StatsLine() const;  // the "submit snapshot stats: " line, fields as Task 2 Step 6 (+ A16's three)
+  // GPU thread (review N1): kept or learned pages that a kept-span or reset invalidation skipped because they were
+  // GPU-written (ForEachClearPageRun's return); the stats line's kept_gpu_written. Survives Reset.
+  void NoteKeptGpuWritten(uint32_t pages);
+  // The "submit snapshot stats: " line, fields as Task 2 Step 6 (+ A16's three, then kept_gpu_written, last).
+  std::string StatsLine() const;
   // GPU thread (cache clear): clears the learner, the bans, the published list (generation moves), the ring slots'
   // ordinals (to "never written") and the kept spans; the caller invalidates all pages itself.
   void Reset();
@@ -175,6 +179,7 @@ class State {
   std::vector<Range> differing_;
   uint64_t frames_ = 0, ranges_max_ = 0, spliced_ = 0, differing_calls_ = 0, missing_reused_ = 0,
            missing_not_yet_ = 0, not_in_copy_ = 0;
+  uint64_t kept_gpu_written_ = 0;  // NoteKeptGpuWritten (SDK: called under the global lock as well)
 
   // Published list (GPU writes, guest reads).
   std::mutex publish_mutex_;
@@ -199,10 +204,11 @@ State& Global();
 
 // Calls run(ctx, first, count) for each maximal run of pages in [page_first, page_first + page_count) whose bit in
 // `bits` is clear (page p is bit p & 63 of word p >> 6: SharedMemory's page flag blocks of 64 pages), in page order.
-// Pages past the last word are not visited. For the kept-span and reset invalidations (review M2): a page whose
-// GPU-written bit is set keeps its data, the rest go the way of a CPU write.
+// Pages past the last word are not visited. Returns the number of pages of the visited (clamped) span whose bit is
+// set, i.e. the pages it skipped. For the kept-span and reset invalidations (review M2): a page whose GPU-written bit
+// is set keeps its data, the rest go the way of a CPU write.
 using PageRunFn = void (*)(void* ctx, uint32_t page_first, uint32_t page_count);
-void ForEachClearPageRun(std::span<const uint64_t> bits, uint32_t page_first, uint32_t page_count, PageRunFn run,
-                         void* ctx);
+uint32_t ForEachClearPageRun(std::span<const uint64_t> bits, uint32_t page_first, uint32_t page_count, PageRunFn run,
+                             void* ctx);
 
 }  // namespace rex::graphics::submit_snapshot

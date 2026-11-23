@@ -891,15 +891,25 @@ void SharedMemory::InvalidateSubmitSnapshotPages(uint32_t start, uint32_t length
   const uint32_t page_last = (start + (length - 1)) >> page_size_log2_;
   // Review M2: MemoryInvalidationCallback clears the GPU-written bits too, so a
   // resolve or memexport that wrote a kept (or learned) page after its splice
-  // would be lost to a CPU re-upload and its range never banned (the boundary's
-  // BanOverlapping runs after this). So only the pages whose
-  // valid-and-GPU-written bit is clear go the way of a CPU write (D3: clears the
-  // valid bits, marks the blocks dirty, fires the watches), in runs; a
-  // GPU-written page keeps its data and BanOverlapping bans its range. The bits
-  // are read under the global lock, as their other readers do (MakeRangeValid,
-  // MemoryInvalidationCallback); both callers already hold it (recursive).
+  // would lose its data to a CPU re-upload, every frame, and its range would
+  // never be banned. So only the pages whose valid-and-GPU-written bit is clear
+  // go the way of a CPU write (D3: clears the valid bits, marks the blocks
+  // dirty, fires the watches), in runs; a GPU-written page keeps its data.
+  // Review N1, the cost of skipping: the bit is per page (RangeWrittenByGpu ->
+  // MakeRangeValid marks whole pages), so a GPU write over part of a skipped
+  // page leaves the rest of that page holding the spliced copy until the
+  // guest's next write to the page trips its watch (a memexport with unknown
+  // destinations marks the whole buffer, so on that frame every kept span is
+  // skipped). And the ban follows only on a latched-on boundary
+  // (GpuFrameBoundary's BanOverlapping, after this): not on the boundary that
+  // latches off, and not in ResetSubmitSnapshot (State::Reset drops the bans).
+  // Skipping is still chosen: invalidating would lose the GPU's data on every
+  // frame. The skipped pages are counted (stats line kept_gpu_written). The
+  // bits are read under the global lock, as their other readers do
+  // (MakeRangeValid, MemoryInvalidationCallback); both callers already hold it
+  // (recursive).
   auto global_lock = global_critical_region_.Acquire();
-  submit_snapshot::ForEachClearPageRun(
+  const uint32_t skipped = submit_snapshot::ForEachClearPageRun(
       system_page_flags_valid_and_gpu_written_, page_first, page_last - page_first + 1,
       [](void* context, uint32_t run_first, uint32_t run_count) {
         auto* self = static_cast<SharedMemory*>(context);
@@ -907,6 +917,9 @@ void SharedMemory::InvalidateSubmitSnapshotPages(uint32_t start, uint32_t length
                                          run_count << self->page_size_log2_, true);
       },
       this);
+  if (skipped) {
+    submit_snapshot::Global().NoteKeptGpuWritten(skipped);
+  }
 }
 
 void SharedMemory::SubmitSnapshotInvalidateThunk(void* context, uint32_t start_bytes,

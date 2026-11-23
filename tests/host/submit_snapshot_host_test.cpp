@@ -727,7 +727,7 @@ static void TestStatsLine() {
     CHECK(empty.StatsLine() ==
           "submit snapshot stats: frames=0 ranges_max=0 ranges_now=0 spliced=0 differing=0 missing_reused=0 "
           "missing_not_yet=0 not_in_copy=0 copy_us_median=0 copy_us_max=0 check_ranges=0 check_moved=0 "
-          "swap_threads=other:0 rejected_cap=0 rejected_size=0 banned=0");
+          "swap_threads=other:0 rejected_cap=0 rejected_size=0 banned=0 kept_gpu_written=0");
   }
   {
     // The overflow bucket reads as 2001: samples 5, 2500, 3000 -> sorted 5, ovf, ovf; the 2nd smallest is ovf.
@@ -739,7 +739,7 @@ static void TestStatsLine() {
     CHECK(s.StatsLine() ==
           "submit snapshot stats: frames=0 ranges_max=0 ranges_now=0 spliced=0 differing=0 missing_reused=0 "
           "missing_not_yet=0 not_in_copy=0 copy_us_median=2001 copy_us_max=3000 check_ranges=0 check_moved=0 "
-          "swap_threads=42:1,other:0 rejected_cap=0 rejected_size=0 banned=0");
+          "swap_threads=42:1,other:0 rejected_cap=0 rejected_size=0 banned=0 kept_gpu_written=0");
   }
   auto s = std::make_unique<ss::State>();
   FakeMem mem(0x200000);
@@ -787,10 +787,11 @@ static void TestStatsLine() {
   Window wc(0x1000, 4096);
   wc.FillFrom(mem);                           // copy == live for R1 and R2
   s->GpuSplice(0x1000, 4096, wc.dest(), wc.Live(), 12);  // spliced=2, differing stays 1, R4 not in copy 10: not_in_copy=1
+  s->NoteKeptGpuWritten(2);  // kept_gpu_written=2, the LAST field (review N1; a missing call would read 0)
   CHECK(s->StatsLine() ==
         "submit snapshot stats: frames=5 ranges_max=10 ranges_now=10 spliced=2 differing=1 missing_reused=1 "
         "missing_not_yet=1 not_in_copy=1 copy_us_median=7 copy_us_max=3000 check_ranges=10 check_moved=1 "
-        "swap_threads=111:3,222:2,other:1 rejected_cap=1 rejected_size=1 banned=1");
+        "swap_threads=111:3,222:2,other:1 rejected_cap=1 rejected_size=1 banned=1 kept_gpu_written=2");
 }
 
 // 18. No allocation per frame after one warm-up frame (A9).
@@ -848,8 +849,10 @@ static void TestResetClears() {
   s->GpuSplice(0x1000, 4096, w.dest(), w.Live(), 12);  // differs: a kept span
   CHECK(AllPat(w, 0x1100, 64, true));
   CHECK(StatField(*s, "ranges_now") == 1);
+  s->NoteKeptGpuWritten(3);
   s->Reset();
   CHECK(StatField(*s, "ranges_now") == 0);  // learner cleared
+  CHECK(StatField(*s, "kept_gpu_written") == 3);  // a statistic of the run: survives (review N1)
   inv = InvLog{};
   s->GpuFrameBoundary(3, true, InvFn, &inv, WrittenFn, &wf, 12);  // frame 4
   CHECK(inv.n == 0);                                          // kept spans cleared
@@ -1037,30 +1040,41 @@ static void RunFn(void* ctx, uint32_t first, uint32_t count) {
 static void TestClearPageRuns() {
   Case("clear_page_runs");
   const uint64_t bits[2] = {uint64_t(1) << 62, 0x3};
+  // The return value (review N1) is the number of set (skipped) pages in the clamped span. The likeliest wrong
+  // version, page_count minus the pages handed to run(), differs from it on every case below but the all-set one.
   {
     RunLog l;
-    ss::ForEachClearPageRun(bits, 60, 11, RunFn, &l);  // pages 60..70
+    const uint32_t skipped = ss::ForEachClearPageRun(bits, 60, 11, RunFn, &l);  // pages 60..70
     // NOT one run {60, 11} (bits ignored), NOT {62,1},{64,2} (set runs), the last run emitted.
     CHECK(l.n == 3);
     CHECK(l.n == 3 && l.first[0] == 60 && l.count[0] == 2);
     CHECK(l.n == 3 && l.first[1] == 63 && l.count[1] == 1);
     CHECK(l.n == 3 && l.first[2] == 66 && l.count[2] == 5);
+    CHECK(skipped == 3);  // pages 62, 64, 65
   }
   {
     RunLog l;
-    ss::ForEachClearPageRun(bits, 64, 2, RunFn, &l);  // every page set: no run
+    const uint32_t skipped = ss::ForEachClearPageRun(bits, 64, 2, RunFn, &l);  // every page set: no run
     CHECK(l.n == 0);
+    CHECK(skipped == 2);
   }
   {
     RunLog l;
-    ss::ForEachClearPageRun(bits, 120, 20, RunFn, &l);  // 128 pages held: clamped to 120..127
+    const uint32_t skipped = ss::ForEachClearPageRun(bits, 120, 20, RunFn, &l);  // 128 pages held: 120..127
     CHECK(l.n == 1 && l.first[0] == 120 && l.count[0] == 8);
+    CHECK(skipped == 0);  // NOT 12 (20 - 8)
+    const uint64_t tail[2] = {0, uint64_t(1) << 63};  // page 127 set
+    RunLog t;
+    const uint32_t tail_skipped = ss::ForEachClearPageRun(tail, 120, 20, RunFn, &t);
+    CHECK(t.n == 1 && t.first[0] == 120 && t.count[0] == 7);
+    CHECK(tail_skipped == 1);  // NOT 13 (20 - 7)
   }
   {
     RunLog l;
-    ss::ForEachClearPageRun(bits, 200, 5, RunFn, &l);  // past the words: nothing
-    ss::ForEachClearPageRun(bits, 0, 0, RunFn, &l);    // no pages: nothing
+    const uint32_t past = ss::ForEachClearPageRun(bits, 200, 5, RunFn, &l);  // past the words: nothing
+    const uint32_t none = ss::ForEachClearPageRun(bits, 0, 0, RunFn, &l);    // no pages: nothing
     CHECK(l.n == 0);
+    CHECK(past == 0 && none == 0);  // NOT 5 for the span past the words
   }
 }
 

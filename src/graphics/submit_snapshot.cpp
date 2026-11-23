@@ -481,18 +481,23 @@ std::string State::StatsLine() const {
                 static_cast<unsigned long long>(thread_other_.load(std::memory_order_relaxed)));
   threads += buf;
   auto u = [](uint64_t v) { return static_cast<unsigned long long>(v); };
-  char line[640];
+  // The longest line (every number 20 digits, both thread slots claimed) is 675 characters, past the old 640
+  // (637 before kept_gpu_written): 1024 holds it.
+  char line[1024];
   std::snprintf(line, sizeof(line),
                 "submit snapshot stats: frames=%llu ranges_max=%llu ranges_now=%llu spliced=%llu differing=%llu "
                 "missing_reused=%llu missing_not_yet=%llu not_in_copy=%llu copy_us_median=%llu copy_us_max=%llu "
-                "check_ranges=%llu check_moved=%llu swap_threads=%s rejected_cap=%llu rejected_size=%llu banned=%llu",
+                "check_ranges=%llu check_moved=%llu swap_threads=%s rejected_cap=%llu rejected_size=%llu banned=%llu "
+                "kept_gpu_written=%llu",
                 u(frames_), u(ranges_max_), u(learner_.ranges().size()), u(spliced_), u(differing_calls_),
                 u(missing_reused_), u(missing_not_yet_), u(not_in_copy_), u(median),
                 u(copy_max_.load(std::memory_order_relaxed)), u(check_ranges_.load(std::memory_order_relaxed)),
                 u(check_moved_.load(std::memory_order_relaxed)), threads.c_str(), u(learner_.rejected_cap_),
-                u(learner_.rejected_size_), u(learner_.banned_));
+                u(learner_.rejected_size_), u(learner_.banned_), u(kept_gpu_written_));
   return line;
 }
+
+void State::NoteKeptGpuWritten(uint32_t pages) { kept_gpu_written_ += pages; }
 
 void State::Reset() {
   kept_.clear();
@@ -512,13 +517,15 @@ State& Global() {
   return s;
 }
 
-void ForEachClearPageRun(std::span<const uint64_t> bits, uint32_t page_first, uint32_t page_count, PageRunFn run,
-                         void* ctx) {
+uint32_t ForEachClearPageRun(std::span<const uint64_t> bits, uint32_t page_first, uint32_t page_count, PageRunFn run,
+                             void* ctx) {
   const uint64_t end = std::min<uint64_t>(uint64_t(page_first) + page_count, uint64_t(bits.size()) * 64);
   uint64_t run_first = 0;
   bool in_run = false;
+  uint32_t skipped = 0;
   for (uint64_t p = page_first; p < end; ++p) {
     const bool set = (bits[size_t(p >> 6)] >> (p & 63)) & 1;
+    if (set) ++skipped;
     if (!set && !in_run) {
       run_first = p;
       in_run = true;
@@ -528,6 +535,7 @@ void ForEachClearPageRun(std::span<const uint64_t> bits, uint32_t page_first, ui
     }
   }
   if (in_run) run(ctx, uint32_t(run_first), uint32_t(end - run_first));
+  return skipped;
 }
 
 }  // namespace rex::graphics::submit_snapshot

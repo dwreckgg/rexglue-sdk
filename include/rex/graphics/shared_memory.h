@@ -282,7 +282,12 @@ class SharedMemory {
   bool AnyPageGpuWritten(uint32_t start, uint32_t length) const;
   // Invalidates (as a CPU write, exact) only the pages of [start, start +
   // length) whose GPU-written bit is clear; a GPU-written page keeps its data
-  // (review M2). Takes the global lock (recursive; both callers hold it).
+  // (review M2: invalidating would lose the GPU's data on every frame) and is
+  // counted (State::NoteKeptGpuWritten). The bit is per page, so a partial GPU
+  // write leaves the rest of a skipped page holding the copy until the guest's
+  // next write trips its watch (review N1); the range is banned only on a
+  // latched-on boundary, not on the one that latches off and not in
+  // ResetSubmitSnapshot. Takes the global lock (recursive; both callers hold it).
   void InvalidateSubmitSnapshotPages(uint32_t start, uint32_t length);
   static void SubmitSnapshotInvalidateThunk(void* context, uint32_t start_bytes,
                                             uint32_t length_bytes);
