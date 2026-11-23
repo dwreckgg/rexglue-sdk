@@ -60,8 +60,10 @@ class Ring {
   // `read` refuses is skipped (not held by the copy). `check`: re-reads each copied range right after the whole
   // copy and counts the ranges whose bytes moved (or could not be re-read).
   CopyResult Copy(uint32_t ordinal, std::span<const Range> list, ReadFn read, void* ctx, bool check);
-  // dest holds guest bytes [start, start + size); overwrites, inside it, every byte of copy `frame`'s ranges;
-  // appends each range whose copy bytes differed from dest's prior bytes to *differing (cleared first).
+  // dest holds guest bytes [start, start + size); overwrites, inside it, the bytes of copy `frame`'s ranges that
+  // also lie in a `learned` range (a range the copy holds but the learner dropped stays live); appends each spliced
+  // piece (held and learned and inside the window) whose copy bytes differed from dest's prior bytes to *differing
+  // (cleared first). spliced / differing count those pieces.
   // kNone only when the slot's ordinal equals `frame`; greater -> kReused; smaller or never written -> kNotYet; on
   // a miss dest is untouched. not_in_copy (kNone only): learned ranges overlapping the window that no single range
   // of the copy contains.
@@ -89,9 +91,10 @@ class Learner {
   void BeginFrame(uint32_t frame);  // ages (D11), clears the frame's notes and pass table
   void NoteRequest(uint32_t address, uint32_t size, uint64_t bin_select, uint32_t uploaded_pages);
   void NoteChanged(const Range& r);  // a splice saw copy != live inside r: last_active = frame
-  // Drops every listed range with a GPU-written page and bans it (A17: a ban leaves after kAgeFrames frames
-  // without its pages being GPU-written; at most kMaxRanges bans). Also re-tests and ages existing bans.
-  void BanOverlapping(GpuWrittenFn written, void* ctx);
+  // Drops every listed range with a GPU-written page and bans the whole pages it covers (page size
+  // 1 << page_size_log2); a candidate overlapping a banned page is refused. A17: a ban leaves after kAgeFrames
+  // frames without its pages being GPU-written; at most kMaxRanges bans. Also re-tests and ages existing bans.
+  void BanOverlapping(GpuWrittenFn written, void* ctx, uint32_t page_size_log2);
   std::span<const Range> ranges() const;  // sorted by address, merged
   uint64_t generation() const;            // +1 on every change of ranges()
   const std::vector<std::pair<uint32_t, uint32_t>>& LearnedPageSpans(uint32_t page_size_log2);  // (first, count)
@@ -114,7 +117,7 @@ class Learner {
   void TryLearn(Range c);
   void RemoveAt(size_t i);
   bool Banned(const Range& c) const;
-  void AddBan(const Range& r);
+  void AddBan(const Range& pages);
 
   uint32_t frame_ = 0;
   uint64_t generation_ = 0;
@@ -143,7 +146,7 @@ class State {
   void NoteCopyMicros(uint32_t us);         // histogram, 1 us buckets to 2000, then one overflow bucket
   // GPU thread
   void GpuFrameBoundary(uint32_t swap_ordinal, bool on, InvalidateFn inv, void* inv_ctx, GpuWrittenFn written,
-                        void* written_ctx);  // kept spans invalidated FIRST, whatever `on`
+                        void* written_ctx, uint32_t page_size_log2);  // kept spans invalidated FIRST, whatever `on`
   bool gpu_on() const;                       // the latch (D6)
   void GpuNoteRequest(uint32_t address, uint32_t size, uint64_t bin_select, uint32_t uploaded_pages);
   void GpuSplice(uint32_t start, uint32_t size, uint8_t* dest, uint32_t page_size_log2);  // no-op unless latched on

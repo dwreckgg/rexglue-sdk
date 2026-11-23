@@ -97,19 +97,24 @@ SpliceResult Ring::Splice(uint32_t frame, uint32_t start, uint32_t size, uint8_t
   }
   const uint64_t w0 = start, w1 = uint64_t(start) + size;
   std::span<const Range> held(s.ranges);
+  // Only bytes a held range and a range learned NOW share (spec section 3: "every learned range ... when copy N
+  // holds that range"): a range the learner dropped since the copy (banned, aged out) stays live.
   for (size_t i = FirstEndingAfter(held, w0); i < held.size() && held[i].address < w1; ++i) {
     const Range& r = held[i];
-    uint64_t lo = std::max<uint64_t>(r.address, w0), hi = std::min(End(r), w1);
-    if (lo >= hi) continue;
-    const uint8_t* src = s.bytes.data() + s.offsets[i] + (lo - r.address);
-    uint8_t* dst = dest + (lo - w0);
-    size_t n = size_t(hi - lo);
-    if (std::memcmp(src, dst, n) != 0) {
-      ++res.differing;
-      if (differing) differing->push_back(r);
+    const uint64_t h0 = std::max<uint64_t>(r.address, w0), h1 = std::min(End(r), w1);
+    for (size_t j = FirstEndingAfter(learned, h0); j < learned.size() && learned[j].address < h1; ++j) {
+      uint64_t lo = std::max<uint64_t>(learned[j].address, h0), hi = std::min(End(learned[j]), h1);
+      if (lo >= hi) continue;
+      const uint8_t* src = s.bytes.data() + s.offsets[i] + (lo - r.address);
+      uint8_t* dst = dest + (lo - w0);
+      size_t n = size_t(hi - lo);
+      if (std::memcmp(src, dst, n) != 0) {
+        ++res.differing;
+        if (differing) differing->push_back(Range{uint32_t(lo), uint32_t(n)});
+      }
+      std::memcpy(dst, src, n);
+      ++res.spliced;
     }
-    std::memcpy(dst, src, n);
-    ++res.spliced;
   }
   for (size_t i = FirstEndingAfter(learned, w0); i < learned.size() && learned[i].address < w1; ++i) {
     const Range& l = learned[i];
@@ -247,19 +252,19 @@ void Learner::NoteChanged(const Range& r) {
   }
 }
 
-void Learner::AddBan(const Range& r) {
+void Learner::AddBan(const Range& pages) {
   if (bans_.size() < kMaxRanges) {
-    bans_.push_back(Ban{r, frame_});
+    bans_.push_back(Ban{pages, frame_});
     return;
   }
   size_t oldest = 0;
   for (size_t i = 1; i < bans_.size(); ++i) {
     if (int32_t(bans_[i].last_written - bans_[oldest].last_written) < 0) oldest = i;
   }
-  bans_[oldest] = Ban{r, frame_};
+  bans_[oldest] = Ban{pages, frame_};
 }
 
-void Learner::BanOverlapping(GpuWrittenFn written, void* ctx) {
+void Learner::BanOverlapping(GpuWrittenFn written, void* ctx, uint32_t page_size_log2) {
   if (!written) return;
   // Re-test the bans: still written -> seen now; not written for more than kAgeFrames frames -> leaves.
   for (size_t i = bans_.size(); i-- > 0;) {
@@ -273,7 +278,11 @@ void Learner::BanOverlapping(GpuWrittenFn written, void* ctx) {
   bool removed = false;
   for (size_t i = list_.size(); i-- > 0;) {
     if (written(ctx, list_[i].address, list_[i].size)) {
-      AddBan(list_[i]);
+      // The ban covers the whole pages of the range (spec section 2 reads GPU writes at page level).
+      const uint64_t page = uint64_t(1) << page_size_log2;
+      const uint64_t p0 = uint64_t(list_[i].address) & ~(page - 1);
+      const uint64_t p1 = (End(list_[i]) + page - 1) & ~(page - 1);
+      AddBan(Range{uint32_t(p0), uint32_t(p1 - p0)});
       RemoveAt(i);
       ++banned_;
       removed = true;
@@ -305,7 +314,7 @@ const std::vector<std::pair<uint32_t, uint32_t>>& Learner::LearnedPageSpans(uint
 
 State::State() {
   kept_.reserve(kMaxRanges * 4);
-  differing_.reserve(kMaxRanges);
+  differing_.reserve(kMaxRanges * 2);  // pieces of two sorted, non-overlapping lists: at most held + learned
   published_.reserve(kMaxRanges);
   guest_list_.reserve(kMaxRanges);
   for (auto& id : thread_ids_) id.store(kNoThread, std::memory_order_relaxed);
@@ -366,7 +375,7 @@ void State::PublishIfChanged() {
 }
 
 void State::GpuFrameBoundary(uint32_t swap_ordinal, bool on, InvalidateFn inv, void* inv_ctx, GpuWrittenFn written,
-                             void* written_ctx) {
+                             void* written_ctx, uint32_t page_size_log2) {
   if (inv) {
     for (const auto& k : kept_) inv(inv_ctx, uint32_t(k.first), uint32_t(k.second - k.first));
   }
@@ -376,7 +385,7 @@ void State::GpuFrameBoundary(uint32_t swap_ordinal, bool on, InvalidateFn inv, v
   if (frame_ == 0) return;
   ++frames_;
   learner_.BeginFrame(frame_);
-  learner_.BanOverlapping(written, written_ctx);
+  learner_.BanOverlapping(written, written_ctx, page_size_log2);
   PublishIfChanged();
 }
 
@@ -486,6 +495,7 @@ void State::Reset() {
   // The refusal counters are statistics of the run, not learned state: they survive the reset.
   uint64_t cap = learner_.rejected_cap_, size = learner_.rejected_size_, banned = learner_.banned_;
   learner_ = Learner();
+  learner_.frame_ = frame_;  // the learner stays on the current frame: a range learned after the reset ages from it
   learner_.rejected_cap_ = cap;
   learner_.rejected_size_ = size;
   learner_.banned_ = banned;

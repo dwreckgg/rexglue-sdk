@@ -122,9 +122,11 @@ static void InvFn(void* ctx, uint32_t start, uint32_t length) {
   ++l->n;
 }
 
+static void NoInv(void*, uint32_t, uint32_t) {}
+
 // A boundary with an invalidate log and no GPU-written pages.
 static void Boundary(ss::State& s, uint32_t ordinal, bool on, InvLog* inv) {
-  s.GpuFrameBoundary(ordinal, on, InvFn, inv, NeverWritten, nullptr);
+  s.GpuFrameBoundary(ordinal, on, InvFn, inv, NeverWritten, nullptr, 12);
 }
 
 // The learning signature: first seen under select 0x1 (pass 0) with no pages, then under 0x2 (pass 1) with a page.
@@ -506,28 +508,30 @@ static void TestBanGpuWritten() {
     LearnL(l, 0x2100, 0x100);  // inside the written page
     LearnL(l, 0x3000, 0x100);  // beside it
     uint64_t g = l.generation();
-    l.BanOverlapping(WrittenFn, &wf);
+    l.BanOverlapping(WrittenFn, &wf, 12);
     CHECK(!HasRange(l.ranges(), 0x2100, 0x100));
     CHECK(HasRange(l.ranges(), 0x3000, 0x100));
     CHECK(l.generation() == g + 1);
     g = l.generation();
-    l.BanOverlapping(WrittenFn, &wf);  // removes nothing
+    l.BanOverlapping(WrittenFn, &wf, 12);  // removes nothing
     CHECK(l.generation() == g);
     l.BeginFrame(2);
     LearnL(l, 0x2180, 0x100);  // overlaps the banned range
     CHECK(!HasRange(l.ranges(), 0x2180, 0x100));
+    LearnL(l, 0x2800, 0x100);  // the same GPU-written page, not overlapping the old range: the page is banned
+    CHECK(!HasRange(l.ranges(), 0x2800, 0x100));
     LearnL(l, 0x4000, 0x100);  // beside it: learned
     CHECK(HasRange(l.ranges(), 0x4000, 0x100));
     // The page stops being GPU-written: the ban (last written at frame 1) leaves at frame 1 + 121.
     wf.on = false;
     for (uint32_t f = 3; f <= 121; ++f) {
       l.BeginFrame(f);
-      l.BanOverlapping(WrittenFn, &wf);
+      l.BanOverlapping(WrittenFn, &wf, 12);
     }
     LearnL(l, 0x2100, 0x100);  // frame 121: still banned
     CHECK(!HasRange(l.ranges(), 0x2100, 0x100));
     l.BeginFrame(122);
-    l.BanOverlapping(WrittenFn, &wf);
+    l.BanOverlapping(WrittenFn, &wf, 12);
     LearnL(l, 0x2100, 0x100);
     CHECK(HasRange(l.ranges(), 0x2100, 0x100));
   }
@@ -540,12 +544,12 @@ static void TestBanGpuWritten() {
     for (uint32_t f = 1; f <= 170; ++f) {
       if (f > 1) l.BeginFrame(f);
       w2.on = f <= 50;
-      l.BanOverlapping(WrittenFn, &w2);
+      l.BanOverlapping(WrittenFn, &w2, 12);
     }
     LearnL(l, 0x2100, 0x100);
     CHECK(!HasRange(l.ranges(), 0x2100, 0x100));
     l.BeginFrame(171);
-    l.BanOverlapping(WrittenFn, &w2);
+    l.BanOverlapping(WrittenFn, &w2, 12);
     LearnL(l, 0x2100, 0x100);
     CHECK(HasRange(l.ranges(), 0x2100, 0x100));
   }
@@ -554,11 +558,11 @@ static void TestBanGpuWritten() {
     auto s = std::make_unique<ss::State>();
     InvLog inv;
     WrittenFake w3{0x2000, 4096, false};
-    s->GpuFrameBoundary(1, true, InvFn, &inv, WrittenFn, &w3);
+    s->GpuFrameBoundary(1, true, InvFn, &inv, WrittenFn, &w3, 12);
     LearnS(*s, 0x2100, 0x100);
     CHECK(StatField(*s, "ranges_now") == 1);
     w3.on = true;
-    s->GpuFrameBoundary(2, true, InvFn, &inv, WrittenFn, &w3);
+    s->GpuFrameBoundary(2, true, InvFn, &inv, WrittenFn, &w3, 12);
     CHECK(StatField(*s, "ranges_now") == 0);
     CHECK(StatField(*s, "banned") == 1);
     LearnS(*s, 0x2100, 0x100);
@@ -745,7 +749,7 @@ static void TestStatsLine() {
   s->NoteCopyMicros(9);
   s->NoteCopyMicros(3000);
   s->NoteCopyMicros(7);
-  s->GpuFrameBoundary(1, true, InvFn, &inv, WrittenFn, &wf);  // frames=1, frame 2
+  s->GpuFrameBoundary(1, true, InvFn, &inv, WrittenFn, &wf, 12);  // frames=1, frame 2
   LearnS(*s, 0x1100, 384);                                    // R1
   LearnS(*s, 0x1800, 768);                                    // R2
   LearnS(*s, 0x9000, 16);                                     // R3 (to be banned)
@@ -758,19 +762,19 @@ static void TestStatsLine() {
   ss::CopyResult c7 = s->GuestSwap(7, MemRead, &mem, true);  // check_ranges=10, check_moved=1
   CHECK(c7.copied == 10 && c7.check_moved == 1);
   wf.on = true;
-  s->GpuFrameBoundary(2, true, InvFn, &inv, WrittenFn, &wf);  // frames=2, frame 3; R3 dropped: banned=1, 9 ranges
+  s->GpuFrameBoundary(2, true, InvFn, &inv, WrittenFn, &wf, 12);  // frames=2, frame 3; R3 dropped: banned=1, 9 ranges
   wf.on = false;
   s->GuestSwap(8, MemRead, &mem, false);                      // slot 0; no check
-  s->GpuFrameBoundary(6, true, InvFn, &inv, WrittenFn, &wf);  // frames=3, frame 7 (slot 3 = copy 7)
+  s->GpuFrameBoundary(6, true, InvFn, &inv, WrittenFn, &wf, 12);  // frames=3, frame 7 (slot 3 = copy 7)
   Window wa(0x1000, 4096);                                    // pattern B: R1 and R2 differ from copy 7
   s->GpuSplice(0x1000, 4096, wa.dest(), 12);                  // spliced=1, differing=1, not_in_copy +0
-  s->GpuFrameBoundary(8, true, InvFn, &inv, WrittenFn, &wf);  // frames=4, frame 9 (slot 1: never written)
+  s->GpuFrameBoundary(8, true, InvFn, &inv, WrittenFn, &wf, 12);  // frames=4, frame 9 (slot 1: never written)
   Window wb(0x1000, 4096);
   s->GpuSplice(0x1000, 4096, wb.dest(), 12);  // missing_not_yet=1
   s->GuestSwap(13, MemRead, &mem, false);     // slot 1 = 13 > 9
   s->GpuSplice(0x1000, 4096, wb.dest(), 12);  // missing_reused=1
   s->GuestSwap(10, MemRead, &mem, false);     // slot 2 = copy 10 (9 ranges, memory after the flip)
-  s->GpuFrameBoundary(9, true, InvFn, &inv, WrittenFn, &wf);  // frames=5, frame 10
+  s->GpuFrameBoundary(9, true, InvFn, &inv, WrittenFn, &wf, 12);  // frames=5, frame 10
   LearnS(*s, 0x1400, 32);                                     // R4: 10 ranges again (ranges_max stays 10)
   Window wc(0x1000, 4096);
   wc.FillFrom(mem);                           // copy == live for R1 and R2
@@ -823,10 +827,10 @@ static void TestResetClears() {
   FakeMem mem(0x10000);
   InvLog inv;
   WrittenFake wf{0x9000, 4096, false};
-  s->GpuFrameBoundary(1, true, InvFn, &inv, WrittenFn, &wf);  // frame 2
+  s->GpuFrameBoundary(1, true, InvFn, &inv, WrittenFn, &wf, 12);  // frame 2
   LearnS(*s, 0x9000, 16);
   wf.on = true;
-  s->GpuFrameBoundary(2, true, InvFn, &inv, WrittenFn, &wf);  // frame 3: banned
+  s->GpuFrameBoundary(2, true, InvFn, &inv, WrittenFn, &wf, 12);  // frame 3: banned
   wf.on = false;
   CHECK(StatField(*s, "banned") == 1);
   LearnS(*s, 0x1100, 64);
@@ -839,7 +843,7 @@ static void TestResetClears() {
   s->Reset();
   CHECK(StatField(*s, "ranges_now") == 0);  // learner cleared
   inv = InvLog{};
-  s->GpuFrameBoundary(3, true, InvFn, &inv, WrittenFn, &wf);  // frame 4
+  s->GpuFrameBoundary(3, true, InvFn, &inv, WrittenFn, &wf, 12);  // frame 4
   CHECK(inv.n == 0);                                          // kept spans cleared
   mem.reads = 0;
   ss::CopyResult c5 = s->GuestSwap(5, MemRead, &mem, false);  // slot 1
@@ -852,6 +856,82 @@ static void TestResetClears() {
   LearnS(*s, 0x9000, 16);  // the ban is gone
   CHECK(StatField(*s, "ranges_now") == 2);
   CHECK(StatField(*s, "banned") == 1);
+  // The learner stays on the current frame (review P2): a range learned after a mid-frame Reset at frame 200 is
+  // still listed at frame 201. The same sequence without Reset is the control.
+  for (int with_reset = 0; with_reset < 2; ++with_reset) {
+    auto r = std::make_unique<ss::State>();
+    InvLog li;
+    Boundary(*r, 199, true, &li);  // frame 200
+    if (with_reset) r->Reset();
+    LearnS(*r, 0x1100, 64);
+    CHECK(StatField(*r, "ranges_now") == 1);
+    Boundary(*r, 200, true, &li);  // frame 201
+    CHECK(StatField(*r, "ranges_now") == 1);
+  }
+}
+
+// 21. Only bytes a held range shares with a range learned NOW are spliced (review F1, F3).
+static void TestSpliceOnlyLearnedNow() {
+  Case("splice_only_learned_now");
+  {
+    // Review P1: a range banned after the copy stays live, also beside a learned range in the same window.
+    auto s = std::make_unique<ss::State>();
+    FakeMem mem(0x10000);
+    InvLog inv;
+    WrittenFake wf{0x1800, 64, false};
+    s->GpuFrameBoundary(1, true, InvFn, &inv, WrittenFn, &wf, 12);  // frame 2
+    LearnS(*s, 0x1100, 64);
+    LearnS(*s, 0x1800, 64);
+    s->GuestSwap(3, MemRead, &mem, false);  // copy 3 holds both
+    wf.on = true;
+    s->GpuFrameBoundary(2, true, InvFn, &inv, WrittenFn, &wf, 12);  // frame 3: 0x1800 dropped and banned
+    CHECK(StatField(*s, "ranges_now") == 1);
+    CHECK(StatField(*s, "banned") == 1);
+    Window w(0x1000, 4096);
+    s->GpuSplice(0x1000, 4096, w.dest(), 12);
+    CHECK(AllPat(w, 0x1100, 64, true));   // control: the learned range is spliced
+    CHECK(AllPat(w, 0x1800, 64, false));  // the dropped range stays live
+    Window w2(0x1800, 64);
+    s->GpuSplice(0x1800, 64, w2.dest(), 12);
+    CHECK(AllPat(w2, 0x1800, 64, false));  // alone in its window: stays live
+  }
+  auto s = std::make_unique<ss::State>();
+  FakeMem mem(0x10000);
+  InvLog inv;
+  WrittenFake wf{0x1100, 64, false};
+  s->GpuFrameBoundary(1, true, InvFn, &inv, WrittenFn, &wf, 12);  // frame 2
+  LearnS(*s, 0x1100, 64);                                         // R1 (to be banned)
+  LearnS(*s, 0x5100, 64);                                         // R2
+  s->GuestSwap(3, MemRead, &mem, false);                          // copy 3 holds R1 and R2
+  wf.on = true;
+  s->GpuFrameBoundary(2, true, InvFn, &inv, WrittenFn, &wf, 12);  // frame 3: R1 dropped
+  wf.on = false;
+  CHECK(StatField(*s, "ranges_now") == 1);
+  // (a) A window overlapping no learned range while copy 3 holds bytes there: nothing spliced, nothing counted.
+  Window wa(0x1000, 4096);
+  s->GpuSplice(0x1000, 4096, wa.dest(), 12);
+  CHECK(AllPat(wa, 0x1100, 64, false));
+  CHECK(StatField(*s, "spliced") == 0);
+  CHECK(StatField(*s, "not_in_copy") == 0);
+  s->GuestSwap(5, MemRead, &mem, false);                          // copy 5 holds R2 only
+  s->GpuFrameBoundary(3, true, InvFn, &inv, WrittenFn, &wf, 12);  // frame 4: no copy 4
+  s->GpuSplice(0x1000, 4096, wa.dest(), 12);
+  CHECK(StatField(*s, "missing_not_yet") == 0);  // no learned range in the window: not a missing copy
+  CHECK(StatField(*s, "missing_reused") == 0);
+  Window wr(0x5000, 4096);
+  s->GpuSplice(0x5000, 4096, wr.dest(), 12);
+  CHECK(StatField(*s, "missing_not_yet") == 1);  // control: R2's window counts the missing copy
+  // (b) A learned range in the window that the copy does not hold there: not counted as spliced.
+  LearnS(*s, 0x6800, 64);                                         // R3, after copy 5
+  s->GpuFrameBoundary(4, true, InvFn, &inv, WrittenFn, &wf, 12);  // frame 5
+  Window wb(0x6000, 4096);
+  s->GpuSplice(0x6000, 4096, wb.dest(), 12);
+  CHECK(AllPat(wb, 0x6800, 64, false));
+  CHECK(StatField(*s, "spliced") == 0);
+  CHECK(StatField(*s, "not_in_copy") == 1);
+  s->GpuSplice(0x5000, 4096, wr.dest(), 12);  // control: R2 is held and learned
+  CHECK(StatField(*s, "spliced") == 1);
+  CHECK(AllPat(wr, 0x5100, 64, true));
 }
 
 // Waits until flag is set, polling, for at most ms milliseconds.
@@ -956,7 +1036,7 @@ static void TestPublishUnderConcurrency() {
   std::thread gpu([&] {
     uint32_t f = 1;
     while (!stop.load(std::memory_order_relaxed)) {
-      s->GpuFrameBoundary(f, true, nullptr, nullptr, nullptr, nullptr);
+      s->GpuFrameBoundary(f, true, NoInv, nullptr, NeverWritten, nullptr, 12);
       // One new range a frame at a cycling address; each leaves 121 frames later: the list keeps changing.
       uint32_t slot = (f * 37) % 300;
       LearnS(*s, 0x10000 + slot * 0x100, 0x80);
@@ -1014,6 +1094,7 @@ int main() {
   TestStatsLine();
   TestNoAllocationAfterWarmup();
   TestResetClears();
+  TestSpliceOnlyLearnedNow();
   // The threaded groups last, so a stuck thread's early exit leaves every other group's result printed.
   TestSlotLockedWhileCopying();
   TestPublishUnderConcurrency();
