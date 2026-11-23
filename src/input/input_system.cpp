@@ -18,6 +18,7 @@
 #include <rex/input/input_system.h>
 #include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
+#include <rex/input/pad_vibration.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
@@ -26,6 +27,15 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+
+REXCVAR_DEFINE_BOOL(pad_vibration_p1, true, "Input",
+                    "Player 1 controller vibration (off: the motors never run)");
+REXCVAR_DEFINE_BOOL(pad_vibration_p2, true, "Input",
+                    "Player 2 controller vibration (off: the motors never run)");
+REXCVAR_DEFINE_BOOL(pad_vibration_p3, true, "Input",
+                    "Player 3 controller vibration (off: the motors never run)");
+REXCVAR_DEFINE_BOOL(pad_vibration_p4, true, "Input",
+                    "Player 4 controller vibration (off: the motors never run)");
 namespace rex::input {
 
 InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
@@ -139,9 +149,15 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
 X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
   SCOPE_profile_cpu_f("hid");
 
+  // The per-slot switch: an off slot's drivers get a copy with both motors zero. They are still
+  // called, so the result is the same either way, and *vibration (guest memory) is never written.
+  const std::array<bool, 4> enabled = {REXCVAR_GET(pad_vibration_p1), REXCVAR_GET(pad_vibration_p2),
+                                       REXCVAR_GET(pad_vibration_p3), REXCVAR_GET(pad_vibration_p4)};
+  X_INPUT_VIBRATION send = VibrationToSend(user_index, *vibration, enabled);
+
   bool any_connected = false;
   for (auto& driver : drivers_) {
-    X_RESULT result = driver->SetState(user_index, vibration);
+    X_RESULT result = driver->SetState(user_index, &send);
     if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
       any_connected = true;
     }
