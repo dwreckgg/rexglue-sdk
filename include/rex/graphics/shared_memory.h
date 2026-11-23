@@ -95,9 +95,27 @@ class SharedMemory {
 
   // Checks if the range has been updated, uploads new data if needed and
   // ensures the host GPU memory backing the range are resident. Returns true if
-  // the range has been fully updated and is usable.
-  bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
-  bool RequestRange(uint32_t start, uint32_t length);
+  // the range has been fully updated and is usable. uploaded_pages (optional):
+  // the number of pages handed to UploadRanges by this call (0 when every page
+  // was valid already, and on every early return).
+  bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count,
+                     uint32_t* uploaded_pages = nullptr);
+  bool RequestRange(uint32_t start, uint32_t length, uint32_t* uploaded_pages = nullptr);
+
+  // Submit snapshot (submit_snapshot.h, gpu_submit_snapshot): the GPU thread's
+  // frame boundary, at each swap packet (CommandProcessor::
+  // OnSubmitSnapshotFrameBoundary). swap_ordinal = the packet's VdSwap ordinal
+  // (0: none); on = gpu_submit_snapshot read now (the latch for the frame).
+  // Holds the global lock through the whole call (the pages kept from the last
+  // frame that are not GPU-written are invalidated through
+  // MemoryInvalidationCallback, the GPU-written bans read
+  // system_page_flags_valid_and_gpu_written_); returns before the lock when
+  // `on` is off and the latch is off already. GPU thread only.
+  void SubmitSnapshotFrameBoundary(uint32_t swap_ordinal, bool on);
+  // Submit snapshot at a cache clear (after ClearCache, GPU thread):
+  // invalidates every page of a learned range (a superset of the pages kept
+  // this frame) that is not GPU-written, then State::Reset.
+  void ResetSubmitSnapshot();
 
   // Marks the range and, if not exact_range, potentially its surroundings
   // (to up to the first GPU-written page, as an access violation exception
@@ -186,6 +204,16 @@ class SharedMemory {
   virtual bool UploadRanges(
       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
 
+  // Submit snapshot: dest holds guest bytes [start_bytes, start_bytes +
+  // size_bytes) just copied from guest memory (`live`, the memcpy's source)
+  // into an upload buffer; overwrites the bytes of learned ranges with the
+  // current frame's VdSwap copy (a no-op unless the frame is latched on and has
+  // a copy). dest is only written (an upload mapping is write-combined or
+  // uncached); the copy is compared with live. Call in UploadRanges right after
+  // each memcpy, without the global lock held. GPU thread only.
+  void SpliceSubmitSnapshot(uint32_t start_bytes, uint32_t size_bytes, uint8_t* dest,
+                            const uint8_t* live);
+
   const std::vector<std::pair<uint32_t, uint32_t>>& trace_download_ranges() {
     return trace_download_ranges_;
   }
@@ -245,6 +273,25 @@ class SharedMemory {
   std::vector<uint64_t> upload_history_[3];
   std::vector<std::pair<uint32_t, uint32_t>> prefetch_ranges_;  // pages
   void NoteRequested(uint32_t start, uint32_t length);          // bytes
+  // Submit snapshot (GPU thread): the frames latched on since start (the stats
+  // line every 3600 of them), and the prefetch's ranges minus learned pages.
+  uint64_t submit_snapshot_frames_on_ = 0;
+  std::vector<std::pair<uint32_t, uint32_t>> submit_snapshot_scratch_;  // pages
+  // Call with the global lock held: any page of [start, start + length) holds
+  // GPU-written data (system_page_flags_valid_and_gpu_written_).
+  bool AnyPageGpuWritten(uint32_t start, uint32_t length) const;
+  // Invalidates (as a CPU write, exact) only the pages of [start, start +
+  // length) whose GPU-written bit is clear; a GPU-written page keeps its data
+  // (review M2: invalidating would lose the GPU's data on every frame) and is
+  // counted (State::NoteKeptGpuWritten). The bit is per page, so a partial GPU
+  // write leaves the rest of a skipped page holding the copy until the guest's
+  // next write trips its watch (review N1); the range is banned only on a
+  // latched-on boundary, not on the one that latches off and not in
+  // ResetSubmitSnapshot. Takes the global lock (recursive; both callers hold it).
+  void InvalidateSubmitSnapshotPages(uint32_t start, uint32_t length);
+  static void SubmitSnapshotInvalidateThunk(void* context, uint32_t start_bytes,
+                                            uint32_t length_bytes);
+  static bool SubmitSnapshotGpuWrittenThunk(void* context, uint32_t address, uint32_t size);
   // Subset of valid pages containing data written by the GPU.
   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
   // Dirty state tracking for frame-end page-state refresh.

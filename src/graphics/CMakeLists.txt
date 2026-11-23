@@ -27,6 +27,7 @@ set(REXGRAPHICS_SYSTEM_SOURCES
     primitive_processor.cpp
     pipeline/render_target/cache.cpp
     shared_memory.cpp
+    submit_snapshot.cpp
     pipeline/texture/cache.cpp
     pipeline/texture/conversion.cpp
     pipeline/shader/interpreter.cpp

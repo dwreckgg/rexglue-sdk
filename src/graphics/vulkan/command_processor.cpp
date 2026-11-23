@@ -33,6 +33,7 @@
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/submit_snapshot.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
@@ -68,6 +69,8 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DECLARE(bool, gpu_submit_snapshot);  // src/graphics/shared_memory.cpp
 
 namespace rex::graphics::vulkan {
 
@@ -1912,6 +1915,11 @@ bool VulkanCommandProcessor::SetupContext() {
 
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  // Submit snapshot: the teardown stats line (on the GPU thread, which StatsLine requires), then the learned state
+  // goes (the shared memory is destroyed below, so there is no page to invalidate; a later SetupContext starts with
+  // every page invalid and an empty list).
+  REXGPU_INFO("{}", submit_snapshot::Global().StatsLine());
+  submit_snapshot::Global().Reset();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -3597,6 +3605,22 @@ void VulkanCommandProcessor::OnPrimaryBufferEnd() {
   }
 }
 
+void VulkanCommandProcessor::OnSubmitSnapshotFrameBoundary(uint32_t swap_ordinal) {
+  if (!shared_memory_) {
+    return;
+  }
+  submit_snapshot::State& snapshot = submit_snapshot::Global();
+  const bool was_on = snapshot.gpu_on();
+  shared_memory_->SubmitSnapshotFrameBoundary(swap_ordinal, REXCVAR_GET(gpu_submit_snapshot));
+  if (snapshot.gpu_on() || was_on) {
+    // Spec section 3 (vertex-slot cache): each slot's first draw of the frame goes through RequestRange, so no
+    // slot keeps drawing an earlier frame's copy (IssueSwap clears only the in-sync bits). Also on the boundary
+    // that latches off (review M3): a slot whose last request was a kept range would otherwise keep drawing that
+    // copy, its invalidated page never requested, until the slot's address changes.
+    InvalidateAllVertexBufferResidency();
+  }
+}
+
 Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                            const uint32_t* host_address, uint32_t dword_count) {
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
@@ -4029,12 +4053,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
         continue;
       }
-      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
+      // Submit snapshot: the uploaded page count only latched on (review M1: no page sum when off).
+      submit_snapshot::State& snapshot = submit_snapshot::Global();
+      uint32_t uploaded_pages = 0;
+      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2,
+                                        snapshot.gpu_on() ? &uploaded_pages : nullptr)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
             "memory",
             vfetch_constant.address << 2, vfetch_constant.size << 2);
         return false;
+      }
+      // Submit snapshot: learn the ranges a later pass (bin select) of the frame re-uploads.
+      if (snapshot.gpu_on()) {
+        snapshot.GpuNoteRequest(vfetch_constant.address << 2, vfetch_constant.size << 2, bin_select_,
+                                uploaded_pages);
       }
       state.address = vfetch_constant.address;
       state.size = vfetch_constant.size;
@@ -5518,6 +5551,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       primitive_processor_->ClearCache();
 
       shared_memory_->ClearCache();
+      // Submit snapshot: after the pages are cleared (B1); the learned pages are invalidated, then State::Reset.
+      shared_memory_->ResetSubmitSnapshot();
     }
   }
 

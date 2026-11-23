@@ -393,9 +393,13 @@ bool D3D12SharedMemory::UploadRanges(
         return false;
       }
       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
-      std::memcpy(upload_buffer_mapping,
-                  memory().TranslatePhysical(upload_range_start << page_size_log2()),
-                  upload_buffer_size);
+      const uint8_t* upload_source =
+          memory().TranslatePhysical(upload_range_start << page_size_log2());
+      std::memcpy(upload_buffer_mapping, upload_source, upload_buffer_size);
+      // Submit snapshot: learned ranges from the frame's VdSwap copy instead of live memory
+      // (compared with upload_source: the mapping is write-combined, never read back).
+      SpliceSubmitSnapshot(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size),
+                           upload_buffer_mapping, upload_source);
       ++command_processor_.gpu_timing_upload_copies_;  // TEMP DIAGNOSTIC
       command_processor_.gpu_timing_upload_bytes_ += upload_buffer_size;
       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),

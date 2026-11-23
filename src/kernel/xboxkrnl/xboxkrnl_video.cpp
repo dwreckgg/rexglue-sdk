@@ -13,6 +13,9 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <mutex>
 #include <string>
 
 #include <rex/pace_stats.h>
@@ -21,6 +24,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/submit_snapshot.h>
 #include <rex/graphics/video_mode_util.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/private.h>
@@ -34,6 +38,11 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
 #include <rex/ui/flags.h>
+#include <rex/thread.h>
+
+// Submit snapshot switches, defined in src/graphics/shared_memory.cpp.
+REXCVAR_DECLARE(bool, gpu_submit_snapshot);
+REXCVAR_DECLARE(bool, gpu_submit_snapshot_check);
 
 namespace {
 // Display gamma type: 0 - linear, 1 - sRGB (CRT), 2 - BT.709 (HDTV), 3 - power
@@ -78,6 +87,39 @@ uint32_t GetConfiguredVideoModeHeight() {
 float GetConfiguredVideoModeRefreshRate() {
   double refresh_rate_hz = std::clamp(REXCVAR_GET(video_mode_refresh_rate), 24.0, 240.0);
   return float(refresh_rate_hz);
+}
+
+// Submit snapshot: the guest copy's ReadFn (ctx = the kernel's memory::Memory). A range is readable as
+// SharedMemory::PrefetchFrameUploads checks it (physical heap QueryRangeAccess not kNoAccess); takes the heap
+// mutex only, never the GPU's global lock (called under swap_mutex()).
+bool ReadSnapshotRange(void* ctx, uint32_t address, uint32_t size, uint8_t* dest) {
+  auto* memory = static_cast<rex::memory::Memory*>(ctx);
+  if (!size) {
+    return true;
+  }
+  if (!memory || uint64_t(address) + size > 0x20000000ull) {
+    return false;
+  }
+  rex::memory::VirtualHeap* heap = memory->GetPhysicalHeap();
+  if (!heap || heap->QueryRangeAccess(address, address + (size - 1)) == rex::memory::PageAccess::kNoAccess) {
+    return false;
+  }
+  std::memcpy(dest, memory->TranslatePhysical(address), size);
+  return true;
+}
+
+// Submit snapshot: "submit snapshot: on|off" at the first VdSwap, then one line at each change of the value seen
+// there (n = the VdSwap call's number, from 1).
+void NoteSubmitSnapshotSwitch(bool on) {
+  static std::atomic<uint64_t> vdswap_calls{0};
+  static std::atomic<int> last_seen{-1};
+  const uint64_t n = vdswap_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+  const int previous = last_seen.exchange(on ? 1 : 0, std::memory_order_relaxed);
+  if (previous < 0) {
+    REXKRNL_INFO("submit snapshot: {}", on ? "on" : "off");
+  } else if (previous != (on ? 1 : 0)) {
+    REXKRNL_INFO("submit snapshot: {} from VdSwap {}", on ? "on" : "off", n);
+  }
 }
 }  // namespace
 
@@ -436,9 +478,15 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                   mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
                   mapped_u32 height) {
   pace_stats::Mark(pace_stats::kGuestSwap);
+  // Submit snapshot (submit_snapshot.h): the switch, read once per VdSwap. On, the ordinal is minted (from the lag
+  // marks' counter, the lag marks then using it too), the learned ranges copied and the swap packet written under
+  // swap_mutex(), after the front buffer check below, so an ordinal that gets no packet gets no copy either. Off,
+  // the lag marks below run exactly as they did before the snapshot.
+  const bool snapshot_on = REXCVAR_GET(gpu_submit_snapshot);
+  NoteSubmitSnapshotSwitch(snapshot_on);
   // Lag marks (pace_stats.h): this swap's ordinal, carried in its swap packet; 0 while the marks are off.
   uint32_t lag_swap_index = 0;
-  if (pace_stats::LagOn()) {
+  if (!snapshot_on && pace_stats::LagOn()) {
     lag_swap_index = pace_stats::LagGuestSwapCount().fetch_add(1, std::memory_order_relaxed) + 1;
     pace_stats::LagThreadSwap& last = pace_stats::LagLastSwapThisThread();
     last.index = lag_swap_index;
@@ -506,6 +554,32 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   dwords[offset++] = gpu_fetch.dword_4;
   dwords[offset++] = gpu_fetch.dword_5;
 
+  // Submit snapshot: held from the mint to the swap packet's last data dword (D4), so ordinal order is copy order
+  // and packet order on every guest thread that swaps; released by the guard on any way out.
+  std::unique_lock<std::mutex> snapshot_lock;
+  if (snapshot_on) {
+    namespace snapshot = rex::graphics::submit_snapshot;
+    snapshot::State& state = snapshot::Global();
+    snapshot_lock = std::unique_lock<std::mutex>(state.swap_mutex());
+    lag_swap_index = pace_stats::LagGuestSwapCount().fetch_add(1, std::memory_order_relaxed) + 1;
+    if (lag_swap_index == 0) {  // a wrap: 0 means "no ordinal" in the packet
+      lag_swap_index = pace_stats::LagGuestSwapCount().fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+    if (pace_stats::LagOn()) {
+      pace_stats::LagThreadSwap& last = pace_stats::LagLastSwapThisThread();
+      last.index = lag_swap_index;
+      last.qpc = int64_t(rex::chrono::Clock::host_tick_count_platform());
+    }
+    state.NoteSwapThread(rex::thread::current_thread_id());
+    const uint64_t copy_start = rex::chrono::Clock::QueryHostTickCount();
+    state.GuestSwap(lag_swap_index, ReadSnapshotRange, REX_KERNEL_MEMORY(),
+                    REXCVAR_GET(gpu_submit_snapshot_check));
+    const uint64_t copy_ticks = rex::chrono::Clock::QueryHostTickCount() - copy_start;
+    const uint64_t tick_frequency = rex::chrono::Clock::QueryHostTickFrequency();
+    const uint64_t copy_us = tick_frequency ? copy_ticks * 1000000 / tick_frequency : 0;
+    state.NoteCopyMicros(uint32_t(std::min<uint64_t>(copy_us, UINT32_MAX)));
+  }
+
   dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, lag_swap_index ? 5 : 4);
   dwords[offset++] = rex::graphics::xenos::kSwapSignature;
   dwords[offset++] = frontbuffer_physical_address;
@@ -514,6 +588,9 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   dwords[offset++] = *height;
   if (lag_swap_index) {
     dwords[offset++] = lag_swap_index;  // read by CommandProcessor::ExecutePacketType3_XE_SWAP
+  }
+  if (snapshot_lock.owns_lock()) {
+    snapshot_lock.unlock();
   }
 
   // Fill the rest of the buffer with NOP packets.

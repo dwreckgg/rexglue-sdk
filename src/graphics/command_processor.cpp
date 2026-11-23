@@ -1143,9 +1143,12 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_width = reader->ReadAndSwap<uint32_t>();
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   uint32_t data_read = 4;
+  submit_snapshot_swap_ordinal_ = 0;
   if (count >= 5) {
     // Lag marks (pace_stats.h): VdSwap's ordinal of this swap, for the present that paints its output.
+    // The submit snapshot keeps the same ordinal in its own variable (its frame boundary below).
     pace_stats::LagGpuSwapIndex() = reader->ReadAndSwap<uint32_t>();
+    submit_snapshot_swap_ordinal_ = pace_stats::LagGpuSwapIndex();
     data_read = 5;
   }
   reader->AdvanceRead((count - data_read) * sizeof(uint32_t));
@@ -1186,6 +1189,10 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   if (action.issue_swap) {
     IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   }
+  // Submit snapshot (D2): the frame boundary, at the packet's real execution (the first point that knows its
+  // ordinal; no draw runs between an early IssueSwap and this packet), before the next frame's first draw and the
+  // prefetch.
+  OnSubmitSnapshotFrameBoundary(submit_snapshot_swap_ordinal_);
   // Once per guest swap, after the frame's IssueSwap here or at the vblank wait before this packet.
   PrefetchFrameUploads();
 
