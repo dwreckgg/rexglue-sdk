@@ -747,10 +747,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
 
     // Fetch constant word usage:
     // - 2: Size (needed only once).
-    // - 3: Exponent adjustment (needed only once).
+    // - 3: Exponent adjustment (needed only once): kTextureFetch result
+    //      exponent bias (exp_adjust, bits 13:18).
     // - 4: Conditionally for 3D kTextureFetch: stacked texture filtering modes.
-    //      Unconditionally LOD kTextureFetch: LOD and gradient exponent bias,
-    //      result exponent bias.
+    //      Unconditionally LOD kTextureFetch: LOD bias (the gradient exponent
+    //      bias is in word 4 too, but is not applied yet).
     // - 5: Dimensionality (3D or 2D stacked - needed only once).
 
     // Load the texture size and whether it's 3D or stacked if needed.
@@ -1409,8 +1410,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, is_all_signed);
 
         // Load the fetch constant word 4, needed unconditionally for LOD
-        // biasing, for result exponent biasing, and conditionally for stacked
-        // texture filtering.
+        // biasing, and conditionally for stacked texture filtering.
         id_vector_temp_.clear();
         id_vector_temp_.push_back(const_int_0_);
         id_vector_temp_.push_back(
@@ -2030,10 +2030,24 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         }
 
         // Apply the exponent bias from the bits 13:18 of the fetch constant
-        // word 4.
+        // word 3 (exp_adjust, after the swizzle; word 4 bits 12:21 are the LOD
+        // bias, which this used to read, scaling every fetch by a power of 2
+        // taken from the LOD bias - Dead or Alive 4's post-processing came out
+        // black at 2^-24). The DXBC translator reads word 3.
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(const_int_0_);
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) >> 2)));
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) & 3)));
+        spv::Id fetch_constant_word_3_signed = builder_->createUnaryOp(
+            spv::OpBitcast, type_int_,
+            builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+                                                             uniform_fetch_constants_, id_vector_temp_),
+                                 spv::NoPrecision));
         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
-            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
+            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_3_signed,
                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
         {
           uint32_t result_remaining_components = used_result_nonzero_components;
