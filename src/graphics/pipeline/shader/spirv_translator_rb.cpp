@@ -934,6 +934,40 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
                                           id_vector_temp_),
               spv::NoPrecision));
 
+      // A SRC_ALPHA source factor of a min / max blend (SystemConstants::min_max_src_alpha): RGB and / or alpha times
+      // the source alpha, which the host min / max would otherwise ignore.
+      {
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantMinMaxSrcAlpha));
+        spv::Id min_max_src_alpha = builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                        id_vector_temp_),
+            spv::NoPrecision);
+        auto flag_set = [&](uint32_t bit) {
+          return builder_->createBinOp(
+              spv::OpINotEqual, type_bool_,
+              builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, min_max_src_alpha,
+                                    builder_->makeUintConstant(uint32_t(1) << bit)),
+              const_uint_0_);
+        };
+        spv::Id src_alpha = builder_->createCompositeExtract(color, type_float_, 3);
+        spv::Id const_float_1 = builder_->makeFloatConstant(1.0f);
+        spv::Id rgb_factor = builder_->createTriOp(spv::OpSelect, type_float_,
+                                                   flag_set(color_target_index), src_alpha,
+                                                   const_float_1);
+        spv::Id alpha_factor = builder_->createTriOp(spv::OpSelect, type_float_,
+                                                     flag_set(4 + color_target_index), src_alpha,
+                                                     const_float_1);
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(rgb_factor);
+        id_vector_temp_.push_back(rgb_factor);
+        id_vector_temp_.push_back(rgb_factor);
+        id_vector_temp_.push_back(alpha_factor);
+        color = builder_->createNoContractionBinOp(
+            spv::OpFMul, type_float4_, color,
+            builder_->createCompositeConstruct(type_float4_, id_vector_temp_));
+      }
+
       if (edram_fragment_shader_interlock_) {
         // Write the color to the target in the EDRAM only it was written on the
         // shader's execution path, according to the Direct3D 9 rules that games

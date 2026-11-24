@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -6118,6 +6119,55 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   }
   dirty |= system_constants_.flags != flags;
   system_constants_.flags = flags;
+
+  // Min / max blending with a SRC_ALPHA source factor (SpirvShaderTranslator::SystemConstants::min_max_src_alpha), the
+  // same cases as the D3D12 command processor's kSysFlag_MinMaxSrcAlpha*: Dead or Alive 4's PRESS START uses MAX with
+  // SRC_ALPHA / ONE over white alpha-0 texels, and came out as a white rectangle without it.
+  uint32_t min_max_src_alpha = 0;
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (!((normalized_color_mask >> (4 * i)) & 0b1111)) {
+      continue;
+    }
+    auto blend_control = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+    bool color_min_max = blend_control.color_comb_fcn == xenos::BlendOp::kMin ||
+                         blend_control.color_comb_fcn == xenos::BlendOp::kMax;
+    bool alpha_min_max = blend_control.alpha_comb_fcn == xenos::BlendOp::kMin ||
+                         blend_control.alpha_comb_fcn == xenos::BlendOp::kMax;
+    auto reads_src_alpha = [](xenos::BlendFactor factor) {
+      return factor == xenos::BlendFactor::kSrcAlpha || factor == xenos::BlendFactor::kOneMinusSrcAlpha ||
+             factor == xenos::BlendFactor::kSrcAlphaSaturate;
+    };
+    // An additive color operation that reads the source alpha would see it squared: the alpha is left alone then.
+    bool color_blend_reads_src_alpha =
+        !color_min_max &&
+        (reads_src_alpha(blend_control.color_srcblend) || reads_src_alpha(blend_control.color_destblend));
+    // For the alpha channel, SRC_COLOR is the source alpha.
+    bool alpha_src_is_src_alpha = blend_control.alpha_srcblend == xenos::BlendFactor::kSrcAlpha ||
+                                  blend_control.alpha_srcblend == xenos::BlendFactor::kSrcColor;
+    bool color_emulated = !color_min_max || ((blend_control.color_srcblend == xenos::BlendFactor::kSrcAlpha ||
+                                              blend_control.color_srcblend == xenos::BlendFactor::kOne) &&
+                                             blend_control.color_destblend == xenos::BlendFactor::kOne);
+    bool alpha_emulated = !alpha_min_max || (((alpha_src_is_src_alpha && !color_blend_reads_src_alpha) ||
+                                              blend_control.alpha_srcblend == xenos::BlendFactor::kOne) &&
+                                             blend_control.alpha_destblend == xenos::BlendFactor::kOne);
+    if (color_min_max && blend_control.color_srcblend == xenos::BlendFactor::kSrcAlpha) {
+      min_max_src_alpha |= uint32_t(1) << i;
+    }
+    if (alpha_min_max && alpha_src_is_src_alpha && !color_blend_reads_src_alpha) {
+      min_max_src_alpha |= uint32_t(1) << (4 + i);
+    }
+    if (!color_emulated || !alpha_emulated) {
+      static std::atomic<bool> s_min_max_factors_logged{false};
+      if (!s_min_max_factors_logged.load(std::memory_order_relaxed) && !s_min_max_factors_logged.exchange(true)) {
+        REXGPU_WARN(
+            "Min / max blending with factors that are not emulated (RB_BLENDCONTROL{} = {:08X}): only a SRC_ALPHA "
+            "or ONE source and a ONE destination factor are applied (logged once)",
+            i, blend_control.value);
+      }
+    }
+  }
+  dirty |= system_constants_.min_max_src_alpha != min_max_src_alpha;
+  system_constants_.min_max_src_alpha = min_max_src_alpha;
 
   // Index buffer address for loading in the shaders.
   if (flags & (SpirvShaderTranslator::kSysFlag_VertexIndexLoad |

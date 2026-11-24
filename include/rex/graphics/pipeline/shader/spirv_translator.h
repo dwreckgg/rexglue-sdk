@@ -307,6 +307,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
     uint32_t vertex_index_max;
     float tessellation_factor_range_min;
     float tessellation_factor_range_max;
+
+    // The Xenos applies the blend factors before a min / max blend operation; Vulkan's min / max (and the FSI blend
+    // emulation) take the colors without them. Bit i: multiply render target i's RGB by the source alpha, bit 4 + i:
+    // its alpha (a SRC_ALPHA source factor), in the fragment shader after the exponent bias. See the D3D12
+    // counterpart (kSysFlag_MinMaxSrcAlpha*) for why the factors are taken to apply.
+    uint32_t min_max_src_alpha;
   };
 
   enum ConstantBuffer : uint32_t {
@@ -879,6 +885,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramRTKeepMask,
     kSystemConstantEdramRTClamp,
     kSystemConstantEdramBlendConstant,
+    kSystemConstantMinMaxSrcAlpha,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;

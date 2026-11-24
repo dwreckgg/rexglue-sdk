@@ -87,6 +87,21 @@ function(rexglue_configure_target target_name)
                 )
             endif()
         endforeach()
+    else()
+        # The host binary's RUNPATH is $ORIGIN: stage the runtime shared libraries next to it, as on Windows.
+        foreach(_lib rexruntime TracyClient)
+            if(TARGET ${_lib})
+                get_target_property(_type ${_lib} TYPE)
+                if(_type STREQUAL "SHARED_LIBRARY")
+                    add_custom_command(TARGET ${target_name} POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            $<TARGET_FILE:${_lib}>
+                            $<TARGET_FILE_DIR:${target_name}>
+                        VERBATIM
+                    )
+                endif()
+            endif()
+        endforeach()
     endif()
 endfunction()
 
