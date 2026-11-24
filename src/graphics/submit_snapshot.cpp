@@ -33,6 +33,48 @@ bool AnyOverlap(std::span<const Range> list, uint64_t start, uint64_t end) {
   return i < list.size() && list[i].address < end;
 }
 
+// What learning candidate c would do to a sorted, non-overlapping list holding total_bytes: the ranges it overlaps
+// ([first, last), merged into [lo, hi)), whether one listed range already holds it, and the list's count and bytes
+// after the merge. TryLearn and the pending admission (cap eviction) share it.
+struct Fit {
+  size_t first, last;
+  uint64_t lo, hi;
+  bool held;
+  size_t count_after;
+  uint64_t bytes_after;
+};
+
+Fit FitOf(std::span<const Range> list, uint64_t total_bytes, const Range& c) {
+  const uint64_t c_end = End(c);
+  Fit f{};
+  f.first = FirstEndingAfter(list, c.address);
+  f.last = f.first;
+  f.lo = c.address;
+  f.hi = c_end;
+  uint64_t removed_bytes = 0;
+  while (f.last < list.size() && list[f.last].address < c_end) {
+    f.lo = std::min<uint64_t>(f.lo, list[f.last].address);
+    f.hi = std::max(f.hi, End(list[f.last]));
+    removed_bytes += list[f.last].size;
+    ++f.last;
+  }
+  f.held = f.last - f.first == 1 && list[f.first].address == f.lo && End(list[f.first]) == f.hi;
+  f.count_after = list.size() - (f.last - f.first) + 1;
+  f.bytes_after = total_bytes - removed_bytes + (f.hi - f.lo);
+  return f;
+}
+
+// Replaces the ranges f merges ([first, last)) with [lo, hi), last active at `frame`; within the reserve (a fitting
+// f never grows the list past kMaxRanges).
+void InsertFit(std::vector<Range>& list, std::vector<uint32_t>& last_active, uint64_t& total_bytes, const Fit& f,
+               uint32_t frame) {
+  list.erase(list.begin() + f.first, list.begin() + f.last);
+  last_active.erase(last_active.begin() + f.first, last_active.begin() + f.last);
+  list.insert(list.begin() + f.first, Range{uint32_t(f.lo), uint32_t(f.hi - f.lo)});
+  last_active.insert(last_active.begin() + f.first, frame);
+  total_bytes = f.bytes_after;
+}
+
 }  // namespace
 
 // ---- Ring ---------------------------------------------------------------------------------------------------------
@@ -151,14 +193,16 @@ Learner::Learner() {
 
 void Learner::BeginFrame(uint32_t frame) {
   frame_ = frame;
-  bool removed = false;
+  bool changed = false;
   for (size_t i = list_.size(); i-- > 0;) {
     if (AgedOut(frame, last_active_[i])) {
       RemoveAt(i);
-      removed = true;
+      changed = true;
     }
   }
-  if (removed) ++generation_;
+  // Cap eviction, at the point aging removes (the only list removals are here, in BanOverlapping and in Reset).
+  if (AdmitPending()) changed = true;
+  if (changed) ++generation_;  // once, for aging and admission together
   // Clear the notes by moving the epoch; on its wrap, empty the table for real.
   if (++epoch_ == 0) {
     for (Note& n : notes_) n.epoch = 0;
@@ -218,29 +262,24 @@ void Learner::TryLearn(Range c) {
     ++banned_;
     return;
   }
-  // The ranges c overlaps: [first, last).
-  const uint64_t c_end = End(c);
-  size_t first = FirstEndingAfter(list_, c.address);
-  size_t last = first;
-  uint64_t lo = c.address, hi = c_end, removed_bytes = 0;
-  while (last < list_.size() && list_[last].address < c_end) {
-    lo = std::min<uint64_t>(lo, list_[last].address);
-    hi = std::max(hi, End(list_[last]));
-    removed_bytes += list_[last].size;
-    ++last;
-  }
-  if (last - first == 1 && list_[first].address == lo && End(list_[first]) == hi) return;  // already held
-  const size_t count_after = list_.size() - (last - first) + 1;
-  const uint64_t bytes_after = total_bytes_ - removed_bytes + (hi - lo);
-  if (count_after > kMaxRanges || bytes_after > kMaxTotalBytes) {
+  const Fit f = FitOf(list_, total_bytes_, c);
+  if (f.held) return;  // already held
+  const bool over_count = f.count_after > kMaxRanges;
+  if (over_count || f.bytes_after > kMaxTotalBytes) {
     ++rejected_cap_;
+    // Cap eviction: the list is not touched now (within a frame the learned pages only grow); the candidate waits
+    // for the next BeginFrame. The window's first refusal keeps the original candidate and the cap that refused it.
+    if (refused_kind_ == 0) {
+      refused_first_ = c;
+      refused_kind_ = over_count ? 1 : 2;
+    }
+    for (uint32_t i = 0; i < pending_count_; ++i) {
+      if (pending_[i].address == c.address && pending_[i].size == c.size) return;
+    }
+    if (pending_count_ < kMaxPending) pending_[pending_count_++] = c;
     return;
   }
-  list_.erase(list_.begin() + first, list_.begin() + last);
-  last_active_.erase(last_active_.begin() + first, last_active_.begin() + last);
-  list_.insert(list_.begin() + first, Range{uint32_t(lo), uint32_t(hi - lo)});
-  last_active_.insert(last_active_.begin() + first, frame_);
-  total_bytes_ = bytes_after;
+  InsertFit(list_, last_active_, total_bytes_, f, frame_);
   ++generation_;
 }
 
@@ -298,6 +337,45 @@ void Learner::BanOverlapping(GpuWrittenFn written, void* ctx, uint32_t page_size
 std::span<const Range> Learner::ranges() const { return list_; }
 
 uint64_t Learner::generation() const { return generation_; }
+
+uint64_t Learner::evicted() const { return evicted_; }
+
+bool Learner::AdmitPending() {
+  bool changed = false;
+  for (uint32_t p = 0; p < pending_count_; ++p) {
+    const Range c = pending_[p];
+    // A ban can arrive between the refusal and this boundary (direct Learner callers; State bans after BeginFrame).
+    // c.size was checked against kMaxRangeBytes by TryLearn and has not changed; a merged range is never size-capped.
+    if (Banned(c)) continue;
+    for (;;) {
+      Fit f = FitOf(list_, total_bytes_, c);
+      if (f.held) break;  // already held: the list stays untouched
+      if (f.count_after <= kMaxRanges && f.bytes_after <= kMaxTotalBytes) {
+        InsertFit(list_, last_active_, total_bytes_, f, frame_);
+        changed = true;
+        break;
+      }
+      // The victim: the range idle longest (ties: the lowest index), outside the ranges c merges with, idle at least
+      // kEvictIdleFrames. Evictions made before a drop stand.
+      size_t victim = list_.size();
+      int32_t victim_idle = 0;
+      for (size_t i = 0; i < list_.size(); ++i) {
+        if (i >= f.first && i < f.last) continue;
+        const int32_t idle = int32_t(frame_ - last_active_[i]);
+        if (idle >= int32_t(kEvictIdleFrames) && (victim == list_.size() || idle > victim_idle)) {
+          victim = i;
+          victim_idle = idle;
+        }
+      }
+      if (victim == list_.size()) break;  // nothing idle enough: dropped (re-noted when requested again)
+      RemoveAt(victim);
+      ++evicted_;
+      changed = true;
+    }
+  }
+  pending_count_ = 0;
+  return changed;
+}
 
 const std::vector<std::pair<uint32_t, uint32_t>>& Learner::LearnedPageSpans(uint32_t page_size_log2) {
   spans_.clear();
@@ -481,33 +559,53 @@ std::string State::StatsLine() const {
                 static_cast<unsigned long long>(thread_other_.load(std::memory_order_relaxed)));
   threads += buf;
   auto u = [](uint64_t v) { return static_cast<unsigned long long>(v); };
-  // The longest line (every number 20 digits, both thread slots claimed) is 675 characters, past the old 640
-  // (637 before kept_gpu_written): 1024 holds it.
+  // refused_first: "-", or 0xADDR:SIZE:count|bytes (at most 2 + 8 + 1 + 10 + 1 + 5 = 27 characters).
+  char refused[32] = "-";
+  if (learner_.refused_kind_ != 0) {
+    std::snprintf(refused, sizeof(refused), "0x%X:%u:%s", learner_.refused_first_.address,
+                  learner_.refused_first_.size, learner_.refused_kind_ == 1 ? "count" : "bytes");
+  }
+  // The longest line (every number 20 digits, both thread slots claimed, refused_first 27 characters) is 780
+  // characters: 675 before cap eviction (637 before kept_gpu_written) + 105 for " evicted=%llu ranges_bytes=%llu
+  // refused_first=%s". 1024 holds it.
   char line[1024];
   std::snprintf(line, sizeof(line),
                 "submit snapshot stats: frames=%llu ranges_max=%llu ranges_now=%llu spliced=%llu differing=%llu "
                 "missing_reused=%llu missing_not_yet=%llu not_in_copy=%llu copy_us_median=%llu copy_us_max=%llu "
                 "check_ranges=%llu check_moved=%llu swap_threads=%s rejected_cap=%llu rejected_size=%llu banned=%llu "
-                "kept_gpu_written=%llu",
+                "kept_gpu_written=%llu evicted=%llu ranges_bytes=%llu refused_first=%s",
                 u(frames_), u(ranges_max_), u(learner_.ranges().size()), u(spliced_), u(differing_calls_),
                 u(missing_reused_), u(missing_not_yet_), u(not_in_copy_), u(median),
                 u(copy_max_.load(std::memory_order_relaxed)), u(check_ranges_.load(std::memory_order_relaxed)),
                 u(check_moved_.load(std::memory_order_relaxed)), threads.c_str(), u(learner_.rejected_cap_),
-                u(learner_.rejected_size_), u(learner_.banned_), u(kept_gpu_written_));
+                u(learner_.rejected_size_), u(learner_.banned_), u(kept_gpu_written_), u(learner_.evicted_),
+                u(learner_.total_bytes_), refused);
   return line;
 }
 
 void State::NoteKeptGpuWritten(uint32_t pages) { kept_gpu_written_ += pages; }
 
+void State::ClearWindowRefusal() {
+  learner_.refused_kind_ = 0;
+  learner_.refused_first_ = Range{};
+}
+
 void State::Reset() {
   kept_.clear();
-  // The refusal counters are statistics of the run, not learned state: they survive the reset.
-  uint64_t cap = learner_.rejected_cap_, size = learner_.rejected_size_, banned = learner_.banned_;
+  // The refusal counters are statistics of the run, not learned state: they survive the reset, as do evicted and
+  // the window's first refusal. The pending candidates are learned state: the reassignment empties them.
+  uint64_t cap = learner_.rejected_cap_, size = learner_.rejected_size_, banned = learner_.banned_,
+           evicted = learner_.evicted_;
+  const Range refused_first = learner_.refused_first_;
+  const uint8_t refused_kind = learner_.refused_kind_;
   learner_ = Learner();
   learner_.frame_ = frame_;  // the learner stays on the current frame: a range learned after the reset ages from it
   learner_.rejected_cap_ = cap;
   learner_.rejected_size_ = size;
   learner_.banned_ = banned;
+  learner_.evicted_ = evicted;
+  learner_.refused_first_ = refused_first;
+  learner_.refused_kind_ = refused_kind;
   Publish();  // the empty list, generation moved
   ring_.ResetOrdinals();
 }

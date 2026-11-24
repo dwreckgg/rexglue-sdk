@@ -160,6 +160,28 @@ static uint64_t StatField(const ss::State& s, const char* name) {
   return v;
 }
 
+// The token after " name=" in StatsLine(), up to the next space or the end; "<absent>" when the key is missing.
+static std::string StatText(const ss::State& s, const char* name) {
+  std::string line = s.StatsLine();
+  std::string key = std::string(" ") + name + "=";
+  size_t p = line.find(key);
+  if (p == std::string::npos) return "<absent>";
+  p += key.size();
+  size_t e = line.find(' ', p);
+  return line.substr(p, e == std::string::npos ? std::string::npos : e - p);
+}
+
+// A full list (the count cap): BeginFrame(frame), then 256 ranges of 16 bytes with 16-byte gaps from 0x10000 (index
+// i = 0x10000 + i * 0x20), all last active at `frame`; 4096 bytes in all.
+static void Full256(ss::Learner& l, uint32_t frame) {
+  l.BeginFrame(frame);
+  for (uint32_t i = 0; i < 256; ++i) LearnL(l, 0x10000 + i * 0x20, 16);
+  CHECK(l.ranges().size() == 256);
+}
+
+// The candidate the cap-evict cases refuse: past every Full256 range.
+static constexpr ss::Range kX{0x30000, 16};
+
 // A guest window [base, base + size) with 4096 canary bytes on both sides.
 // Live(): the live guest bytes the upload was copied from (Task 2: the memcpy's source, passed as `live`), in a
 // buffer of their own as in the SDK. Groups 1-21 treat dest's bytes before the splice as live memory, so Live()
@@ -453,6 +475,286 @@ static void TestLimits() {
   }
 }
 
+// 24. Cap eviction (spec 2026-11-23 cap-evict, G1/G2): a refused candidate waits for the next BeginFrame, which
+// evicts the longest-idle range idle >= kEvictIdleFrames (8), ties to the lowest index; never mid-frame.
+// Excluded wrong versions: evict the first index whatever its age (boundary 8), ">" for ">=" (boundary 9), a
+// threshold of 7 (boundary 8), eviction inside TryLearn (the frame-9 mid-frame check).
+static void TestEvictIdleEdge() {
+  Case("evict_idle_edge");
+  ss::Learner l;
+  Full256(l, 1);
+  l.BeginFrame(7);
+  uint64_t g7 = l.generation();
+  LearnL(l, kX.address, kX.size);  // refused: count 257
+  CHECK(!HasRange(l.ranges(), kX.address, kX.size));
+  CHECK(l.ranges().size() == 256);
+  CHECK(l.generation() == g7);  // the refusal changes nothing mid-frame
+  l.BeginFrame(8);  // every range idle 7 < 8: X dropped
+  CHECK(!HasRange(l.ranges(), kX.address, kX.size) && HasRange(l.ranges(), 0x10000, 16));
+  CHECK(l.evicted() == 0);
+  l.NoteChanged({0x10000, 16});  // index 0 last active 8
+  LearnL(l, kX.address, kX.size);  // refused again
+  uint64_t g8 = l.generation();
+  l.BeginFrame(9);  // index 0 idle 1, indices 1..255 idle 8 (eligible): index 1 is the victim
+  CHECK(HasRange(l.ranges(), kX.address, kX.size));
+  CHECK(l.generation() == g8 + 1);  // one step for the boundary's eviction and insert together (R2')
+  CHECK(!HasRange(l.ranges(), 0x10020, 16) && HasRange(l.ranges(), 0x10000, 16));
+  CHECK(l.ranges().size() == 256);
+  uint64_t g9 = l.generation();
+  LearnL(l, 0x30100, 16);  // refused: count 257; nothing is evicted mid-frame
+  CHECK(!HasRange(l.ranges(), 0x30100, 16) && HasRange(l.ranges(), 0x10040, 16) && l.generation() == g9 &&
+        l.ranges().size() == 256);
+  l.BeginFrame(10);  // X idle 1 (protected), index 0 idle 2, 0x10040 (now index 1) idle 9: the victim
+  CHECK(HasRange(l.ranges(), kX.address, kX.size));
+  CHECK(!HasRange(l.ranges(), 0x10040, 16));
+  CHECK(HasRange(l.ranges(), 0x30100, 16));
+  CHECK(l.evicted() == 2);
+}
+
+// 25. The victim is the LONGEST idle range, not the lowest-index eligible one: index 0 idle 11 (eligible) loses to
+// index 1 idle 12.
+static void TestEvictLongestIdle() {
+  Case("evict_longest_idle");
+  ss::Learner l;
+  Full256(l, 1);
+  l.BeginFrame(2);
+  l.NoteChanged({0x10000, 16});  // index 0 last active 2
+  l.BeginFrame(12);
+  LearnL(l, kX.address, kX.size);  // refused
+  CHECK(!HasRange(l.ranges(), kX.address, kX.size));
+  l.BeginFrame(13);
+  CHECK(HasRange(l.ranges(), 0x10000, 16) && !HasRange(l.ranges(), 0x10020, 16) &&
+        HasRange(l.ranges(), kX.address, kX.size));
+}
+
+// 26. Nothing idle: every range changed each frame (idle 1 at each boundary), the candidate is refused at every
+// boundary and nothing is evicted. Companion: once the ranges go quiet (last active 20, idle 9 at 29), it is admitted.
+static void TestNothingIdleRefuses() {
+  Case("nothing_idle_refuses");
+  ss::Learner l;
+  Full256(l, 1);
+  bool absent = true;
+  for (uint32_t f = 2; f <= 20; ++f) {
+    l.BeginFrame(f);
+    if (HasRange(l.ranges(), kX.address, kX.size)) absent = false;
+    l.NoteChanged({0x10000, 256 * 0x20});  // every range last active f
+    LearnL(l, kX.address, kX.size);
+  }
+  l.BeginFrame(21);
+  CHECK(absent && !HasRange(l.ranges(), kX.address, kX.size));
+  CHECK(l.ranges().size() == 256);
+  CHECK(l.evicted() == 0);
+  for (uint32_t f = 22; f <= 28; ++f) l.BeginFrame(f);  // no NoteChanged: every range last active 20
+  LearnL(l, kX.address, kX.size);                        // frame 28, refused
+  l.BeginFrame(29);                                      // every range idle 9
+  CHECK(HasRange(l.ranges(), kX.address, kX.size));
+  CHECK(l.evicted() == 1);
+}
+
+// 27. At most kMaxPending (16) candidates per boundary, deduplicated: C0 refused twice takes one slot, so C0..C15
+// are admitted and C16..C19 are not. Without the dedup C15 is missing; without the bound C16 is present.
+static void TestPendingBoundAndDedup() {
+  Case("pending_bound_and_dedup");
+  ss::Learner l;
+  Full256(l, 1);
+  l.BeginFrame(20);
+  const uint32_t n = 20;
+  CHECK(n > ss::kMaxPending);
+  LearnL(l, 0x40000, 16);  // C0
+  for (uint32_t k = 0; k < n; ++k) LearnL(l, 0x40000 + k * 0x20, 16);  // C0 again, C1..C19
+  CHECK(l.ranges().size() == 256);
+  l.BeginFrame(21);  // every fill range idle 20
+  bool admitted = true, refused = true, victims = true;
+  for (uint32_t k = 0; k < 16; ++k) admitted = admitted && HasRange(l.ranges(), 0x40000 + k * 0x20, 16);
+  for (uint32_t k = 16; k < n; ++k) refused = refused && !HasRange(l.ranges(), 0x40000 + k * 0x20, 16);
+  for (uint32_t i = 0; i < 16; ++i) victims = victims && !HasRange(l.ranges(), 0x10000 + i * 0x20, 16);
+  CHECK(admitted);
+  CHECK(HasRange(l.ranges(), 0x40000 + 15 * 0x20, 16));  // C15: the slot the dedup saved
+  CHECK(refused);
+  CHECK(!HasRange(l.ranges(), 0x40000 + 16 * 0x20, 16));  // C16: past the bound
+  CHECK(l.ranges().size() == 256);
+  CHECK(l.evicted() == 16);
+  CHECK(victims && HasRange(l.ranges(), 0x10000 + 16 * 0x20, 16));  // the 16 lowest fill ranges, and only those
+}
+
+// 28. Bytes cap: the ranges the candidate overlaps merge into it and are never victims. Merged {0x100000, 98304}
+// would make 557056 bytes; evicting 0x120000 (the lowest-index range outside the overlap) leaves 491520.
+static void TestEvictOverlapNotVictim() {
+  Case("evict_overlap_not_victim");
+  ss::Learner l;
+  l.BeginFrame(1);
+  for (uint32_t i = 0; i < 8; ++i) LearnL(l, 0x100000 + i * 0x20000, 65536);
+  uint64_t sum = 0;
+  for (const ss::Range& r : l.ranges()) sum += r.size;
+  CHECK(l.ranges().size() == 8 && sum == 524288);
+  l.BeginFrame(20);
+  LearnL(l, 0x108000, 65536);  // refused: bytes 524288 - 65536 + 98304 = 557056
+  CHECK(!HasRange(l.ranges(), 0x100000, 98304) && l.ranges().size() == 8);
+  l.BeginFrame(21);
+  CHECK(HasRange(l.ranges(), 0x100000, 98304));
+  CHECK(!HasRange(l.ranges(), 0x120000, 65536));
+  CHECK(l.ranges().size() == 7);
+  CHECK(!HasRange(l.ranges(), 0x108000, 65536));  // the wrong version evicts the overlapped range 0
+}
+
+// 29. Bytes cap, several victims for one candidate: 16 x 32768 = 524288; {0x400000, 65536} needs two evictions.
+static void TestBytesCapEvictsSeveral() {
+  Case("bytes_cap_evicts_several");
+  ss::Learner l;
+  l.BeginFrame(1);
+  for (uint32_t i = 0; i < 16; ++i) LearnL(l, 0x200000 + i * 0x10000, 32768);
+  uint64_t sum = 0;
+  for (const ss::Range& r : l.ranges()) sum += r.size;
+  CHECK(l.ranges().size() == 16 && sum == 524288);
+  l.BeginFrame(20);
+  LearnL(l, 0x400000, 65536);  // refused: bytes 589824
+  l.BeginFrame(21);
+  CHECK(HasRange(l.ranges(), 0x400000, 65536));
+  CHECK(l.ranges().size() == 15);
+  CHECK(!HasRange(l.ranges(), 0x200000, 32768) && !HasRange(l.ranges(), 0x210000, 32768));
+  CHECK(HasRange(l.ranges(), 0x220000, 32768));
+  CHECK(l.evicted() == 2);
+}
+
+// 30. A pending candidate on a page banned before its boundary is dropped at admission. In State a ban at boundary
+// N+1 already existed in frame N (State runs BanOverlapping right after BeginFrame), so this order is reachable only
+// by direct Learner callers. Companion: a second pending candidate is admitted at the same boundary.
+static void TestBanBeforeAdmission() {
+  Case("ban_before_admission");
+  ss::Learner l;
+  l.BeginFrame(1);
+  for (uint32_t i = 0; i < 255; ++i) LearnL(l, 0x10000 + i * 0x20, 16);
+  LearnL(l, 0x9000, 16);  // R, index 0
+  CHECK(l.ranges().size() == 256);
+  l.BeginFrame(20);
+  LearnL(l, 0x9100, 16);   // refused (count); R's 4 KB page
+  LearnL(l, 0x20000, 16);  // refused (count)
+  WrittenFake wf{0x9000, 4096, true};
+  l.BanOverlapping(WrittenFn, &wf, 12);  // R banned and dropped
+  CHECK(!HasRange(l.ranges(), 0x9000, 16) && l.ranges().size() == 255);
+  uint64_t g = l.generation();
+  l.BeginFrame(21);
+  CHECK(!HasRange(l.ranges(), 0x9100, 16));
+  CHECK(HasRange(l.ranges(), 0x20000, 16));
+  CHECK(l.generation() == g + 1);  // an insert with no eviction moves the generation too (R2'): State publishes on it
+  CHECK(l.ranges().size() == 256);
+  CHECK(l.evicted() == 0);
+}
+
+// 31. Evictions made before a drop stand: only index 0 is idle >= 8 (idle 20; the others idle 2); one eviction
+// leaves 491520 + 65536 = 557056 > 524288, so the candidate is dropped and the list changed (generation moves).
+static void TestPartialEvictThenDrop() {
+  Case("partial_evict_then_drop");
+  ss::Learner l;
+  l.BeginFrame(1);
+  for (uint32_t i = 0; i < 16; ++i) LearnL(l, 0x200000 + i * 0x10000, 32768);
+  CHECK(l.ranges().size() == 16);
+  l.BeginFrame(19);
+  l.NoteChanged({0x210000, 15 * 0x10000});  // indices 1..15 last active 19
+  l.BeginFrame(20);
+  LearnL(l, 0x400000, 65536);  // refused (bytes)
+  uint64_t g = l.generation();
+  l.BeginFrame(21);
+  CHECK(!HasRange(l.ranges(), 0x400000, 65536));
+  CHECK(!HasRange(l.ranges(), 0x200000, 32768));
+  CHECK(l.ranges().size() == 15);
+  CHECK(l.evicted() == 1);
+  CHECK(l.generation() != g);
+}
+
+// 32. A pending candidate the list already holds at its boundary is dropped untouched (no erase and reinsert, no
+// generation move, no eviction). 0x10000+0x40 merges indices 0 and 1 only (index 2 at 0x10040 touches, and touching
+// ranges do not merge: group 8); {0x2FFF0, 0x30} is a new range covering X.
+static void TestHeldAtAdmission() {
+  Case("held_at_admission");
+  ss::Learner l;
+  Full256(l, 1);
+  l.BeginFrame(20);
+  LearnL(l, kX.address, kX.size);  // refused (count)
+  LearnL(l, 0x10000, 0x40);        // merges two: 255 ranges
+  CHECK(HasRange(l.ranges(), 0x10000, 0x40) && HasRange(l.ranges(), 0x10040, 16) && l.ranges().size() == 255);
+  LearnL(l, 0x2FFF0, 0x30);
+  CHECK(HasRange(l.ranges(), 0x2FFF0, 0x30) && l.ranges().size() == 256);
+  uint64_t g = l.generation();
+  size_t n = l.ranges().size();
+  l.BeginFrame(21);  // no aging (idle 20 < 120); X is held: dropped
+  CHECK(l.generation() == g);
+  CHECK(l.evicted() == 0);
+  CHECK(HasRange(l.ranges(), 0x2FFF0, 0x30));
+  CHECK(l.ranges().size() == n);
+}
+
+// 33. Reset empties the pending list (a stale candidate is not admitted into the emptied list); evicted and
+// refused_first survive it like the other refusal statistics.
+static void TestResetClearsPending() {
+  Case("reset_clears_pending");
+  auto s = std::make_unique<ss::State>();
+  InvLog inv;
+  Boundary(*s, 1, true, &inv);  // frame 2
+  for (uint32_t i = 0; i < 256; ++i) LearnS(*s, 0x10000 + i * 0x20, 16);
+  CHECK(StatField(*s, "ranges_now") == 256);
+  Boundary(*s, 10, true, &inv);  // frame 11
+  LearnS(*s, kX.address, kX.size);  // refused
+  Boundary(*s, 11, true, &inv);  // frame 12: every range idle 10, X admitted
+  CHECK(StatField(*s, "evicted") == 1);
+  CHECK(StatField(*s, "ranges_now") == 256);
+  LearnS(*s, 0x30100, 16);  // refused, pending
+  s->Reset();
+  Boundary(*s, 12, true, &inv);  // frame 13
+  CHECK(StatField(*s, "ranges_now") == 0);  // NOT 1
+  CHECK(StatField(*s, "evicted") == 1);
+  CHECK(StatText(*s, "refused_first") == "0x30000:16:count");
+}
+
+// 34. refused_first is the FIRST cap refusal of the window; ClearWindowRefusal starts a new window.
+static void TestRefusedFirstWindow() {
+  Case("refused_first_window");
+  auto s = std::make_unique<ss::State>();
+  InvLog inv;
+  Boundary(*s, 1, true, &inv);  // frame 2
+  for (uint32_t i = 0; i < 256; ++i) LearnS(*s, 0x10000 + i * 0x20, 16);
+  CHECK(StatText(*s, "refused_first") == "-");
+  LearnS(*s, kX.address, kX.size);
+  LearnS(*s, 0x30100, 16);
+  CHECK(StatText(*s, "refused_first") == "0x30000:16:count");
+  s->ClearWindowRefusal();
+  CHECK(StatText(*s, "refused_first") == "-");
+  LearnS(*s, 0x30100, 16);
+  CHECK(StatText(*s, "refused_first") == "0x30100:16:count");
+}
+
+// 35. The kind: the count cap is checked first. 256 x 2048 = 524288 (both caps reached); one more range of 16 is
+// over both (count 257, bytes 524304) and reads "count".
+static void TestRefusedKindCountFirst() {
+  Case("refused_kind_count_first");
+  auto s = std::make_unique<ss::State>();
+  InvLog inv;
+  Boundary(*s, 1, true, &inv);  // frame 2
+  for (uint32_t i = 0; i < 256; ++i) LearnS(*s, 0x100000 + i * 0x1000, 2048);
+  CHECK(StatField(*s, "ranges_now") == 256 && StatField(*s, "ranges_bytes") == 524288);
+  LearnS(*s, 0x300000, 16);
+  CHECK(StatText(*s, "refused_first") == "0x300000:16:count");
+}
+
+// 36. No allocation on the refusal and eviction path (group 18's rule): 20 frames, each refusing one candidate and
+// admitting it at the next boundary by evicting an idle range.
+static void TestNoAllocationOnEviction() {
+  Case("no_allocation_on_eviction");
+  auto s = std::make_unique<ss::State>();
+  InvLog inv;
+  Boundary(*s, 1, true, &inv);  // frame 2
+  for (uint32_t i = 0; i < 256; ++i) LearnS(*s, 0x10000 + i * 0x20, 16);
+  g_allocs = 0;
+  g_count_allocs = true;
+  for (uint32_t k = 0; k < 20; ++k) {
+    LearnS(*s, 0x50000 + k * 0x20, 16);  // refused (count)
+    Boundary(*s, 20 + k, true, &inv);    // frame 21 + k: admitted by evicting an idle fill range
+  }
+  g_count_allocs = false;
+  CHECK(g_allocs.load() == 0);
+  CHECK(StatField(*s, "evicted") == 20);
+}
+
 // 8. Overlapping ranges merge; touching ones do not.
 static void TestMergeOverlappingOnly() {
   Case("merge_overlapping_only");
@@ -727,7 +1029,8 @@ static void TestStatsLine() {
     CHECK(empty.StatsLine() ==
           "submit snapshot stats: frames=0 ranges_max=0 ranges_now=0 spliced=0 differing=0 missing_reused=0 "
           "missing_not_yet=0 not_in_copy=0 copy_us_median=0 copy_us_max=0 check_ranges=0 check_moved=0 "
-          "swap_threads=other:0 rejected_cap=0 rejected_size=0 banned=0 kept_gpu_written=0");
+          "swap_threads=other:0 rejected_cap=0 rejected_size=0 banned=0 kept_gpu_written=0 evicted=0 "
+          "ranges_bytes=0 refused_first=-");
   }
   {
     // The overflow bucket reads as 2001: samples 5, 2500, 3000 -> sorted 5, ovf, ovf; the 2nd smallest is ovf.
@@ -739,7 +1042,8 @@ static void TestStatsLine() {
     CHECK(s.StatsLine() ==
           "submit snapshot stats: frames=0 ranges_max=0 ranges_now=0 spliced=0 differing=0 missing_reused=0 "
           "missing_not_yet=0 not_in_copy=0 copy_us_median=2001 copy_us_max=3000 check_ranges=0 check_moved=0 "
-          "swap_threads=42:1,other:0 rejected_cap=0 rejected_size=0 banned=0 kept_gpu_written=0");
+          "swap_threads=42:1,other:0 rejected_cap=0 rejected_size=0 banned=0 kept_gpu_written=0 evicted=0 "
+          "ranges_bytes=0 refused_first=-");
   }
   auto s = std::make_unique<ss::State>();
   FakeMem mem(0x200000);
@@ -787,11 +1091,15 @@ static void TestStatsLine() {
   Window wc(0x1000, 4096);
   wc.FillFrom(mem);                           // copy == live for R1 and R2
   s->GpuSplice(0x1000, 4096, wc.dest(), wc.Live(), 12);  // spliced=2, differing stays 1, R4 not in copy 10: not_in_copy=1
-  s->NoteKeptGpuWritten(2);  // kept_gpu_written=2, the LAST field (review N1; a missing call would read 0)
+  s->NoteKeptGpuWritten(2);  // kept_gpu_written=2 (review N1; a missing call would read 0)
+  // evicted=0: the frame-2 refusal (0x1A8000, 65536, refused by the bytes cap) was pending at boundary 3, where every
+  // range was idle 1, so it was dropped. ranges_bytes = R1 384 + R2 768 + 7 x 65536 + R4 32 = 459936 (R3 banned).
+  // refused_first: the window's first cap refusal (the rejected_size one is not a cap refusal).
   CHECK(s->StatsLine() ==
         "submit snapshot stats: frames=5 ranges_max=10 ranges_now=10 spliced=2 differing=1 missing_reused=1 "
         "missing_not_yet=1 not_in_copy=1 copy_us_median=7 copy_us_max=3000 check_ranges=10 check_moved=1 "
-        "swap_threads=111:3,222:2,other:1 rejected_cap=1 rejected_size=1 banned=1 kept_gpu_written=2");
+        "swap_threads=111:3,222:2,other:1 rejected_cap=1 rejected_size=1 banned=1 kept_gpu_written=2 evicted=0 "
+        "ranges_bytes=459936 refused_first=0x1A8000:65536:bytes");
 }
 
 // 18. No allocation per frame after one warm-up frame (A9).
@@ -1227,6 +1535,19 @@ int main() {
   TestLearnedPageSpans();
   TestLearningSignature();
   TestLimits();
+  TestEvictIdleEdge();
+  TestEvictLongestIdle();
+  TestNothingIdleRefuses();
+  TestPendingBoundAndDedup();
+  TestEvictOverlapNotVictim();
+  TestBytesCapEvictsSeveral();
+  TestBanBeforeAdmission();
+  TestPartialEvictThenDrop();
+  TestHeldAtAdmission();
+  TestResetClearsPending();
+  TestRefusedFirstWindow();
+  TestRefusedKindCountFirst();
+  TestNoAllocationOnEviction();
   TestMergeOverlappingOnly();
   TestAgingEdge();
   TestBanGpuWritten();

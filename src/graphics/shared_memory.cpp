@@ -959,6 +959,8 @@ void SharedMemory::SubmitSnapshotFrameBoundary(uint32_t swap_ordinal, bool on) {
   }
   if (snapshot.gpu_on() && ++submit_snapshot_frames_on_ % 3600 == 0) {
     REXGPU_INFO("{}", snapshot.StatsLine());
+    // refused_first= is per printed window (cap eviction spec G3); the teardown line prints the current window's.
+    snapshot.ClearWindowRefusal();
   }
 }
 

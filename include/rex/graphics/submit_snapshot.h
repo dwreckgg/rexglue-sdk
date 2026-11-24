@@ -29,6 +29,9 @@ namespace rex::graphics::submit_snapshot {
 
 inline constexpr uint32_t kRingDepth = 4, kMaxRanges = 256, kMaxTotalBytes = 512 * 1024,
                           kMaxRangeBytes = 64 * 1024, kAgeFrames = 120;
+// Cap eviction (spec 2026-11-23-doa4-raptor-cap-evict-design.md G1, G2): a candidate the caps refused waits for the
+// next BeginFrame (at most kMaxPending of them per boundary), which evicts listed ranges idle >= kEvictIdleFrames.
+inline constexpr uint32_t kEvictIdleFrames = 8, kMaxPending = 16;
 
 struct Range {
   uint32_t address;  // guest physical, bytes
@@ -89,7 +92,9 @@ class Ring {
 class Learner {
  public:
   Learner();
-  void BeginFrame(uint32_t frame);  // ages (D11), clears the frame's notes and pass table
+  // Ages (D11), then admits the candidates the caps refused in the previous frame (pending; cap eviction), then
+  // clears the frame's notes and pass table.
+  void BeginFrame(uint32_t frame);
   void NoteRequest(uint32_t address, uint32_t size, uint64_t bin_select, uint32_t uploaded_pages);
   void NoteChanged(const Range& r);  // a splice saw copy != live inside r: last_active = frame
   // Drops every listed range with a GPU-written page and bans the whole pages it covers (page size
@@ -99,6 +104,7 @@ class Learner {
   std::span<const Range> ranges() const;  // sorted by address, merged
   uint64_t generation() const;            // +1 on every change of ranges()
   const std::vector<std::pair<uint32_t, uint32_t>>& LearnedPageSpans(uint32_t page_size_log2);  // (first, count)
+  uint64_t evicted() const;  // ranges removed to admit a pending candidate (the stats line's evicted=)
 
  private:
   friend class State;
@@ -116,6 +122,10 @@ class Learner {
   static constexpr uint32_t kMaxPasses = 64;
   uint32_t PassIndex(uint64_t bin_select);
   void TryLearn(Range c);
+  // BeginFrame, after aging: admits each pending candidate in order (evicting the longest-idle ranges outside its
+  // overlap while it does not fit and one is idle >= kEvictIdleFrames, else dropping it) and empties pending_.
+  // True when the list changed (an eviction or an insert).
+  bool AdmitPending();
   void RemoveAt(size_t i);
   bool Banned(const Range& c) const;
   void AddBan(const Range& pages);
@@ -134,6 +144,13 @@ class Learner {
   std::vector<std::pair<uint32_t, uint32_t>> spans_;
   // Refusal events (A16), read by State::StatsLine.
   uint64_t rejected_cap_ = 0, rejected_size_ = 0, banned_ = 0;
+  // Cap eviction: the candidates the caps refused this frame (deduplicated, at most kMaxPending), admitted or dropped
+  // at the next BeginFrame; evicted_ and the window's first refusal (State::StatsLine, survive Reset).
+  std::array<Range, kMaxPending> pending_{};
+  uint32_t pending_count_ = 0;
+  uint64_t evicted_ = 0;
+  Range refused_first_{};
+  uint8_t refused_kind_ = 0;  // 0 none in this window, 1 count, 2 bytes
 };
 
 // Process-wide via Global(); instantiable for tests.
@@ -157,8 +174,12 @@ class State {
   // GPU thread (review N1): kept or learned pages that a kept-span or reset invalidation skipped because they were
   // GPU-written (ForEachClearPageRun's return); the stats line's kept_gpu_written. Survives Reset.
   void NoteKeptGpuWritten(uint32_t pages);
-  // The "submit snapshot stats: " line, fields as Task 2 Step 6 (+ A16's three, then kept_gpu_written, last).
+  // The "submit snapshot stats: " line, fields as Task 2 Step 6 (+ A16's three), ending kept_gpu_written, evicted,
+  // ranges_bytes, refused_first.
   std::string StatsLine() const;
+  // GPU thread: starts a new refusal window (refused_first= reads "-" until the next cap refusal); the periodic
+  // stats print calls it right after printing (the teardown print does not). Reset keeps the window's refusal.
+  void ClearWindowRefusal();
   // GPU thread (cache clear): clears the learner, the bans, the published list (generation moves), the ring slots'
   // ordinals (to "never written") and the kept spans; the caller invalidates all pages itself.
   void Reset();
