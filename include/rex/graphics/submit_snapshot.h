@@ -27,7 +27,7 @@
 
 namespace rex::graphics::submit_snapshot {
 
-inline constexpr uint32_t kRingDepth = 4, kMaxRanges = 256, kMaxTotalBytes = 512 * 1024,
+inline constexpr uint32_t kRingDepth = 4, kMaxRanges = 512, kMaxTotalBytes = 512 * 1024,
                           kMaxRangeBytes = 64 * 1024, kAgeFrames = 120;
 // Cap eviction (spec 2026-11-23-doa4-raptor-cap-evict-design.md G1, G2): a candidate the caps refused waits for the
 // next BeginFrame (at most kMaxPending of them per boundary), which evicts listed ranges idle >= kEvictIdleFrames.

@@ -171,15 +171,16 @@ static std::string StatText(const ss::State& s, const char* name) {
   return line.substr(p, e == std::string::npos ? std::string::npos : e - p);
 }
 
-// A full list (the count cap): BeginFrame(frame), then 256 ranges of 16 bytes with 16-byte gaps from 0x10000 (index
-// i = 0x10000 + i * 0x20), all last active at `frame`; 4096 bytes in all.
-static void Full256(ss::Learner& l, uint32_t frame) {
+// A full list (the count cap): BeginFrame(frame), then kMaxRanges ranges of 16 bytes with 16-byte gaps from 0x10000
+// (index i = 0x10000 + i * 0x20, the last ending at 0x10000 + kMaxRanges * 0x20), all last active at `frame`;
+// kMaxRanges * 16 bytes in all (8192 at 512), far under the byte cap, so the count cap is the one that binds.
+static void FullList(ss::Learner& l, uint32_t frame) {
   l.BeginFrame(frame);
-  for (uint32_t i = 0; i < 256; ++i) LearnL(l, 0x10000 + i * 0x20, 16);
-  CHECK(l.ranges().size() == 256);
+  for (uint32_t i = 0; i < ss::kMaxRanges; ++i) LearnL(l, 0x10000 + i * 0x20, 16);
+  CHECK(l.ranges().size() == ss::kMaxRanges);
 }
 
-// The candidate the cap-evict cases refuse: past every Full256 range.
+// The candidate the cap-evict cases refuse: past every FullList range.
 static constexpr ss::Range kX{0x30000, 16};
 
 // A guest window [base, base + size) with 4096 canary bytes on both sides.
@@ -427,18 +428,18 @@ static void TestLearningSignature() {
   }
 }
 
-// 7. Limits at both edges: 256 ranges, 64 KB per range, 512 KB in all.
+// 7. Limits at both edges: kMaxRanges ranges, 64 KB per range, 512 KB in all.
 static void TestLimits() {
   Case("limits_both_edges");
   {
     ss::Learner l;
     l.BeginFrame(1);
     std::vector<ss::Range> candidates;
-    for (uint32_t i = 0; i < 257; ++i) candidates.push_back({0x10000 + i * 0x20, 16});  // 16-byte gaps
-    CHECK(candidates.size() == 257);
+    for (uint32_t i = 0; i < ss::kMaxRanges + 1; ++i) candidates.push_back({0x10000 + i * 0x20, 16});  // 16-byte gaps
+    CHECK(candidates.size() == ss::kMaxRanges + 1);
     for (const ss::Range& c : candidates) LearnL(l, c.address, c.size);
-    CHECK(l.ranges().size() == 256);
-    CHECK(!HasRange(l.ranges(), candidates[256].address, 16));
+    CHECK(l.ranges().size() == ss::kMaxRanges);
+    CHECK(!HasRange(l.ranges(), candidates[ss::kMaxRanges].address, 16));
   }
   {
     ss::Learner l;
@@ -466,13 +467,32 @@ static void TestLimits() {
     auto s = std::make_unique<ss::State>();
     InvLog inv;
     Boundary(*s, 1, true, &inv);
-    for (uint32_t i = 0; i < 257; ++i) LearnS(*s, 0x10000 + i * 0x20, 16);
-    CHECK(StatField(*s, "ranges_now") == 256);
+    for (uint32_t i = 0; i < ss::kMaxRanges + 1; ++i) LearnS(*s, 0x10000 + i * 0x20, 16);
+    CHECK(StatField(*s, "ranges_now") == ss::kMaxRanges);
     CHECK(StatField(*s, "rejected_cap") == 1);
     LearnS(*s, 0x200000, 65537);
     CHECK(StatField(*s, "rejected_size") == 1);
     CHECK(StatField(*s, "rejected_cap") == 1);
   }
+}
+
+// 43. The count cap is 512 (ledger SS83: the Playground refused about 7,000 candidates a minute at 256 with the bytes at
+// 178K of 512K). 512 ranges of 16 bytes (8192 bytes, far under the byte cap) are all held; the 513th distinct range is
+// refused by the count cap. The value is pinned here as a literal, not as kMaxRanges.
+static void TestCountCapIs512() {
+  Case("count_cap_is_512");
+  auto s = std::make_unique<ss::State>();
+  InvLog inv;
+  Boundary(*s, 1, true, &inv);  // frame 2
+  for (uint32_t i = 0; i < 512; ++i) LearnS(*s, 0x10000 + i * 0x20, 16);
+  CHECK(StatField(*s, "ranges_now") == 512);
+  CHECK(StatField(*s, "ranges_bytes") == 8192);
+  CHECK(StatField(*s, "rejected_cap") == 0);
+  CHECK(StatText(*s, "refused_first") == "-");
+  LearnS(*s, 0x30000, 16);  // the 513th distinct range: count 513, bytes 8208
+  CHECK(StatField(*s, "rejected_cap") == 1);
+  CHECK(StatText(*s, "refused_first") == "0x30000:16:count");
+  CHECK(StatField(*s, "ranges_now") == 512);
 }
 
 // 24. Cap eviction (spec 2026-11-23 cap-evict, G1/G2): a refused candidate waits for the next BeginFrame, which
@@ -482,12 +502,12 @@ static void TestLimits() {
 static void TestEvictIdleEdge() {
   Case("evict_idle_edge");
   ss::Learner l;
-  Full256(l, 1);
+  FullList(l, 1);
   l.BeginFrame(7);
   uint64_t g7 = l.generation();
-  LearnL(l, kX.address, kX.size);  // refused: count 257
+  LearnL(l, kX.address, kX.size);  // refused: count kMaxRanges + 1
   CHECK(!HasRange(l.ranges(), kX.address, kX.size));
-  CHECK(l.ranges().size() == 256);
+  CHECK(l.ranges().size() == ss::kMaxRanges);
   CHECK(l.generation() == g7);  // the refusal changes nothing mid-frame
   l.BeginFrame(8);  // every range idle 7 < 8: X dropped
   CHECK(!HasRange(l.ranges(), kX.address, kX.size) && HasRange(l.ranges(), 0x10000, 16));
@@ -495,15 +515,15 @@ static void TestEvictIdleEdge() {
   l.NoteChanged({0x10000, 16});  // index 0 last active 8
   LearnL(l, kX.address, kX.size);  // refused again
   uint64_t g8 = l.generation();
-  l.BeginFrame(9);  // index 0 idle 1, indices 1..255 idle 8 (eligible): index 1 is the victim
+  l.BeginFrame(9);  // index 0 idle 1, indices 1..kMaxRanges-1 idle 8 (eligible): index 1 is the victim
   CHECK(HasRange(l.ranges(), kX.address, kX.size));
   CHECK(l.generation() == g8 + 1);  // one step for the boundary's eviction and insert together (R2')
   CHECK(!HasRange(l.ranges(), 0x10020, 16) && HasRange(l.ranges(), 0x10000, 16));
-  CHECK(l.ranges().size() == 256);
+  CHECK(l.ranges().size() == ss::kMaxRanges);
   uint64_t g9 = l.generation();
-  LearnL(l, 0x30100, 16);  // refused: count 257; nothing is evicted mid-frame
+  LearnL(l, 0x30100, 16);  // refused: count kMaxRanges + 1; nothing is evicted mid-frame
   CHECK(!HasRange(l.ranges(), 0x30100, 16) && HasRange(l.ranges(), 0x10040, 16) && l.generation() == g9 &&
-        l.ranges().size() == 256);
+        l.ranges().size() == ss::kMaxRanges);
   l.BeginFrame(10);  // X idle 1 (protected), index 0 idle 2, 0x10040 (now index 1) idle 9: the victim
   CHECK(HasRange(l.ranges(), kX.address, kX.size));
   CHECK(!HasRange(l.ranges(), 0x10040, 16));
@@ -516,7 +536,7 @@ static void TestEvictIdleEdge() {
 static void TestEvictLongestIdle() {
   Case("evict_longest_idle");
   ss::Learner l;
-  Full256(l, 1);
+  FullList(l, 1);
   l.BeginFrame(2);
   l.NoteChanged({0x10000, 16});  // index 0 last active 2
   l.BeginFrame(12);
@@ -532,17 +552,17 @@ static void TestEvictLongestIdle() {
 static void TestNothingIdleRefuses() {
   Case("nothing_idle_refuses");
   ss::Learner l;
-  Full256(l, 1);
+  FullList(l, 1);
   bool absent = true;
   for (uint32_t f = 2; f <= 20; ++f) {
     l.BeginFrame(f);
     if (HasRange(l.ranges(), kX.address, kX.size)) absent = false;
-    l.NoteChanged({0x10000, 256 * 0x20});  // every range last active f
+    l.NoteChanged({0x10000, ss::kMaxRanges * 0x20});  // every range last active f
     LearnL(l, kX.address, kX.size);
   }
   l.BeginFrame(21);
   CHECK(absent && !HasRange(l.ranges(), kX.address, kX.size));
-  CHECK(l.ranges().size() == 256);
+  CHECK(l.ranges().size() == ss::kMaxRanges);
   CHECK(l.evicted() == 0);
   for (uint32_t f = 22; f <= 28; ++f) l.BeginFrame(f);  // no NoteChanged: every range last active 20
   LearnL(l, kX.address, kX.size);                        // frame 28, refused
@@ -556,13 +576,13 @@ static void TestNothingIdleRefuses() {
 static void TestPendingBoundAndDedup() {
   Case("pending_bound_and_dedup");
   ss::Learner l;
-  Full256(l, 1);
+  FullList(l, 1);
   l.BeginFrame(20);
   const uint32_t n = 20;
   CHECK(n > ss::kMaxPending);
   LearnL(l, 0x40000, 16);  // C0
   for (uint32_t k = 0; k < n; ++k) LearnL(l, 0x40000 + k * 0x20, 16);  // C0 again, C1..C19
-  CHECK(l.ranges().size() == 256);
+  CHECK(l.ranges().size() == ss::kMaxRanges);
   l.BeginFrame(21);  // every fill range idle 20
   bool admitted = true, refused = true, victims = true;
   for (uint32_t k = 0; k < 16; ++k) admitted = admitted && HasRange(l.ranges(), 0x40000 + k * 0x20, 16);
@@ -572,7 +592,7 @@ static void TestPendingBoundAndDedup() {
   CHECK(HasRange(l.ranges(), 0x40000 + 15 * 0x20, 16));  // C15: the slot the dedup saved
   CHECK(refused);
   CHECK(!HasRange(l.ranges(), 0x40000 + 16 * 0x20, 16));  // C16: past the bound
-  CHECK(l.ranges().size() == 256);
+  CHECK(l.ranges().size() == ss::kMaxRanges);
   CHECK(l.evicted() == 16);
   CHECK(victims && HasRange(l.ranges(), 0x10000 + 16 * 0x20, 16));  // the 16 lowest fill ranges, and only those
 }
@@ -623,21 +643,21 @@ static void TestBanBeforeAdmission() {
   Case("ban_before_admission");
   ss::Learner l;
   l.BeginFrame(1);
-  for (uint32_t i = 0; i < 255; ++i) LearnL(l, 0x10000 + i * 0x20, 16);
+  for (uint32_t i = 0; i < ss::kMaxRanges - 1; ++i) LearnL(l, 0x10000 + i * 0x20, 16);
   LearnL(l, 0x9000, 16);  // R, index 0
-  CHECK(l.ranges().size() == 256);
+  CHECK(l.ranges().size() == ss::kMaxRanges);
   l.BeginFrame(20);
   LearnL(l, 0x9100, 16);   // refused (count); R's 4 KB page
   LearnL(l, 0x20000, 16);  // refused (count)
   WrittenFake wf{0x9000, 4096, true};
   l.BanOverlapping(WrittenFn, &wf, 12);  // R banned and dropped
-  CHECK(!HasRange(l.ranges(), 0x9000, 16) && l.ranges().size() == 255);
+  CHECK(!HasRange(l.ranges(), 0x9000, 16) && l.ranges().size() == ss::kMaxRanges - 1);
   uint64_t g = l.generation();
   l.BeginFrame(21);
   CHECK(!HasRange(l.ranges(), 0x9100, 16));
   CHECK(HasRange(l.ranges(), 0x20000, 16));
   CHECK(l.generation() == g + 1);  // an insert with no eviction moves the generation too (R2'): State publishes on it
-  CHECK(l.ranges().size() == 256);
+  CHECK(l.ranges().size() == ss::kMaxRanges);
   CHECK(l.evicted() == 0);
 }
 
@@ -666,41 +686,43 @@ static void TestPartialEvictThenDrop() {
 }
 
 // 37. Churn is bounded (spec G2; ruling SS77): a candidate larger than every eligible victim together never evicts.
-// 8 ranges of 65000 bytes that change every frame (520000) + 248 ranges of 16 bytes requested every frame that never
-// change (3968) = 523968 bytes, 256 ranges. A 65536-byte candidate C is requested every frame: 523968 + 65536 -
-// 3968 = 585536 > 524288 even with all 248 small ranges evicted. Under R3' every 8th boundary wiped the 248 small
-// ranges (2976 evictions in 100 boundaries, C never admitted; review I1's probe).
+// 8 ranges of 65000 bytes that change every frame (520000) + kMaxRanges - 8 ranges of 8 bytes requested every frame
+// that never change (504 x 8 = 4032 at 512) = 524032 bytes, kMaxRanges ranges: the list is full by count and within
+// 256 bytes of the byte cap. A 65536-byte candidate C is requested every frame (count kMaxRanges + 1, bytes 589568):
+// 524032 + 65536 - 4032 = 585536 > 524288 even with every small range evicted. Under R3' every 8th boundary wiped the
+// small ranges (at 256: 2976 evictions in 100 boundaries, C never admitted; review I1's probe).
 static void TestFutileEvictionDrops() {
   Case("futile_eviction_drops");
+  constexpr uint32_t kSmall = ss::kMaxRanges - 8;
   ss::Learner l;
   l.BeginFrame(1);
   for (uint32_t i = 0; i < 8; ++i) LearnL(l, 0x1000000 + i * 0x20000, 65000);
-  for (uint32_t j = 0; j < 248; ++j) LearnL(l, 0x100000 + j * 0x20, 16);
+  for (uint32_t j = 0; j < kSmall; ++j) LearnL(l, 0x100000 + j * 0x20, 8);
   uint64_t sum0 = 0;
   for (const ss::Range& r : l.ranges()) sum0 += r.size;
-  CHECK(l.ranges().size() == 256 && sum0 == 523968);
-  CHECK(sum0 + 65536 - 248 * 16 > ss::kMaxTotalBytes);  // the precondition: C cannot fit even with every victim gone
+  CHECK(l.ranges().size() == ss::kMaxRanges && sum0 == 8 * 65000 + kSmall * 8);
+  CHECK(sum0 + 65536 - kSmall * 8 > ss::kMaxTotalBytes);  // the precondition: C cannot fit even with every victim gone
   bool c_ever = false, refused_every_frame = true;
-  size_t min_size = 256;
+  size_t min_size = ss::kMaxRanges;
   for (uint32_t f = 2; f <= 101; ++f) {
     l.BeginFrame(f);
     min_size = std::min(min_size, l.ranges().size());
     if (HasRange(l.ranges(), 0x2000000, 65536)) c_ever = true;
     l.NoteChanged({0x1000000, 8 * 0x20000});  // the 8 big ranges change every frame
-    for (uint32_t j = 0; j < 248; ++j) LearnL(l, 0x100000 + j * 0x20, 16);
+    for (uint32_t j = 0; j < kSmall; ++j) LearnL(l, 0x100000 + j * 0x20, 8);
     LearnL(l, 0x2000000, 65536);
     if (HasRange(l.ranges(), 0x2000000, 65536)) refused_every_frame = false;
   }
   CHECK(refused_every_frame);
   CHECK(!c_ever);
   CHECK(l.evicted() == 0);
-  CHECK(min_size == 256);  // no boundary removed a range
+  CHECK(min_size == ss::kMaxRanges);  // no boundary removed a range
 }
 
 // 42. R3-pre at its byte edge: a candidate that fits EXACTLY at kMaxTotalBytes once every eligible range is gone is
 // admitted (the admission rule is bytes_after <= kMaxTotalBytes; R3-pre drops only past it). 16 x 32768 = 524288;
 // indices 2..15 changed at 19, so only indices 0 and 1 are idle >= 8 at 21: 524288 + 65536 - 2 x 32768 = 524288.
-// The excluded wrong version drops at ">=" (nothing evicted, the candidate absent). The count edge (exactly 256 after
+// The excluded wrong version drops at ">=" (nothing evicted, the candidate absent). The count edge (exactly kMaxRanges after
 // the only eligible victim goes) is group 39's C_a.
 static void TestPreCheckAtByteEdge() {
   Case("pre_check_at_byte_edge");
@@ -732,18 +754,18 @@ static void TestPreCheckAtByteEdge() {
 static void TestR2AgingBeforeAdmission() {
   Case("r2_aging_before_admission");
   ss::Learner l;
-  Full256(l, 1);
+  FullList(l, 1);
   l.BeginFrame(115);
   l.NoteChanged({0x10000, 5 * 0x20});
-  l.NoteChanged({0x10000 + 6 * 0x20, 250 * 0x20});
+  l.NoteChanged({0x10000 + 6 * 0x20, (ss::kMaxRanges - 6) * 0x20});  // indices 6..kMaxRanges-1
   l.BeginFrame(121);
-  CHECK(HasRange(l.ranges(), 0x100A0, 16) && l.ranges().size() == 256);
+  CHECK(HasRange(l.ranges(), 0x100A0, 16) && l.ranges().size() == ss::kMaxRanges);
   LearnL(l, kX.address, kX.size);
   CHECK(!HasRange(l.ranges(), kX.address, kX.size));
   l.BeginFrame(122);
   CHECK(HasRange(l.ranges(), kX.address, kX.size));
   CHECK(!HasRange(l.ranges(), 0x100A0, 16));
-  CHECK(l.ranges().size() == 256);
+  CHECK(l.ranges().size() == ss::kMaxRanges);
   CHECK(l.evicted() == 0);
 }
 
@@ -753,16 +775,16 @@ static void TestR2AgingBeforeAdmission() {
 static void TestR3PendingOrder() {
   Case("r3_pending_order");
   ss::Learner l;
-  Full256(l, 1);
+  FullList(l, 1);
   l.BeginFrame(19);
-  l.NoteChanged({0x10020, 255 * 0x20});
+  l.NoteChanged({0x10020, (ss::kMaxRanges - 1) * 0x20});
   l.BeginFrame(20);
   LearnL(l, 0x30000, 16);
   LearnL(l, 0x30100, 16);
   l.BeginFrame(21);
   CHECK(HasRange(l.ranges(), 0x30000, 16));
   CHECK(!HasRange(l.ranges(), 0x30100, 16));
-  CHECK(l.evicted() == 1 && l.ranges().size() == 256);
+  CHECK(l.evicted() == 1 && l.ranges().size() == ss::kMaxRanges);
 }
 
 static bool PageListed(ss::State& s, uint32_t page) {
@@ -779,7 +801,7 @@ static void TestR4PendingSurvivesFrameZero() {
   auto s = std::make_unique<ss::State>();
   InvLog inv;
   Boundary(*s, 1, true, &inv);  // frame 2
-  for (uint32_t i = 0; i < 256; ++i) LearnS(*s, 0x10000 + i * 0x20, 16);
+  for (uint32_t i = 0; i < ss::kMaxRanges; ++i) LearnS(*s, 0x10000 + i * 0x20, 16);
   LearnS(*s, kX.address, kX.size);
   CHECK(StatField(*s, "rejected_cap") == 1);
   CHECK(!PageListed(*s, 0x30));
@@ -788,7 +810,7 @@ static void TestR4PendingSurvivesFrameZero() {
   Boundary(*s, 20, true, &inv);  // frame 21: every fill range idle 19
   CHECK(PageListed(*s, 0x30));
   CHECK(StatField(*s, "evicted") == 1);
-  CHECK(StatField(*s, "ranges_now") == 256);
+  CHECK(StatField(*s, "ranges_now") == ss::kMaxRanges);
 }
 
 // 41. The eviction idle expression across the frame-counter wrap (same form as aging). Fill at 0xFFFFFFF8; frame 3
@@ -797,9 +819,9 @@ static void TestR4PendingSurvivesFrameZero() {
 static void TestIdleAtCounterWrap() {
   Case("idle_at_counter_wrap");
   ss::Learner l;
-  Full256(l, 0xFFFFFFF8u);
+  FullList(l, 0xFFFFFFF8u);
   l.BeginFrame(3);
-  CHECK(l.ranges().size() == 256);  // idle 11 <= 120: not aged
+  CHECK(l.ranges().size() == ss::kMaxRanges);  // idle 11 <= 120: not aged
   LearnL(l, kX.address, kX.size);
   l.BeginFrame(4);  // idle 12 >= 8: X admitted by one eviction
   CHECK(HasRange(l.ranges(), kX.address, kX.size) && l.evicted() == 1);
@@ -814,13 +836,13 @@ static void TestIdleAtCounterWrap() {
 static void TestHeldAtAdmission() {
   Case("held_at_admission");
   ss::Learner l;
-  Full256(l, 1);
+  FullList(l, 1);
   l.BeginFrame(20);
   LearnL(l, kX.address, kX.size);  // refused (count)
-  LearnL(l, 0x10000, 0x40);        // merges two: 255 ranges
-  CHECK(HasRange(l.ranges(), 0x10000, 0x40) && HasRange(l.ranges(), 0x10040, 16) && l.ranges().size() == 255);
+  LearnL(l, 0x10000, 0x40);        // merges two: kMaxRanges - 1 ranges
+  CHECK(HasRange(l.ranges(), 0x10000, 0x40) && HasRange(l.ranges(), 0x10040, 16) && l.ranges().size() == ss::kMaxRanges - 1);
   LearnL(l, 0x2FFF0, 0x30);
-  CHECK(HasRange(l.ranges(), 0x2FFF0, 0x30) && l.ranges().size() == 256);
+  CHECK(HasRange(l.ranges(), 0x2FFF0, 0x30) && l.ranges().size() == ss::kMaxRanges);
   uint64_t g = l.generation();
   size_t n = l.ranges().size();
   l.BeginFrame(21);  // no aging (idle 20 < 120); X is held: dropped
@@ -837,13 +859,13 @@ static void TestResetClearsPending() {
   auto s = std::make_unique<ss::State>();
   InvLog inv;
   Boundary(*s, 1, true, &inv);  // frame 2
-  for (uint32_t i = 0; i < 256; ++i) LearnS(*s, 0x10000 + i * 0x20, 16);
-  CHECK(StatField(*s, "ranges_now") == 256);
+  for (uint32_t i = 0; i < ss::kMaxRanges; ++i) LearnS(*s, 0x10000 + i * 0x20, 16);
+  CHECK(StatField(*s, "ranges_now") == ss::kMaxRanges);
   Boundary(*s, 10, true, &inv);  // frame 11
   LearnS(*s, kX.address, kX.size);  // refused
   Boundary(*s, 11, true, &inv);  // frame 12: every range idle 10, X admitted
   CHECK(StatField(*s, "evicted") == 1);
-  CHECK(StatField(*s, "ranges_now") == 256);
+  CHECK(StatField(*s, "ranges_now") == ss::kMaxRanges);
   LearnS(*s, 0x30100, 16);  // refused, pending
   s->Reset();
   Boundary(*s, 12, true, &inv);  // frame 13
@@ -858,7 +880,7 @@ static void TestRefusedFirstWindow() {
   auto s = std::make_unique<ss::State>();
   InvLog inv;
   Boundary(*s, 1, true, &inv);  // frame 2
-  for (uint32_t i = 0; i < 256; ++i) LearnS(*s, 0x10000 + i * 0x20, 16);
+  for (uint32_t i = 0; i < ss::kMaxRanges; ++i) LearnS(*s, 0x10000 + i * 0x20, 16);
   CHECK(StatText(*s, "refused_first") == "-");
   LearnS(*s, kX.address, kX.size);
   LearnS(*s, 0x30100, 16);
@@ -869,15 +891,18 @@ static void TestRefusedFirstWindow() {
   CHECK(StatText(*s, "refused_first") == "0x30100:16:count");
 }
 
-// 35. The kind: the count cap is checked first. 256 x 2048 = 524288 (both caps reached); one more range of 16 is
-// over both (count 257, bytes 524304) and reads "count".
+// 35. The kind: the count cap is checked first. kMaxRanges ranges of kMaxTotalBytes / kMaxRanges bytes (512 x 1024 =
+// 524288 at 512: both caps reached); one more range of 16 is over both (count kMaxRanges + 1, bytes 524304) and
+// reads "count".
 static void TestRefusedKindCountFirst() {
   Case("refused_kind_count_first");
+  constexpr uint32_t kEach = ss::kMaxTotalBytes / ss::kMaxRanges;
+  CHECK(kEach * ss::kMaxRanges == ss::kMaxTotalBytes && kEach < 0x1000);  // precondition: both caps exactly, gaps
   auto s = std::make_unique<ss::State>();
   InvLog inv;
   Boundary(*s, 1, true, &inv);  // frame 2
-  for (uint32_t i = 0; i < 256; ++i) LearnS(*s, 0x100000 + i * 0x1000, 2048);
-  CHECK(StatField(*s, "ranges_now") == 256 && StatField(*s, "ranges_bytes") == 524288);
+  for (uint32_t i = 0; i < ss::kMaxRanges; ++i) LearnS(*s, 0x100000 + i * 0x1000, kEach);
+  CHECK(StatField(*s, "ranges_now") == ss::kMaxRanges && StatField(*s, "ranges_bytes") == 524288);
   LearnS(*s, 0x300000, 16);
   CHECK(StatText(*s, "refused_first") == "0x300000:16:count");
 }
@@ -889,7 +914,7 @@ static void TestNoAllocationOnEviction() {
   auto s = std::make_unique<ss::State>();
   InvLog inv;
   Boundary(*s, 1, true, &inv);  // frame 2
-  for (uint32_t i = 0; i < 256; ++i) LearnS(*s, 0x10000 + i * 0x20, 16);
+  for (uint32_t i = 0; i < ss::kMaxRanges; ++i) LearnS(*s, 0x10000 + i * 0x20, 16);
   g_allocs = 0;
   g_count_allocs = true;
   for (uint32_t k = 0; k < 20; ++k) {
@@ -1681,6 +1706,7 @@ int main() {
   TestLearnedPageSpans();
   TestLearningSignature();
   TestLimits();
+  TestCountCapIs512();
   TestEvictIdleEdge();
   TestEvictLongestIdle();
   TestNothingIdleRefuses();
