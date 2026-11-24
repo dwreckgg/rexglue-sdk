@@ -951,14 +951,22 @@ void SharedMemory::SubmitSnapshotFrameBoundary(uint32_t swap_ordinal, bool on) {
   }
   {
     // B2: one hold of the global lock for the whole boundary. Lock order: the
-    // global lock, then the helper's publish mutex (inside); the guest side
-    // (VdSwap) never takes the global lock while it holds swap_mutex().
+    // global lock, then the helper's publish mutex (inside). The GPU thread
+    // never takes swap_mutex() (only VdSwap does). VdSwap can take the global
+    // lock while it holds swap_mutex(): its swap-packet writes into the
+    // primary ring buffer fault into the write-watch handler, which takes the
+    // global lock, when SharedMemory watches that page. That order
+    // (swap_mutex(), then the global lock) has no reverse edge: nothing that
+    // holds the global lock waits for swap_mutex(), and VdSwap holds no ring
+    // slot or publish mutex while it writes the packet.
     auto global_lock = global_critical_region_.Acquire();
     snapshot.GpuFrameBoundary(swap_ordinal, on, SubmitSnapshotInvalidateThunk, this,
                               SubmitSnapshotGpuWrittenThunk, this, page_size_log2_);
   }
   if (snapshot.gpu_on() && ++submit_snapshot_frames_on_ % 3600 == 0) {
     REXGPU_INFO("{}", snapshot.StatsLine());
+    // refused_first= is per printed window (cap eviction spec G3); the teardown line prints the current window's.
+    snapshot.ClearWindowRefusal();
   }
 }
 
