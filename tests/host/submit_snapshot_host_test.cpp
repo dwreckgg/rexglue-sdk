@@ -641,8 +641,10 @@ static void TestBanBeforeAdmission() {
   CHECK(l.evicted() == 0);
 }
 
-// 31. Evictions made before a drop stand: only index 0 is idle >= 8 (idle 20; the others idle 2); one eviction
-// leaves 491520 + 65536 = 557056 > 524288, so the candidate is dropped and the list changed (generation moves).
+// 31. R3-pre (ruling SS77, replacing R3' "evictions made before a drop stand"): a candidate that cannot fit even with
+// every eligible victim gone is dropped with NO eviction. Only index 0 is idle >= 8 (idle 20; the others idle 2);
+// evicting it would leave 491520 + 65536 = 557056 > 524288, so nothing is evicted and the list and its generation
+// stay as they were. The excluded wrong version is R3': index 0 evicted, 15 ranges, the generation moved.
 static void TestPartialEvictThenDrop() {
   Case("partial_evict_then_drop");
   ss::Learner l;
@@ -653,13 +655,157 @@ static void TestPartialEvictThenDrop() {
   l.NoteChanged({0x210000, 15 * 0x10000});  // indices 1..15 last active 19
   l.BeginFrame(20);
   LearnL(l, 0x400000, 65536);  // refused (bytes)
+  CHECK(!HasRange(l.ranges(), 0x400000, 65536));
   uint64_t g = l.generation();
   l.BeginFrame(21);
   CHECK(!HasRange(l.ranges(), 0x400000, 65536));
-  CHECK(!HasRange(l.ranges(), 0x200000, 32768));
+  CHECK(HasRange(l.ranges(), 0x200000, 32768));
+  CHECK(l.ranges().size() == 16);
+  CHECK(l.evicted() == 0);
+  CHECK(l.generation() == g);
+}
+
+// 37. Churn is bounded (spec G2; ruling SS77): a candidate larger than every eligible victim together never evicts.
+// 8 ranges of 65000 bytes that change every frame (520000) + 248 ranges of 16 bytes requested every frame that never
+// change (3968) = 523968 bytes, 256 ranges. A 65536-byte candidate C is requested every frame: 523968 + 65536 -
+// 3968 = 585536 > 524288 even with all 248 small ranges evicted. Under R3' every 8th boundary wiped the 248 small
+// ranges (2976 evictions in 100 boundaries, C never admitted; review I1's probe).
+static void TestFutileEvictionDrops() {
+  Case("futile_eviction_drops");
+  ss::Learner l;
+  l.BeginFrame(1);
+  for (uint32_t i = 0; i < 8; ++i) LearnL(l, 0x1000000 + i * 0x20000, 65000);
+  for (uint32_t j = 0; j < 248; ++j) LearnL(l, 0x100000 + j * 0x20, 16);
+  uint64_t sum0 = 0;
+  for (const ss::Range& r : l.ranges()) sum0 += r.size;
+  CHECK(l.ranges().size() == 256 && sum0 == 523968);
+  CHECK(sum0 + 65536 - 248 * 16 > ss::kMaxTotalBytes);  // the precondition: C cannot fit even with every victim gone
+  bool c_ever = false, refused_every_frame = true;
+  size_t min_size = 256;
+  for (uint32_t f = 2; f <= 101; ++f) {
+    l.BeginFrame(f);
+    min_size = std::min(min_size, l.ranges().size());
+    if (HasRange(l.ranges(), 0x2000000, 65536)) c_ever = true;
+    l.NoteChanged({0x1000000, 8 * 0x20000});  // the 8 big ranges change every frame
+    for (uint32_t j = 0; j < 248; ++j) LearnL(l, 0x100000 + j * 0x20, 16);
+    LearnL(l, 0x2000000, 65536);
+    if (HasRange(l.ranges(), 0x2000000, 65536)) refused_every_frame = false;
+  }
+  CHECK(refused_every_frame);
+  CHECK(!c_ever);
+  CHECK(l.evicted() == 0);
+  CHECK(min_size == 256);  // no boundary removed a range
+}
+
+// 42. R3-pre at its byte edge: a candidate that fits EXACTLY at kMaxTotalBytes once every eligible range is gone is
+// admitted (the admission rule is bytes_after <= kMaxTotalBytes; R3-pre drops only past it). 16 x 32768 = 524288;
+// indices 2..15 changed at 19, so only indices 0 and 1 are idle >= 8 at 21: 524288 + 65536 - 2 x 32768 = 524288.
+// The excluded wrong version drops at ">=" (nothing evicted, the candidate absent). The count edge (exactly 256 after
+// the only eligible victim goes) is group 39's C_a.
+static void TestPreCheckAtByteEdge() {
+  Case("pre_check_at_byte_edge");
+  ss::Learner l;
+  l.BeginFrame(1);
+  for (uint32_t i = 0; i < 16; ++i) LearnL(l, 0x200000 + i * 0x10000, 32768);
+  uint64_t sum0 = 0;
+  for (const ss::Range& r : l.ranges()) sum0 += r.size;
+  CHECK(l.ranges().size() == 16 && sum0 == 524288);
+  l.BeginFrame(19);
+  l.NoteChanged({0x220000, 14 * 0x10000});  // indices 2..15 last active 19
+  l.BeginFrame(20);
+  LearnL(l, 0x400000, 65536);  // refused (bytes 589824)
+  CHECK(!HasRange(l.ranges(), 0x400000, 65536));
+  l.BeginFrame(21);
+  CHECK(HasRange(l.ranges(), 0x400000, 65536));
+  CHECK(!HasRange(l.ranges(), 0x200000, 32768) && !HasRange(l.ranges(), 0x210000, 32768));
+  CHECK(HasRange(l.ranges(), 0x220000, 32768));
   CHECK(l.ranges().size() == 15);
-  CHECK(l.evicted() == 1);
-  CHECK(l.generation() != g);
+  CHECK(l.evicted() == 2);
+  uint64_t sum1 = 0;
+  for (const ss::Range& r : l.ranges()) sum1 += r.size;
+  CHECK(sum1 == ss::kMaxTotalBytes);  // exactly at the cap
+}
+
+// 38. R2: aging runs BEFORE admission. Index 5 (0x100A0) last active 1, the others 115. Boundary 121: index 5 idle
+// 120, not aged. X refused at 121. Boundary 122: index 5 idle 121 > 120 is aged first, so X fits with no eviction.
+// The excluded wrong version admits first: it evicts index 5 for X (evicted 1).
+static void TestR2AgingBeforeAdmission() {
+  Case("r2_aging_before_admission");
+  ss::Learner l;
+  Full256(l, 1);
+  l.BeginFrame(115);
+  l.NoteChanged({0x10000, 5 * 0x20});
+  l.NoteChanged({0x10000 + 6 * 0x20, 250 * 0x20});
+  l.BeginFrame(121);
+  CHECK(HasRange(l.ranges(), 0x100A0, 16) && l.ranges().size() == 256);
+  LearnL(l, kX.address, kX.size);
+  CHECK(!HasRange(l.ranges(), kX.address, kX.size));
+  l.BeginFrame(122);
+  CHECK(HasRange(l.ranges(), kX.address, kX.size));
+  CHECK(!HasRange(l.ranges(), 0x100A0, 16));
+  CHECK(l.ranges().size() == 256);
+  CHECK(l.evicted() == 0);
+}
+
+// 39. R3: pending candidates are admitted in pending order (first refused, first admitted). Only index 0 is idle >= 8
+// at boundary 21; C_a (refused first) takes it, C_b finds no victim (C_a is idle 0) and is dropped. The excluded
+// wrong version admits the last-refused candidate first.
+static void TestR3PendingOrder() {
+  Case("r3_pending_order");
+  ss::Learner l;
+  Full256(l, 1);
+  l.BeginFrame(19);
+  l.NoteChanged({0x10020, 255 * 0x20});
+  l.BeginFrame(20);
+  LearnL(l, 0x30000, 16);
+  LearnL(l, 0x30100, 16);
+  l.BeginFrame(21);
+  CHECK(HasRange(l.ranges(), 0x30000, 16));
+  CHECK(!HasRange(l.ranges(), 0x30100, 16));
+  CHECK(l.evicted() == 1 && l.ranges().size() == 256);
+}
+
+static bool PageListed(ss::State& s, uint32_t page) {
+  for (const auto& [first, count] : s.LearnedPageSpans(12)) {
+    if (page >= first && page < first + count) return true;
+  }
+  return false;
+}
+
+// 40. R4': a candidate pending at a frame_ == 0 boundary (ordinal 0, then latched off) survives it and is admitted at
+// the next BeginFrame. The excluded wrong version clears pending at a frame_ == 0 boundary.
+static void TestR4PendingSurvivesFrameZero() {
+  Case("r4_pending_survives_frame_zero");
+  auto s = std::make_unique<ss::State>();
+  InvLog inv;
+  Boundary(*s, 1, true, &inv);  // frame 2
+  for (uint32_t i = 0; i < 256; ++i) LearnS(*s, 0x10000 + i * 0x20, 16);
+  LearnS(*s, kX.address, kX.size);
+  CHECK(StatField(*s, "rejected_cap") == 1);
+  CHECK(!PageListed(*s, 0x30));
+  Boundary(*s, 0, true, &inv);   // frame 0
+  Boundary(*s, 5, false, &inv);  // latched off: frame 0
+  Boundary(*s, 20, true, &inv);  // frame 21: every fill range idle 19
+  CHECK(PageListed(*s, 0x30));
+  CHECK(StatField(*s, "evicted") == 1);
+  CHECK(StatField(*s, "ranges_now") == 256);
+}
+
+// 41. The eviction idle expression across the frame-counter wrap (same form as aging). Fill at 0xFFFFFFF8; frame 3
+// is idle 11, nothing aged; boundary 4 admits X by one eviction (idle 12 >= 8); at boundary 5 X (idle 1) is protected
+// and a fill range (idle 13) is the victim.
+static void TestIdleAtCounterWrap() {
+  Case("idle_at_counter_wrap");
+  ss::Learner l;
+  Full256(l, 0xFFFFFFF8u);
+  l.BeginFrame(3);
+  CHECK(l.ranges().size() == 256);  // idle 11 <= 120: not aged
+  LearnL(l, kX.address, kX.size);
+  l.BeginFrame(4);  // idle 12 >= 8: X admitted by one eviction
+  CHECK(HasRange(l.ranges(), kX.address, kX.size) && l.evicted() == 1);
+  LearnL(l, 0x30100, 16);
+  l.BeginFrame(5);  // X idle 1 (protected); a fill range idle 13 is the victim
+  CHECK(HasRange(l.ranges(), kX.address, kX.size) && HasRange(l.ranges(), 0x30100, 16) && l.evicted() == 2);
 }
 
 // 32. A pending candidate the list already holds at its boundary is dropped untouched (no erase and reinsert, no
@@ -1543,6 +1689,12 @@ int main() {
   TestBytesCapEvictsSeveral();
   TestBanBeforeAdmission();
   TestPartialEvictThenDrop();
+  TestFutileEvictionDrops();
+  TestPreCheckAtByteEdge();
+  TestR2AgingBeforeAdmission();
+  TestR3PendingOrder();
+  TestR4PendingSurvivesFrameZero();
+  TestIdleAtCounterWrap();
   TestHeldAtAdmission();
   TestResetClearsPending();
   TestRefusedFirstWindow();

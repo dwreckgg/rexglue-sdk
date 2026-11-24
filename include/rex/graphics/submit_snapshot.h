@@ -92,7 +92,7 @@ class Ring {
 class Learner {
  public:
   Learner();
-  // Ages (D11), then admits the candidates the caps refused in the previous frame (pending; cap eviction), then
+  // Ages (D11), then admits the candidates the caps refused since the last BeginFrame (pending; cap eviction), then
   // clears the frame's notes and pass table.
   void BeginFrame(uint32_t frame);
   void NoteRequest(uint32_t address, uint32_t size, uint64_t bin_select, uint32_t uploaded_pages);
@@ -122,8 +122,9 @@ class Learner {
   static constexpr uint32_t kMaxPasses = 64;
   uint32_t PassIndex(uint64_t bin_select);
   void TryLearn(Range c);
-  // BeginFrame, after aging: admits each pending candidate in order (evicting the longest-idle ranges outside its
-  // overlap while it does not fit and one is idle >= kEvictIdleFrames, else dropping it) and empties pending_.
+  // BeginFrame, after aging: admits each pending candidate in order and empties pending_. A candidate that does not
+  // fit is dropped with no eviction when it would not fit even with every eligible range gone (R3-pre: ranges outside
+  // its overlap, idle >= kEvictIdleFrames); otherwise the longest-idle eligible ranges are evicted until it fits.
   // True when the list changed (an eviction or an insert).
   bool AdmitPending();
   void RemoveAt(size_t i);
@@ -144,8 +145,9 @@ class Learner {
   std::vector<std::pair<uint32_t, uint32_t>> spans_;
   // Refusal events (A16), read by State::StatsLine.
   uint64_t rejected_cap_ = 0, rejected_size_ = 0, banned_ = 0;
-  // Cap eviction: the candidates the caps refused this frame (deduplicated, at most kMaxPending), admitted or dropped
-  // at the next BeginFrame; evicted_ and the window's first refusal (State::StatsLine, survive Reset).
+  // Cap eviction: the candidates the caps refused since the last BeginFrame (deduplicated, at most kMaxPending),
+  // admitted or dropped at the next BeginFrame; evicted_ and the window's first refusal (State::StatsLine, survive
+  // Reset).
   std::array<Range, kMaxPending> pending_{};
   uint32_t pending_count_ = 0;
   uint64_t evicted_ = 0;

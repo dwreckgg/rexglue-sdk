@@ -200,7 +200,8 @@ void Learner::BeginFrame(uint32_t frame) {
       changed = true;
     }
   }
-  // Cap eviction, at the point aging removes (the only list removals are here, in BanOverlapping and in Reset).
+  // Cap eviction, at the point aging removes (ranges leave the list only here, in BanOverlapping and in Reset;
+  // TryLearn's merge replaces ranges with a superset, so within a frame the learned pages only grow).
   if (AdmitPending()) changed = true;
   if (changed) ++generation_;  // once, for aging and admission together
   // Clear the notes by moving the epoch; on its wrap, empty the table for real.
@@ -347,6 +348,7 @@ bool Learner::AdmitPending() {
     // A ban can arrive between the refusal and this boundary (direct Learner callers; State bans after BeginFrame).
     // c.size was checked against kMaxRangeBytes by TryLearn and has not changed; a merged range is never size-capped.
     if (Banned(c)) continue;
+    bool checked = false;
     for (;;) {
       Fit f = FitOf(list_, total_bytes_, c);
       if (f.held) break;  // already held: the list stays untouched
@@ -355,8 +357,25 @@ bool Learner::AdmitPending() {
         changed = true;
         break;
       }
+      // R3-pre (ruling SS77, spec G2 "churn is bounded"): before the first eviction, drop c with no eviction when it
+      // cannot fit even with every eligible victim gone. Exact: a victim lies outside [f.first, f.last), so removing
+      // it leaves that overlap set, lo and hi as they are and lowers count_after by 1 and bytes_after by its size;
+      // n_elig <= count_after - 1 and bytes_elig <= bytes_after - (hi - lo), so neither difference can underflow.
+      if (!checked) {
+        checked = true;
+        size_t n_elig = 0;
+        uint64_t bytes_elig = 0;
+        for (size_t i = 0; i < list_.size(); ++i) {
+          if (i >= f.first && i < f.last) continue;
+          if (int32_t(frame_ - last_active_[i]) >= int32_t(kEvictIdleFrames)) {
+            ++n_elig;
+            bytes_elig += list_[i].size;
+          }
+        }
+        if (f.count_after - n_elig > kMaxRanges || f.bytes_after - bytes_elig > kMaxTotalBytes) break;  // dropped
+      }
       // The victim: the range idle longest (ties: the lowest index), outside the ranges c merges with, idle at least
-      // kEvictIdleFrames. Evictions made before a drop stand.
+      // kEvictIdleFrames. Under R3-pre the evictions always end in the insert above.
       size_t victim = list_.size();
       int32_t victim_idle = 0;
       for (size_t i = 0; i < list_.size(); ++i) {
@@ -367,7 +386,7 @@ bool Learner::AdmitPending() {
           victim_idle = idle;
         }
       }
-      if (victim == list_.size()) break;  // nothing idle enough: dropped (re-noted when requested again)
+      if (victim == list_.size()) break;  // not reached under R3-pre; kept so the loop always ends
       RemoveAt(victim);
       ++evicted_;
       changed = true;
