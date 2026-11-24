@@ -747,10 +747,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
 
     // Fetch constant word usage:
     // - 2: Size (needed only once).
-    // - 3: Exponent adjustment (needed only once).
+    // - 3: Exponent adjustment (needed only once): kTextureFetch result
+    //      exponent bias (exp_adjust, bits 13:18).
     // - 4: Conditionally for 3D kTextureFetch: stacked texture filtering modes.
-    //      Unconditionally LOD kTextureFetch: LOD and gradient exponent bias,
-    //      result exponent bias.
+    //      Unconditionally LOD kTextureFetch: LOD bias (the gradient exponent
+    //      bias is in word 4 too, but is not applied yet).
     // - 5: Dimensionality (3D or 2D stacked - needed only once).
 
     // Load the texture size and whether it's 3D or stacked if needed.
