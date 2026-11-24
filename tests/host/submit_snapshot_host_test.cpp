@@ -489,6 +489,12 @@ static void TestCountCapIs512() {
   CHECK(StatField(*s, "ranges_bytes") == 8192);
   CHECK(StatField(*s, "rejected_cap") == 0);
   CHECK(StatText(*s, "refused_first") == "-");
+  // The full list goes through the Ring whole (review 4b M1): GuestSwap -> Ring::Copy copies all 512 ranges, not a
+  // cut at 256. The last range ends at 0x10000 + 511 * 0x20 + 16 = 0x13FF0, inside the 0x14000-byte FakeMem.
+  FakeMem mem(0x14000);
+  ss::CopyResult c = s->GuestSwap(2, MemRead, &mem, false);
+  CHECK(c.copied == 512);
+  CHECK(c.bytes == 8192 && c.skipped_unreadable == 0);
   LearnS(*s, 0x30000, 16);  // the 513th distinct range: count 513, bytes 8208
   CHECK(StatField(*s, "rejected_cap") == 1);
   CHECK(StatText(*s, "refused_first") == "0x30000:16:count");
@@ -746,6 +752,74 @@ static void TestPreCheckAtByteEdge() {
   uint64_t sum1 = 0;
   for (const ss::Range& r : l.ranges()) sum1 += r.size;
   CHECK(sum1 == ss::kMaxTotalBytes);  // exactly at the cap
+}
+
+// 44. R3-pre counts only victims OUTSIDE the candidate's overlap set (re-review m-rr1, mutant mB). A = {0x200000, 16}
+// idle and overlapped by c; B = {0x300000, 16} idle, not overlapped; fillers active every frame, 14 x 32768 + 8 =
+// 458760 bytes. c = {0x1F8000, 65536} merges A: bytes_after = 458760 + 32 - 16 + 65536 = 524312 > 524288 (refused,
+// bytes; count 17, far under the count cap). Eligible = B only: 524312 - 16 = 524296 > 524288, so c is dropped with no
+// eviction. The excluded wrong version also counts A (524312 - 32 = 524280 passes), then evicts B and still drops c.
+static void TestPreCheckSkipsOverlap() {
+  Case("pre_check_skips_overlap");
+  ss::Learner l;
+  l.BeginFrame(1);
+  LearnL(l, 0x200000, 16);  // A
+  LearnL(l, 0x300000, 16);  // B
+  for (uint32_t i = 0; i < 14; ++i) LearnL(l, 0x400000 + i * 0x10000, 32768);
+  LearnL(l, 0x400000 + 14 * 0x10000, 8);
+  uint64_t sum0 = 0;
+  for (const ss::Range& r : l.ranges()) sum0 += r.size;
+  CHECK(l.ranges().size() == 17 && sum0 == 458760 + 32);
+  l.BeginFrame(19);
+  l.NoteChanged({0x400000, 15 * 0x10000});  // the fillers last active 19
+  l.BeginFrame(20);
+  LearnL(l, 0x1F8000, 65536);  // refused (bytes 524312)
+  CHECK(!HasRange(l.ranges(), 0x1F8000, 65536) && l.ranges().size() == 17);
+  uint64_t g = l.generation();
+  l.BeginFrame(21);  // A and B idle 20, the fillers idle 2
+  CHECK(!HasRange(l.ranges(), 0x1F8000, 65536));
+  CHECK(HasRange(l.ranges(), 0x300000, 16));  // B not evicted
+  CHECK(HasRange(l.ranges(), 0x200000, 16));
+  CHECK(l.ranges().size() == 17);
+  CHECK(l.evicted() == 0);
+  CHECK(l.generation() == g);
+}
+
+// 45. R3-pre runs for EVERY pending candidate, not only the first (re-review m-rr1, mutant mC). The list of group 37
+// (8 x 65000 active every frame + kMaxRanges - 8 ranges of 8 bytes, last active 1): kMaxRanges ranges, 524032 bytes.
+// Frame 8 refuses D = {0x30000000, 16} (count kMaxRanges + 1), then C = {0x2000000, 65536}. Boundary 9 (the small
+// ranges idle 8): D passes its pre-check (count_after - n_elig = 9) and evicts one small range, the lowest index
+// 0x100000, then fits (bytes 524040). C: bytes_after 524040 + 65536 = 589576, eligible 503 x 8 = 4024 (D is idle 0),
+// 585552 > 524288, so C is dropped with no eviction: evicted 1. The excluded wrong version pre-checks only the first
+// pending candidate: C wipes all 503 small ranges and is still dropped (evicted 504).
+// A single boundary: in group 37's loop the small range D evicts is re-requested, refused and pended, and evicts
+// another at each later boundary (legitimate churn), so the count there is not 1.
+static void TestPreCheckEveryCandidate() {
+  Case("pre_check_every_candidate");
+  constexpr uint32_t kSmall = ss::kMaxRanges - 8;
+  ss::Learner l;
+  l.BeginFrame(1);
+  for (uint32_t i = 0; i < 8; ++i) LearnL(l, 0x1000000 + i * 0x20000, 65000);
+  for (uint32_t j = 0; j < kSmall; ++j) LearnL(l, 0x100000 + j * 0x20, 8);
+  uint64_t sum0 = 0;
+  for (const ss::Range& r : l.ranges()) sum0 += r.size;
+  CHECK(l.ranges().size() == ss::kMaxRanges && sum0 == 8 * 65000 + kSmall * 8);
+  for (uint32_t f = 2; f <= 8; ++f) {
+    l.BeginFrame(f);
+    l.NoteChanged({0x1000000, 8 * 0x20000});  // the 8 big ranges change every frame
+  }
+  LearnL(l, 0x30000000, 16);   // D, refused first (count)
+  LearnL(l, 0x2000000, 65536);  // C, refused second
+  CHECK(!HasRange(l.ranges(), 0x30000000, 16) && !HasRange(l.ranges(), 0x2000000, 65536));
+  l.BeginFrame(9);
+  CHECK(HasRange(l.ranges(), 0x30000000, 16));
+  CHECK(!HasRange(l.ranges(), 0x100000, 8) && HasRange(l.ranges(), 0x100020, 8));
+  CHECK(!HasRange(l.ranges(), 0x2000000, 65536));
+  CHECK(l.evicted() == 1);
+  CHECK(l.ranges().size() == ss::kMaxRanges);
+  bool smalls_kept = true;
+  for (uint32_t j = 1; j < kSmall; ++j) smalls_kept = smalls_kept && HasRange(l.ranges(), 0x100000 + j * 0x20, 8);
+  CHECK(smalls_kept);
 }
 
 // 38. R2: aging runs BEFORE admission. Index 5 (0x100A0) last active 1, the others 115. Boundary 121: index 5 idle
@@ -1717,6 +1791,8 @@ int main() {
   TestPartialEvictThenDrop();
   TestFutileEvictionDrops();
   TestPreCheckAtByteEdge();
+  TestPreCheckSkipsOverlap();
+  TestPreCheckEveryCandidate();
   TestR2AgingBeforeAdmission();
   TestR3PendingOrder();
   TestR4PendingSurvivesFrameZero();
