@@ -22,9 +22,11 @@
 #include <rex/memory/ring_buffer.h>
 #include <rex/stream.h>
 #include <rex/string/buffer.h>
+#include <rex/system/kernel_state.h>
 #include <rex/system/thread_state.h>
 #include <rex/thread.h>
 #include <rex/cvar.h>
+#include <shared_mutex>
 
 REXCVAR_DEFINE_INT32(
     audio_maxqframes, 8, "Audio",
@@ -60,6 +62,21 @@ std::atomic<uint32_t> g_audio_worker_tid{0};   // host thread id of the worker (
 std::atomic<uint32_t> g_audio_registrations{0};  // clients the guest registered (netplay: rex_audio_registrations)
 std::mutex g_audio_mutex;
 std::condition_variable g_audio_cv;
+
+// Issue #22: TerminateTitle kills guest threads asleep, leaving their condition-variable wait blocks linked to freed
+// stacks, and the worker (a host thread) keeps waiting on and waking g_audio_cv after it. The one guest sleeper on
+// g_audio_cv, rex_audio_advance, holds a guest-wake pass across its bounded wait (250 ms at most), and TerminateTitle
+// waits for the passes held before it suspends anyone: so no guest thread is ever asleep here when killed. Guest-side
+// wakes (rex_audio_lockstep, also called by the closing thread's det::Stop) need a pass too.
+std::shared_lock<std::shared_mutex> AudioWakePass() {
+  if (auto* ks = rex::system::kernel_state()) {
+    return ks->TryGuestWakePass();
+  }
+  // No kernel state: before the runtime exists, or after it is gone (np::Shutdown, the last caller on a close, runs
+  // before the runtime is reset): a pass that always succeeds.
+  static std::shared_mutex no_title;
+  return std::shared_lock<std::shared_mutex>(no_title);
+}
 }  // namespace
 
 AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
@@ -448,12 +465,24 @@ extern "C" REX_DLL_EXPORT void rex_audio_lockstep(int on) {
     rex::audio::g_audio_lockstep = on != 0;
     rex::audio::g_xma_lockstep = on != 0;
   }
-  rex::audio::g_audio_cv.notify_all();
+  // Called by det::Stop on the closing thread after TerminateTitle: then no pass, no wake (issue #22).
+  if (auto pass = rex::audio::AudioWakePass(); pass.owns_lock()) {
+    rex::audio::g_audio_cv.notify_all();
+  }
 }
 // Sampler: the worker's guest context while it runs a guest callback, else nullptr
 extern "C" REX_DLL_EXPORT void* rex_audio_callback_context() { return rex::audio::g_audio_cb_ctx.load(std::memory_order_relaxed); }
 // Allows n more audio callbacks and waits until they ran (1) or timeout_ms passed (0)
 extern "C" REX_DLL_EXPORT int rex_audio_advance(uint32_t n, int timeout_ms) {
+  // The game's main guest thread (its frame boundary). It holds a guest-wake pass across the wait below (bounded by
+  // timeout_ms, 250 at most from the game), so it is never asleep on g_audio_cv when TerminateTitle kills it (issue #22).
+  // With no pass the title is being terminated and this thread with it: the budget is still granted (never lost to a
+  // refusal), but it neither wakes nor sleeps on g_audio_cv.
+  auto pass = rex::audio::AudioWakePass();
+  if (!pass.owns_lock()) {
+    rex::audio::g_audio_budget += n;
+    return 0;
+  }
   std::unique_lock lock(rex::audio::g_audio_mutex);
   rex::audio::g_audio_budget += n;
   rex::audio::g_audio_cv.notify_all();

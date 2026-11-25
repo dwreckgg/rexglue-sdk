@@ -278,14 +278,16 @@ class KernelState {
   // This DOES NOT RETURN if called from a guest thread!
   void TerminateTitle();
 
-  // Guest-wake passes (DOA4 Online issue #22). A host thread that wakes guest threads through a host condition
-  // variable holds a pass while it notifies. Such a variable keeps each sleeper's wait block on the sleeper's own
-  // stack, and TerminateTitle kills sleeping guest threads together with their stacks: a later notify then walks freed
-  // memory (an access violation in RtlWakeAllConditionVariable on most window closes). TerminateTitle closes the passes
-  // for good, after the passes in flight have ended and before it suspends any guest thread. Never blocks: a pass that
-  // does not own its lock means the title is being or has been terminated, and the caller skips its notify. Only for
-  // variables that guest threads alone sleep on: a host thread that also sleeps on one can walk the dead wait blocks
-  // itself when its own wait ends.
+  // Guest-wake passes (DOA4 Online issue #22). A host condition variable keeps each sleeper's wait block on the
+  // sleeper's own stack, and TerminateTitle kills sleeping guest threads together with their stacks: a later notify
+  // (or a host thread's own wait on the same variable) then walks freed memory (an access violation in
+  // RtlWakeAllConditionVariable on most window closes). Two uses: a thread that may run after a kill holds a pass while
+  // it wakes guest sleepers, and skips the wake without one (NoteGuestWrite, det Stop); a guest thread that sleeps on a
+  // variable a host thread also uses holds a pass across its wait (rex_audio_advance), so it is never asleep there when
+  // killed. TerminateTitle refuses new passes, then waits for the held ones to end, before it suspends any guest
+  // thread; the passes stay closed for good. Never blocks: a pass that does not own its lock means the title is being
+  // or has been terminated. Every holder must be bounded (a short notify, or a wait with a time limit): nothing else
+  // ends TerminateTitle's wait for it.
   std::shared_lock<std::shared_mutex> TryGuestWakePass();
 
   void RegisterThread(XThread* thread);
@@ -394,6 +396,9 @@ class KernelState {
   // exclusive.
   std::shared_mutex guest_wake_mutex_;
   bool guest_wakes_closed_ = false;
+  // Set by TerminateTitle before it waits for the exclusive lock: TryGuestWakePass refuses at once from then on, so the
+  // close waits only for the passes already held.
+  std::atomic<bool> guest_wakes_closing_{false};
 
   friend class XObject;
 };

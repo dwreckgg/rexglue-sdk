@@ -844,6 +844,11 @@ std::optional<KernelState::RecompiledModuleInfo> KernelState::FindRecompiledModu
 }
 
 std::shared_lock<std::shared_mutex> KernelState::TryGuestWakePass() {
+  // Refused at once once TerminateTitle is closing, so the close waits only for passes already held (without this,
+  // back-to-back passes in the netplay audio lockstep kept a close waiting for up to 1.7 s in a test build).
+  if (guest_wakes_closing_.load(std::memory_order_acquire)) {
+    return {};
+  }
   std::shared_lock<std::shared_mutex> pass(guest_wake_mutex_, std::try_to_lock);
   if (pass.owns_lock() && guest_wakes_closed_) {
     pass.unlock();
@@ -856,6 +861,7 @@ void KernelState::TerminateTitle() {
   // Close the guest-wake passes first (issue #22): waits for the notifies in flight, so none can still be walking a
   // sleeper's wait block when that sleeper is suspended and terminated below. Before the global lock, which no pass
   // holder takes.
+  guest_wakes_closing_.store(true, std::memory_order_release);  // no new pass from here on
   {
     std::unique_lock<std::shared_mutex> close(guest_wake_mutex_);
     guest_wakes_closed_ = true;
