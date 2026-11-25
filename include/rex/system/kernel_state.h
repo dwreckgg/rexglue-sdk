@@ -17,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -277,6 +278,16 @@ class KernelState {
   // This DOES NOT RETURN if called from a guest thread!
   void TerminateTitle();
 
+  // Guest-wake passes (DOA4 Online issue #22). A host thread that wakes guest threads through a host condition
+  // variable holds a pass while it notifies. Such a variable keeps each sleeper's wait block on the sleeper's own
+  // stack, and TerminateTitle kills sleeping guest threads together with their stacks: a later notify then walks freed
+  // memory (an access violation in RtlWakeAllConditionVariable on most window closes). TerminateTitle closes the passes
+  // for good, after the passes in flight have ended and before it suspends any guest thread. Never blocks: a pass that
+  // does not own its lock means the title is being or has been terminated, and the caller skips its notify. Only for
+  // variables that guest threads alone sleep on: a host thread that also sleeps on one can walk the dead wait blocks
+  // itself when its own wait ends.
+  std::shared_lock<std::shared_mutex> TryGuestWakePass();
+
   void RegisterThread(XThread* thread);
   void UnregisterThread(XThread* thread);
   void OnThreadExecute(XThread* thread);
@@ -378,6 +389,11 @@ class KernelState {
   util::NativeList dpc_list_;
   std::condition_variable_any dispatch_cond_;
   std::list<std::function<void()>> dispatch_queue_;
+
+  // TryGuestWakePass: passes hold guest_wake_mutex_ shared; TerminateTitle sets guest_wakes_closed_ holding it
+  // exclusive.
+  std::shared_mutex guest_wake_mutex_;
+  bool guest_wakes_closed_ = false;
 
   friend class XObject;
 };

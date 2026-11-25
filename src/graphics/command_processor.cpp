@@ -128,6 +128,13 @@ CommandProcessor::~CommandProcessor() = default;
 void CommandProcessor::NoteGuestWrite() {
   guest_write_progress_.fetch_add(1);  // seq_cst: ordered before the waiter count read below
   if (guest_write_waiters_.load() > 0) {
+    // Only guest threads sleep on guest_write_cv_, and TerminateTitle may kill one asleep there; the notify must then
+    // never run (issue #22: it walks the dead thread's wait block). The pass ends that before the first guest thread is
+    // suspended; once the title is terminated no pass is given and the wake is skipped.
+    auto pass = kernel_state_->TryGuestWakePass();
+    if (!pass.owns_lock()) {
+      return;
+    }
     // A waiter between its predicate check and its sleep holds the mutex; taking it here makes the notify land after the
     // sleep starts. Only a try: a guest thread suspended and terminated while holding it (TerminateTitle on window close)
     // must not block the vsync or command processor thread for good. A failed try can lose this one wake, which the

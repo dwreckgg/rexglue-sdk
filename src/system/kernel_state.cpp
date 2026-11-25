@@ -843,8 +843,23 @@ std::optional<KernelState::RecompiledModuleInfo> KernelState::FindRecompiledModu
   return std::nullopt;
 }
 
+std::shared_lock<std::shared_mutex> KernelState::TryGuestWakePass() {
+  std::shared_lock<std::shared_mutex> pass(guest_wake_mutex_, std::try_to_lock);
+  if (pass.owns_lock() && guest_wakes_closed_) {
+    pass.unlock();
+  }
+  return pass;
+}
+
 void KernelState::TerminateTitle() {
   REXSYS_DEBUG("KernelState::TerminateTitle");
+  // Close the guest-wake passes first (issue #22): waits for the notifies in flight, so none can still be walking a
+  // sleeper's wait block when that sleeper is suspended and terminated below. Before the global lock, which no pass
+  // holder takes.
+  {
+    std::unique_lock<std::shared_mutex> close(guest_wake_mutex_);
+    guest_wakes_closed_ = true;
+  }
   auto global_lock = global_critical_region_.Acquire();
 
   // Suspend all running guest threads so they stop touching shared state.

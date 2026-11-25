@@ -103,7 +103,8 @@ class CommandProcessor {
   uint32_t guest_write_progress() const { return guest_write_progress_.load(); }
   // Blocks until guest_write_progress() differs from `seen` or `limit` has passed; true when it moved. A bump made after
   // `seen` was read is seen by the predicate; its notify can be lost only when the notifier finds the mutex held (it only
-  // tries the lock, see NoteGuestWrite), which the limit bounds. The limit is a condition-variable timeout: at the
+  // tries the lock, see NoteGuestWrite), which the limit bounds, or once TerminateTitle has begun (no notify after it,
+  // issue #22). The limit is a condition-variable timeout: at the
   // process's timer resolution (up to ~15.6 ms when nothing raised it).
   bool WaitForGuestWriteProgress(uint32_t seen, std::chrono::microseconds limit);
   // Bumps the counter and wakes the waiters (cheap when nobody waits).
